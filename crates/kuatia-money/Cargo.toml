@@ -1,0 +1,26 @@
+[package]
+name = "kuatia-money"
+description = "Monetary Cent type for the Kuatia ledger with a compile-time swappable integer backing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Swap the integer backing from the default i64 to i128. The choice is
+# workspace-global (cargo feature unification) and changes no source.
+i128 = []
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

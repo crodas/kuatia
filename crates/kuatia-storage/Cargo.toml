@@ -1,0 +1,29 @@
+[package]
+name = "kuatia-storage"
+description = "Storage abstraction and conformance suite for the Kuatia ledger."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Pass through to kuatia-types: swap the Cent backing to i128.
+i128 = ["kuatia-types/i128"]
+
+[dependencies]
+kuatia-types.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+serde.workspace = true
+paste.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
