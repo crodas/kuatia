@@ -1,0 +1,5 @@
+# Dev/CI toolchain for this repo. Downstream consumers are unaffected; their
+# minimum supported Rust is the `rust-version` (1.85) in the crate manifests.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
