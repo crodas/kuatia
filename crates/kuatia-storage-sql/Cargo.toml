@@ -1,0 +1,33 @@
+[package]
+name = "kuatia-storage-sql"
+description = "SQLite/PostgreSQL storage backend for the Kuatia ledger."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kuatia-types.workspace = true
+kuatia-storage.workspace = true
+sqlx = { workspace = true, features = ["macros"] }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+paste.workspace = true
+
+[features]
+default = ["sqlite"]
+sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres"]
+# Pass through to the domain crates: swap the Cent backing to i128.
+i128 = ["kuatia-types/i128", "kuatia-storage/i128"]

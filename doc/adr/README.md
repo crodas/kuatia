@@ -1,0 +1,60 @@
+# Architecture Decision Records
+
+Significant, hard-to-reverse design decisions for Kuatia, captured so the
+*why* survives. New ADRs follow [`template.md`](template.md) (MADR-style:
+context → drivers → considered options with pros/cons → decision outcome
+→ consequences → links). Numbering is sequential; an ADR is never edited
+to reverse a decision. Instead, a new ADR supersedes it.
+
+## Index
+
+| ADR | Title | Status | Summary |
+|-----|-------|--------|---------|
+| [0001](0001-modified-utxo-signed-postings.md) | Modified UTXO: value as signed postings | accepted | Value is signed postings (negative = "offset positions"), not mutable balances; conservation is structural; balances are projections. |
+| [0002](0002-saga-commit-pipeline.md) | Saga commit pipeline | accepted | Commit is a compensating saga (`reserve → finalize`), not a single/distributed transaction: composable, coordinator-free, crash-recoverable. |
+| [0003](0003-dumb-storage-saga-recovery.md) | Dumb storage + durable saga recovery | accepted | Storage returns affected-row counts and makes no decisions; the saga owns interpretation/idempotency; crash-safety is phase-tracked write-ahead + roll-forward. Refines 0002. |
+| [0004](0004-account-policies-overdraft-model.md) | Account policies & overdraft model | accepted | A closed `AccountPolicy` enum per account gates negative postings + floor; intent is explicit, illegal states unrepresentable. Refines 0001. |
+| [0005](0005-intent-api-movements-vs-envelopes.md) | Intent API: movements vs. envelopes | accepted | Callers express `Movement`/`Transfer` intent; `resolve()` produces the concrete `Envelope`. UTXO mechanics stay internal; idempotency keys on the resolved id. |
+| [0006](0006-reservation-protocol-posting-lifecycle.md) | Reservation protocol & posting lifecycle | accepted | `Active → PendingInactive → Inactive` + a durable `ReservationId` give lock-free, recoverable, exclusive ownership of inputs. The primitive behind 0002/0003. |
+| [0007](0007-reversal-via-compensating-transfers.md) | Reversal via compensating transfers | accepted | Undo is an inverse envelope committed through the normal path (never deletion/mutation), preserving the append-only audit log. |
+| [0008](0008-conformance-tested-storage.md) | Conformance-tested storage | accepted | One `store_tests!` suite every backend must pass, with `InMemoryStore` as the executable reference; enforces the equal count semantics 0003 relies on. |
+| [0009](0009-monetary-representation-integer-minor-units.md) | Monetary amounts as integer minor units | accepted | `Cent` is an `i64` newtype of minor units with only checked arithmetic; scale lives in the presentation-only `Amount`, not on the stored value or asset. Makes 0001's conservation exact. |
+| [0010](0010-event-stream-vs-transfer-log.md) | Derived event stream vs. transfer log | accepted | A secondary append-only `EventStore` feed (outbox-style) for transfer + account-lifecycle events; transfer log stays authoritative. `append_event` is idempotent on a content key, a scoped exception to 0003. |
+| [0011](0011-swappable-money-backing.md) | Swappable integer backing for money, default i64 | accepted | `Cent` moves to a `kuatia-money` crate over a `CentBacking` trait; the i64↔i128 width is a cargo feature, hidden from the API, stored as text. Refines 0009. |
+
+## Recommended future ADRs
+
+Real decisions whose rationale lives in the code/docs but is not yet
+captured as an ADR, roughly in priority order:
+
+1. **Content-addressed transfer ids, and rejecting a sequential hash
+   chain**: `EnvelopeId = double-SHA-256(canonical bytes)` for idempotency
+   + tamper evidence, and why a per-transfer hash chain was rejected (a
+   concurrency bottleneck). See the "No Sequential Hash Chain" section of
+   `architecture.md`.
+2. **Pure core / async layer split**: a zero-IO, deterministic
+   `kuatia-core` (validation, selection, hashing; golden-vector testable)
+   vs. the async storage + saga layer.
+3. **Rust-generated ids (`AutoId`), no `AUTOINCREMENT`/`SERIAL`**: the
+   application owns identity (snowflake-style `i64`), enabling future
+   sharding without DB coordination.
+4. **Append-only, versioned accounts + snapshot pinning**: accounts are
+   never modified in place; snapshot hashes guard against TOCTOU between
+   load and apply.
+5. **All arithmetic in Rust, never in SQL**: no `SUM`/`MAX`/etc. on
+   monetary values; the storage layer stays a dumb record keeper.
+6. **`Book` is a transfer-policy scope, not the accounting journal**: the
+   naming/modeling decision and why it is easy to conflate
+   (`accounting-mapping.md`).
+7. **Posting proliferation & consolidation**: greedy largest-first
+   selection (ADR-0001/0005) fragments balances into ever-smaller change
+   postings; whether and how to consolidate, and what to do with dust, is
+   undecided.
+8. **Retention / pruning of `Inactive` postings and the append-only
+   logs**: both the transfer log and the derived event stream (ADR-0010)
+   grow without bound; archival/retention is deferred and currently a
+   conscious omission.
+9. **Read/projection consistency model**: a balance is a non-transactional
+   sum over `Active` postings, so a read concurrent with a commit is
+   eventually consistent; the read-side guarantee is implied but never
+   stated.

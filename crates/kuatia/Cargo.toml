@@ -1,0 +1,37 @@
+[package]
+name = "kuatia"
+description = "Append-only, auditable, multi-asset UTXO-style ledger: async resource and saga commit pipeline."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Bubble the i128 Cent backing up to the outermost crate. Enabling
+# `kuatia/i128` swaps the integer width across the whole dependency chain.
+i128 = ["kuatia-types/i128", "kuatia-core/i128", "kuatia-storage/i128"]
+
+[dependencies]
+kuatia-types.workspace = true
+kuatia-core.workspace = true
+kuatia-storage.workspace = true
+legend.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+# For the runnable examples — connect to a real SQLite-backed ledger.
+kuatia-storage-sql.workspace = true
+sqlx = { workspace = true, features = ["sqlite"] }

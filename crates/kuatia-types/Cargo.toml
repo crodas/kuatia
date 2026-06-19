@@ -1,0 +1,24 @@
+[package]
+name = "kuatia-types"
+description = "Domain types for the Kuatia ledger: postings, accounts, transfers, books."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Pass through to kuatia-money: swap the Cent backing to i128.
+i128 = ["kuatia-money/i128"]
+
+[dependencies]
+kuatia-money.workspace = true
+serde.workspace = true
+bitflags.workspace = true
