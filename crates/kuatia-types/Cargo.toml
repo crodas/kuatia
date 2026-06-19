@@ -1,0 +1,12 @@
+[package]
+name = "kuatia-types"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bitflags = { version = "2", features = ["serde"] }

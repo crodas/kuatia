@@ -1,0 +1,196 @@
+# Transfers
+
+## Overview
+
+A transfer is the atomic unit of value movement in the ledger. It consumes existing postings and creates new ones, preserving per-asset conservation.
+
+There are two layers:
+
+- **Intent layer** — callers express movements (from, to, asset, amount). The ledger resolves these into concrete postings.
+- **Envelope layer** — concrete postings to consume and create. Used internally after resolution and available for direct callers.
+
+## Movements
+
+A movement is the fundamental building block:
+
+```rust
+struct Movement {
+    from: AccountId,  // account being debited
+    to: AccountId,    // account being credited
+    asset: AssetId,   // asset to transfer
+    amount: Cent,     // amount (may be negative for liabilities)
+}
+```
+
+Every operation — pay, deposit, withdraw — is expressed as one or more movements. The resolve step aggregates net debits per (account, asset) and selects postings only for accounts with a positive net debit.
+
+## Operations
+
+### Pay
+
+Transfer value between two accounts.
+
+```rust
+TransferBuilder::new()
+    .pay(from, to, asset, amount)
+    .build()
+```
+
+Produces one movement:
+
+| from | to | asset | amount |
+|------|----|-------|--------|
+| A | B | USD | 50 |
+
+Resolve selects postings from A to cover 50, creates a +50 posting on B, and returns change to A if the selected postings exceed 50.
+
+### Deposit
+
+Fund an account from a system/external source. Creates a liability on the source and a credit on the target.
+
+```rust
+TransferBuilder::new()
+    .deposit(to, asset, amount, external)
+    .build()
+```
+
+Produces two movements:
+
+| from | to | asset | amount |
+|------|----|-------|--------|
+| external | external | USD | -100 |
+| external | to | USD | +100 |
+
+The first movement creates a -100 liability posting on the external account. The second creates a +100 posting on the target account.
+
+Net debit on the external account: -100 + 100 = **0**. No posting selection is needed — the liability is created directly.
+
+Conservation: created sum = -100 + 100 = 0. Consumed sum = 0. Both sides balance.
+
+### Withdraw
+
+Move value from an account to an external destination.
+
+```rust
+TransferBuilder::new()
+    .withdraw(from, asset, amount, external)
+    .build()
+```
+
+Produces one movement:
+
+| from | to | asset | amount |
+|------|----|-------|--------|
+| A | external | USD | 50 |
+
+Resolve selects postings from A to cover 50, creates a +50 posting on the external account, and returns change to A.
+
+### Raw movement
+
+For operations that don't fit the convenience methods:
+
+```rust
+TransferBuilder::new()
+    .movement(from, to, asset, amount)
+    .build()
+```
+
+## Resolve Algorithm
+
+The resolve step converts a `Transfer` (intent) into an `Envelope` (concrete postings) using a two-pass algorithm:
+
+### Pass 1: Create output postings and aggregate debits
+
+For each movement:
+1. Create a `NewPosting { owner: to, asset, value: amount }` with `payer: Some(from)` when `from != to`
+2. Accumulate the movement's amount into a net debit map keyed by `(from, asset)`
+
+### Pass 2: Select postings for accounts with positive net debit
+
+For each `(account, asset)` pair where net debit > 0:
+1. Query active postings for that account and asset
+2. Run greedy largest-first selection to cover the net debit
+3. Compute change = selected sum - net debit
+4. If change > 0, create a change posting returning the remainder to the account
+
+Pairs with net debit <= 0 (e.g. the external account in a deposit) are skipped — no posting selection needed.
+
+### Aggregation benefit
+
+Aggregating debits before selection means that multiple movements debiting the same account share one selection pass. For example, if a transfer contains two payments from account A (50 + 30), the resolve selects postings once for 80 rather than twice.
+
+## Envelope
+
+After resolution, the result is an `Envelope`:
+
+```rust
+struct Envelope {
+    consumes: Vec<PostingId>,       // postings to deactivate
+    creates: Vec<NewPosting>,       // new postings to create
+    account_snapshots: Vec<AccountSnapshotId>,
+    book: u32,
+    code: u32,
+    user_data: UserData,
+    metadata: Metadata,
+}
+```
+
+The envelope is content-addressed: its `EnvelopeId` is the double-SHA-256 of its canonical binary serialization. This provides idempotency (committing the same envelope twice returns the cached receipt) and tamper evidence.
+
+## Transfer Builder
+
+The `TransferBuilder` provides a fluent API for constructing transfers:
+
+```rust
+let transfer = TransferBuilder::new()
+    .deposit(alice, usd, Cent::from(1000), bank)
+    .pay(alice, bob, usd, Cent::from(200))
+    .book(1)
+    .code(100)
+    .metadata(metadata)
+    .build();
+```
+
+A single transfer can contain multiple movements of different types. All movements execute atomically.
+
+## Commit Paths
+
+### Saga commit (default)
+
+```
+Transfer → resolve → Envelope → reserve → validate → finalize → Receipt
+```
+
+Four-phase pipeline with automatic retry and LIFO compensation on failure. Used by `ledger.commit(transfer)`.
+
+### Atomic commit
+
+```
+Envelope → load → plan → apply → Receipt
+```
+
+Single-pass pipeline without reservation. Used by `ledger.commit_atomic(envelope)` and internally by `reverse()`.
+
+## Reversal
+
+`reverse(transfer_id)` creates a compensating envelope that:
+1. Consumes the original transfer's created postings
+2. Recreates the original transfer's consumed postings
+
+This undoes the operation while preserving the full audit trail — no postings are deleted.
+
+## Validation
+
+Every envelope passes through `validate_and_plan()` before being applied. The validation steps are:
+
+1. Non-empty (must consume or create at least one posting)
+2. No duplicate consumed PostingIds
+3. All consumed postings exist
+4. All consumed postings are Active or PendingInactive
+5. All referenced accounts exist, not frozen, not closed
+6. Account snapshot pinning (if provided)
+7. Per-asset conservation: `sum(consumed) == sum(created)`
+8. Negative postings only on SystemAccount or ExternalAccount
+9. Policy enforcement: projected balance satisfies account floor
+
+See [architecture.md](architecture.md) for details on each check.

@@ -1,0 +1,13 @@
+[package]
+name = "kuatia-core"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kuatia-types = { path = "../kuatia-types" }
+sha2 = { version = "0.10", default-features = false }
+serde = { version = "1", features = ["derive"] }

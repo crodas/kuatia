@@ -1,0 +1,25 @@
+[package]
+name = "kuatia-storage-sql"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kuatia-types = { path = "../kuatia-types" }
+kuatia-storage = { path = "../kuatia-storage" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "macros", "any"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+paste = "1"
+
+[features]
+default = ["sqlite"]
+sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres"]

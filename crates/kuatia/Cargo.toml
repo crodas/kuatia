@@ -1,0 +1,21 @@
+[package]
+name = "kuatia"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kuatia-types = { path = "../kuatia-types" }
+kuatia-core = { path = "../kuatia-core" }
+kuatia-storage = { path = "../kuatia-storage" }
+legend = "0.1"
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+serde = { version = "1", features = ["derive"] }
+async-trait = "0.1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

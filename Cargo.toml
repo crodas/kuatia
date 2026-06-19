@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/kuatia-types", "crates/kuatia-core", "crates/kuatia-storage", "crates/kuatia-storage-sql", "crates/kuatia"]
+
+[workspace.package]
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+arithmetic_overflow = "deny"
+missing_docs = "deny"
+
+[profile.release]
+overflow-checks = true
