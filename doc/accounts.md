@@ -11,9 +11,8 @@ An account is a versioned entity that owns postings. Balance is never stored —
 | `id` | `AccountId(i64)` | Stable identity, assigned at creation |
 | `version` | `u64` | Starts at 1, increments on every mutation |
 | `policy` | `AccountPolicy` | Balance floor rule (see below) |
-| `flags` | `AccountFlags` | Lifecycle flags: `FROZEN`, `CLOSED` |
-| `book` | `u32` | Grouping label (e.g. tenant or product line) |
-| `code` | `u32` | Category code (e.g. chart of accounts) |
+| `flags` | `AccountFlags` | Lifecycle flags (`FROZEN`, `CLOSED`) + user-defined (`USER_0`–`USER_7`) |
+| `journal` | `JournalId` | Journal this account belongs to |
 | `user_data` | `UserData` | Fixed 28 bytes: `u128 + u64 + u32` for external refs |
 | `metadata` | `Metadata` | `BTreeMap<String, Vec<u8>>` for free-form data |
 

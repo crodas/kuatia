@@ -128,8 +128,7 @@ struct Envelope {
     consumes: Vec<PostingId>,       // postings to deactivate
     creates: Vec<NewPosting>,       // new postings to create
     account_snapshots: Vec<AccountSnapshotId>,
-    book: u32,
-    code: u32,
+    journal: JournalId,
     user_data: UserData,
     metadata: Metadata,
 }
@@ -145,8 +144,7 @@ The `TransferBuilder` provides a fluent API for constructing transfers:
 let transfer = TransferBuilder::new()
     .deposit(alice, usd, Cent::from(1000), bank)
     .pay(alice, bob, usd, Cent::from(200))
-    .book(1)
-    .code(100)
+    .journal(sales_journal)
     .metadata(metadata)
     .build();
 ```
