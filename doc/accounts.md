@@ -28,7 +28,7 @@ Each account has a policy that controls what balance constraints apply:
 | `SystemAccount` | None | Yes | No |
 | `ExternalAccount` | None | Yes | No |
 
-Only `SystemAccount` and `ExternalAccount` may hold negative postings (liabilities). Validation rejects any transfer that would create a negative posting on another account type.
+Only `SystemAccount` and `ExternalAccount` may hold negative postings (offset positions). Validation rejects any transfer that would create a negative posting on another account type.
 
 `CappedOverdraft` accounts emit CAS (Compare-And-Swap) guards during validation to prevent write-skew — two concurrent transfers could each pass validation independently but together push the balance below the floor.
 
@@ -93,11 +93,11 @@ Hold positive postings only. Cannot go negative. Used for end-user wallets, merc
 
 ### System accounts (`SystemAccount`)
 
-Operational accounts for fees, settlement, market-making. Can hold negative postings (liabilities). Used as the counterparty in deposits — the system account takes on a negative balance to represent the liability.
+Operational accounts representing issuance, sink, revenue, COGS, fees, or internal balancing. Can hold negative postings (offset positions — e.g. a liability when the account is the deposit counterparty). Used as the counterparty in deposits — the system account takes on a negative balance to offset the value credited elsewhere.
 
 ### External accounts (`ExternalAccount`)
 
-Boundary accounts representing entities outside the ledger (banks, payment processors). Like system accounts, they can hold negative postings. Used to track money entering and leaving the system.
+Boundary accounts representing the outside world (banks, payment processors). They represent value entering and leaving the ledger boundary, and like system accounts they can hold negative postings (offset positions).
 
 ### Credit accounts (`CappedOverdraft`)
 

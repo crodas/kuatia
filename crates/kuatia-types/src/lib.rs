@@ -536,6 +536,10 @@ pub enum PostingStatus {
 }
 
 /// A signed amount of one asset, owned by exactly one account.
+///
+/// A positive posting is value controlled by the account; a negative posting is
+/// an offset position (issuance, external flow, or system balancing), only
+/// allowed on `SystemAccount` or `ExternalAccount`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Posting {
     /// Unique identifier derived from the creating transfer.
@@ -544,7 +548,7 @@ pub struct Posting {
     pub owner: AccountId,
     /// The asset this posting denominates.
     pub asset: AssetId,
-    /// Signed: positive = holding, negative = liability.
+    /// Signed: positive = value controlled by the account, negative = offset position.
     pub value: Cent,
     /// Lifecycle state — only `Active` postings count toward balance.
     pub status: PostingStatus,
@@ -565,7 +569,7 @@ pub struct NewPosting {
     pub owner: AccountId,
     /// The asset this posting denominates.
     pub asset: AssetId,
-    /// Signed amount: positive = holding, negative = liability.
+    /// Signed amount: positive = value controlled by the account, negative = offset position.
     pub value: Cent,
     /// Informational provenance — who funded this posting.
     pub payer: Option<AccountId>,
@@ -729,7 +733,8 @@ pub enum AccountPolicy {
     UncappedOverdraft,
     /// Fees, settlement, market-making, minting. No balance constraints.
     SystemAccount,
-    /// Boundary account holding the negative side of deposits.
+    /// Boundary account representing value entering/leaving the ledger; holds
+    /// the offset (negative) side of deposits.
     ExternalAccount,
 }
 
@@ -825,7 +830,7 @@ pub struct Movement {
     pub to: AccountId,
     /// Asset to transfer.
     pub asset: AssetId,
-    /// Amount to transfer (may be negative for liability postings).
+    /// Amount to transfer (may be negative for offset postings).
     pub amount: Cent,
 }
 
@@ -880,8 +885,8 @@ impl TransferBuilder {
         self.movement(from, to, asset, amount)
     }
 
-    /// Add a deposit: creates a liability on the external account and credits
-    /// the target account.  Pushes two movements whose net debit on the
+    /// Add a deposit: creates an offset posting on the external account and
+    /// credits the target account.  Pushes two movements whose net debit on the
     /// external account is zero.
     pub fn deposit(
         self,

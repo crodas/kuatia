@@ -18,7 +18,7 @@ struct Movement {
     from: AccountId,  // account being debited
     to: AccountId,    // account being credited
     asset: AssetId,   // asset to transfer
-    amount: Cent,     // amount (may be negative for liabilities)
+    amount: Cent,     // amount (may be negative for offset postings)
 }
 ```
 
@@ -46,7 +46,7 @@ Resolve selects postings from A to cover 50, creates a +50 posting on B, and ret
 
 ### Deposit
 
-Fund an account from a system/external source. Creates a liability on the source and a credit on the target.
+Fund an account from a system/external source. Creates an offset posting on the source and a credit on the target.
 
 ```rust
 TransferBuilder::new()
@@ -61,9 +61,9 @@ Produces two movements:
 | external | external | USD | -100 |
 | external | to | USD | +100 |
 
-The first movement creates a -100 liability posting on the external account. The second creates a +100 posting on the target account.
+The first movement creates a -100 offset posting on the external account. The second creates a +100 posting on the target account.
 
-Net debit on the external account: -100 + 100 = **0**. No posting selection is needed — the liability is created directly.
+Net debit on the external account: -100 + 100 = **0**. No posting selection is needed — the offset is created directly.
 
 Conservation: created sum = -100 + 100 = 0. Consumed sum = 0. Both sides balance.
 

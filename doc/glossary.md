@@ -6,8 +6,8 @@
 
 A signed amount of one asset owned by one account. The fundamental unit of value in the ledger. Postings are immutable once created — consumed postings are marked `Inactive` but never deleted.
 
-- **Positive posting**: a holding (the account owns value).
-- **Negative posting**: a liability (only allowed on `SystemAccount` and `ExternalAccount`).
+- **Positive posting**: value controlled by the account.
+- **Negative posting**: an offset position — only allowed for accounts whose policy permits issuance, external flow, or system balancing (`SystemAccount`, `ExternalAccount`).
 
 Lifecycle: `Active` → `PendingInactive` (reserved by saga) → `Inactive` (consumed).
 
@@ -121,7 +121,7 @@ let deposit = TransferBuilder::new()
     .build();
 ledger.commit(deposit).await?;
 // Alice: +10,000 USD
-// Bank: -10,000 USD (liability — money entered the system)
+// Bank: -10,000 USD (offset — value entered the ledger boundary)
 ```
 
 **Alice trades 5,000 USD for EUR at 1:0.92:**
@@ -237,7 +237,7 @@ let receipt = TransferBuilder::new()
     .build();
 ledger.commit(receipt).await?;
 // Warehouse: +50.000 rice
-// World: -50.000 rice (liability — issued into system)
+// World: -50.000 rice (offset — issued into the ledger)
 ```
 
 **Cash sale — customer buys 2 rice at 15,000 Gs each:**

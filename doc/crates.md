@@ -130,7 +130,7 @@ Transfers are built via `TransferBuilder` and committed with `ledger.commit(tran
 | Builder method | Description |
 |---------------|-------------|
 | `.pay(from, to, asset, amount)` | Single movement between accounts |
-| `.deposit(to, asset, amount, external)` | Two movements: liability on external + credit on target |
+| `.deposit(to, asset, amount, external)` | Two movements: offset on external + credit on target |
 | `.withdraw(from, asset, amount, external)` | Single movement from account to external |
 | `.movement(from, to, asset, amount)` | Raw movement for custom operations |
 

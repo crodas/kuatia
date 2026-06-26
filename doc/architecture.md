@@ -2,7 +2,7 @@
 
 ## UTXO (Unspent Transaction Output)-Style Postings
 
-Value is stored as **postings** — signed amounts of a single asset owned by exactly one account. A positive posting is a holding; a negative posting is a liability (used by external/boundary accounts).
+Value is stored as **postings** — signed amounts of a single asset owned by exactly one account. A positive posting is value controlled by the account; a negative posting is an offset position (issuance, external flow, or system balancing).
 
 Account balance = sum of active postings for that (account, asset) pair. There is no mutable balance field to drift out of sync.
 
@@ -194,7 +194,7 @@ Each account has a policy controlling its balance floor and whether it may hold 
 | `SystemAccount` | None | Yes | No |
 | `ExternalAccount` | None | Yes | No |
 
-Only `SystemAccount` and `ExternalAccount` may receive negative postings (liabilities). Validation rejects any transfer that would create a negative posting on another account type.
+Only `SystemAccount` and `ExternalAccount` may receive negative postings (offset positions). Validation rejects any transfer that would create a negative posting on another account type.
 
 ## CAS (Compare-And-Swap) Guards for CappedOverdraft
 
