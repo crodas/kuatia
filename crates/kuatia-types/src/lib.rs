@@ -382,6 +382,15 @@ fn hex(bytes: &[u8]) -> String {
 // Identifier constructors
 // ---------------------------------------------------------------------------
 
+impl Default for AccountId {
+    fn default() -> Self {
+        thread_local! {
+            static GEN: crate::autoid::AutoId = crate::autoid::AutoId::new();
+        }
+        GEN.with(|g| Self(g.next()))
+    }
+}
+
 impl AccountId {
     /// Create an `AccountId` from an `i64`.
     pub const fn new(id: i64) -> Self {
@@ -399,6 +408,101 @@ impl AssetId {
     /// Create an `AssetId` from a `u32`.
     pub const fn new(id: u32) -> Self {
         Self(id)
+    }
+}
+
+/// Identifies a journal — a named scope for transfers.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct JournalId(pub i64);
+
+impl fmt::Debug for JournalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "JournalId({})", self.0)
+    }
+}
+
+impl Default for JournalId {
+    fn default() -> Self {
+        thread_local! {
+            static GEN: crate::autoid::AutoId = crate::autoid::AutoId::new();
+        }
+        GEN.with(|g| Self(g.next()))
+    }
+}
+
+impl JournalId {
+    /// Create a `JournalId` from an `i64`.
+    pub const fn new(id: i64) -> Self {
+        Self(id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Journal
+// ---------------------------------------------------------------------------
+
+/// A journal scopes which accounts and assets may participate in transfers.
+/// Accounts and balances are global — journals only gate participation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Journal {
+    /// Stable identity for this journal.
+    pub id: JournalId,
+    /// Human-readable name.
+    pub name: String,
+    /// If non-empty, only these assets may appear in movements.
+    pub allowed_assets: Vec<AssetId>,
+    /// If non-empty, accounts with ANY of these flags may participate.
+    pub allowed_flags: AccountFlags,
+    /// If non-empty, these specific accounts may participate (in addition to flag matches).
+    pub allowed_accounts: Vec<AccountId>,
+}
+
+/// Builder for constructing [`Journal`] values.
+pub struct JournalBuilder {
+    journal: Journal,
+}
+
+impl JournalBuilder {
+    /// Create a new journal builder with the given name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            journal: Journal {
+                id: JournalId::default(),
+                name: name.into(),
+                allowed_assets: Vec::new(),
+                allowed_flags: AccountFlags::empty(),
+                allowed_accounts: Vec::new(),
+            },
+        }
+    }
+
+    /// Set the journal id explicitly.
+    pub fn id(mut self, id: JournalId) -> Self {
+        self.journal.id = id;
+        self
+    }
+
+    /// Add an allowed asset.
+    pub fn allow_asset(mut self, asset: AssetId) -> Self {
+        self.journal.allowed_assets.push(asset);
+        self
+    }
+
+    /// Set allowed account flags — accounts with ANY of these flags may participate.
+    pub fn allow_flags(mut self, flags: AccountFlags) -> Self {
+        self.journal.allowed_flags = flags;
+        self
+    }
+
+    /// Add a specific allowed account.
+    pub fn allow_account(mut self, account: AccountId) -> Self {
+        self.journal.allowed_accounts.push(account);
+        self
+    }
+
+    /// Consume the builder and return the [`Journal`].
+    pub fn build(self) -> Journal {
+        self.journal
     }
 }
 
@@ -496,10 +600,8 @@ pub struct Envelope {
     pub creates: Vec<NewPosting>,
     /// Account version pins for optimistic concurrency.
     pub account_snapshots: Vec<AccountSnapshotId>,
-    /// Grouping label (e.g. tenant or product).
-    pub book: u32,
-    /// Category code for this envelope.
-    pub code: u32,
+    /// Journal this envelope belongs to.
+    pub journal: JournalId,
     /// Fixed-width secondary identifiers.
     pub user_data: UserData,
     /// Free-form key-value metadata.
@@ -522,14 +624,9 @@ impl Envelope {
         &self.account_snapshots
     }
 
-    /// Grouping label (e.g. tenant or product).
-    pub fn book(&self) -> u32 {
-        self.book
-    }
-
-    /// Category code for this envelope.
-    pub fn code(&self) -> u32 {
-        self.code
+    /// Journal this envelope belongs to.
+    pub fn journal(&self) -> JournalId {
+        self.journal
     }
 
     /// Fixed-width secondary identifiers.
@@ -584,15 +681,9 @@ impl EnvelopeBuilder {
         self
     }
 
-    /// Set the book label.
-    pub fn book(mut self, book: u32) -> Self {
-        self.envelope.book = book;
-        self
-    }
-
-    /// Set the category code.
-    pub fn code(mut self, code: u32) -> Self {
-        self.envelope.code = code;
+    /// Set the journal.
+    pub fn journal(mut self, journal: JournalId) -> Self {
+        self.envelope.journal = journal;
         self
     }
 
@@ -643,13 +734,35 @@ pub enum AccountPolicy {
 }
 
 bitflags::bitflags! {
-    /// Lifecycle flags for an [`Account`].
+    /// Lifecycle and user-defined flags for an [`Account`].
+    ///
+    /// Bits 0–7 are reserved for system flags. Bits 8–31 are available for
+    /// user-defined flags, which can be used with [`Journal::allowed_flags`]
+    /// to scope which accounts may participate in a journal.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AccountFlags: u32 {
         /// Account may not be the source or destination of any transfer.
         const FROZEN = 1 << 0;
         /// Terminal — no further activity.
         const CLOSED = 1 << 1;
+        // Bits 2–7: reserved for future system flags.
+        // Bits 8–31: user-defined.
+        /// User-defined flag 0.
+        const USER_0 = 1 << 8;
+        /// User-defined flag 1.
+        const USER_1 = 1 << 9;
+        /// User-defined flag 2.
+        const USER_2 = 1 << 10;
+        /// User-defined flag 3.
+        const USER_3 = 1 << 11;
+        /// User-defined flag 4.
+        const USER_4 = 1 << 12;
+        /// User-defined flag 5.
+        const USER_5 = 1 << 13;
+        /// User-defined flag 6.
+        const USER_6 = 1 << 14;
+        /// User-defined flag 7.
+        const USER_7 = 1 << 15;
     }
 }
 
@@ -664,10 +777,8 @@ pub struct Account {
     pub policy: AccountPolicy,
     /// Lifecycle flags (frozen, closed).
     pub flags: AccountFlags,
-    /// Grouping label (e.g. tenant or product).
-    pub book: u32,
-    /// Category code.
-    pub code: u32,
+    /// Journal this entity belongs to.
+    pub journal: JournalId,
     /// Fixed-width secondary identifiers.
     pub user_data: UserData,
     /// Free-form key-value metadata.
@@ -727,10 +838,8 @@ pub struct Movement {
 pub struct Transfer {
     /// Movements to execute atomically.
     pub movements: Vec<Movement>,
-    /// Grouping label (e.g. tenant or product).
-    pub book: u32,
-    /// Category code.
-    pub code: u32,
+    /// Journal this entity belongs to.
+    pub journal: JournalId,
     /// Fixed-width secondary identifiers.
     pub user_data: UserData,
     /// Free-form key-value metadata.
@@ -798,15 +907,9 @@ impl TransferBuilder {
         self.movement(from, external, asset, amount)
     }
 
-    /// Set the book label.
-    pub fn book(mut self, book: u32) -> Self {
-        self.transfer.book = book;
-        self
-    }
-
-    /// Set the category code.
-    pub fn code(mut self, code: u32) -> Self {
-        self.transfer.code = code;
+    /// Set the journal.
+    pub fn journal(mut self, journal: JournalId) -> Self {
+        self.transfer.journal = journal;
         self
     }
 
@@ -901,6 +1004,12 @@ impl ToBytes for AccountFlags {
     }
 }
 
+impl ToBytes for JournalId {
+    fn to_bytes(&self) -> Vec<u8> {
+        self.0.to_be_bytes().to_vec()
+    }
+}
+
 impl ToBytes for NewPosting {
     fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -954,8 +1063,7 @@ impl ToBytes for Envelope {
             buf.extend(snap.to_bytes());
         }
 
-        write_u32(&mut buf, self.book);
-        write_u32(&mut buf, self.code);
+        buf.extend(self.journal.to_bytes());
         buf.extend(self.user_data.to_bytes());
 
         write_u32(&mut buf, self.metadata.len() as u32);
@@ -979,8 +1087,7 @@ impl ToBytes for Account {
         write_u64(&mut buf, self.version);
         buf.extend(self.policy.to_bytes());
         buf.extend(self.flags.to_bytes());
-        write_u32(&mut buf, self.book);
-        write_u32(&mut buf, self.code);
+        buf.extend(self.journal.to_bytes());
         buf.extend(self.user_data.to_bytes());
 
         write_u32(&mut buf, self.metadata.len() as u32);

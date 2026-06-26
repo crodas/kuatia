@@ -41,6 +41,7 @@ impl SqlStore {
             include_str!("migrations/001_init.sql"),
             include_str!("migrations/002_timestamps_and_columns.sql"),
             include_str!("migrations/003_events.sql"),
+            include_str!("migrations/004_journals.sql"),
         ] {
             for statement in sql.split(';') {
                 let trimmed = statement.trim();
@@ -107,11 +108,8 @@ fn row_to_account(row: &sqlx::any::AnyRow) -> Result<Account, StoreError> {
     let flags_bits: i32 = row
         .try_get("flags")
         .map_err(|e| StoreError::Internal(e.to_string()))?;
-    let book: i32 = row
-        .try_get("book")
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
-    let code: i32 = row
-        .try_get("code")
+    let journal: i64 = row
+        .try_get("journal")
         .map_err(|e| StoreError::Internal(e.to_string()))?;
     let user_data_bytes: Vec<u8> = row
         .try_get("user_data")
@@ -125,8 +123,7 @@ fn row_to_account(row: &sqlx::any::AnyRow) -> Result<Account, StoreError> {
         version: version as u64,
         policy: deserialize_policy(&policy_str)?,
         flags: AccountFlags::from_bits_truncate(flags_bits as u32),
-        book: book as u32,
-        code: code as u32,
+        journal: JournalId::new(journal),
         user_data: deserialize_blob(&user_data_bytes)?,
         metadata: deserialize_blob(&metadata_bytes)?,
     })
@@ -205,14 +202,13 @@ impl AccountStore for SqlStore {
         }
 
         sqlx::query(
-            "INSERT INTO accounts (id, version, policy, flags, book, code, user_data, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+            "INSERT INTO accounts (id, version, policy, flags, journal, user_data, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7)"
         )
             .bind(account.id.0)
             .bind(account.version as i64)
             .bind(serialize_policy(&account.policy)?)
             .bind(account.flags.bits() as i32)
-            .bind(account.book as i32)
-            .bind(account.code as i32)
+            .bind(account.journal.0)
             .bind(serialize_blob(&account.user_data)?)
             .bind(serialize_blob(&account.metadata)?)
             .execute(&self.pool)
@@ -246,14 +242,13 @@ impl AccountStore for SqlStore {
         }
 
         sqlx::query(
-            "INSERT INTO accounts (id, version, policy, flags, book, code, user_data, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+            "INSERT INTO accounts (id, version, policy, flags, journal, user_data, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7)"
         )
             .bind(account.id.0)
             .bind(account.version as i64)
             .bind(serialize_policy(&account.policy)?)
             .bind(account.flags.bits() as i32)
-            .bind(account.book as i32)
-            .bind(account.code as i32)
+            .bind(account.journal.0)
             .bind(serialize_blob(&account.user_data)?)
             .bind(serialize_blob(&account.metadata)?)
             .execute(&self.pool)
@@ -573,13 +568,12 @@ impl TransferStore for SqlStore {
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
 
-        sqlx::query("INSERT INTO transfers (id, transfer, receipt, created_at, book, code) VALUES ($1, $2, $3, $4, $5, $6)")
+        sqlx::query("INSERT INTO transfers (id, transfer, receipt, created_at, journal) VALUES ($1, $2, $3, $4, $5)")
             .bind(tid.0.as_slice())
             .bind(&transfer_bytes)
             .bind(&receipt_bytes)
             .bind(record.created_at)
-            .bind(record.envelope.book() as i32)
-            .bind(record.envelope.code() as i32)
+            .bind(record.envelope.journal().0)
             .execute(&mut *tx)
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -686,13 +680,8 @@ impl TransferStore for SqlStore {
                 {
                     return false;
                 }
-                if let Some(book) = query.book
-                    && r.envelope.book() != book
-                {
-                    return false;
-                }
-                if let Some(code) = query.code
-                    && r.envelope.code() != code
+                if let Some(journal) = query.journal
+                    && r.envelope.journal() != journal
                 {
                     return false;
                 }
@@ -802,5 +791,52 @@ impl EventStore for SqlStore {
             events.push(event);
         }
         Ok(events)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JournalStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl JournalStore for SqlStore {
+    async fn create_journal(&self, journal: Journal) -> Result<(), StoreError> {
+        let data = serialize_blob(&journal)?;
+        sqlx::query("INSERT INTO journals (id, name, data) VALUES ($1, $2, $3)")
+            .bind(journal.id.0)
+            .bind(&journal.name)
+            .bind(&data)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_journal(&self, id: &JournalId) -> Result<Journal, StoreError> {
+        let row = sqlx::query("SELECT data FROM journals WHERE id = $1")
+            .bind(id.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?
+            .ok_or_else(|| StoreError::NotFound(format!("journal {id:?}")))?;
+        let data: Vec<u8> = row
+            .try_get("data")
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        deserialize_blob(&data)
+    }
+
+    async fn list_journals(&self) -> Result<Vec<Journal>, StoreError> {
+        let rows = sqlx::query("SELECT data FROM journals")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.iter()
+            .map(|row| {
+                let data: Vec<u8> = row
+                    .try_get("data")
+                    .map_err(|e| StoreError::Internal(e.to_string()))?;
+                deserialize_blob(&data)
+            })
+            .collect()
     }
 }

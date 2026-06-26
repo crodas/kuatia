@@ -3,8 +3,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     version     BIGINT NOT NULL,
     policy      TEXT NOT NULL,
     flags       INTEGER NOT NULL,
-    book        INTEGER NOT NULL,
-    code        INTEGER NOT NULL,
+    journal     BIGINT NOT NULL,
     user_data   BLOB NOT NULL,
     metadata    BLOB NOT NULL,
     PRIMARY KEY (id, version)

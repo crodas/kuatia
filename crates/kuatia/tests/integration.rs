@@ -29,8 +29,7 @@ fn make_account(id: i64, policy: AccountPolicy) -> Account {
         version: 1,
         policy,
         flags: AccountFlags::empty(),
-        book: 0,
-        code: 0,
+        journal: JournalId(0),
         user_data: UserData::default(),
         metadata: BTreeMap::new(),
     }

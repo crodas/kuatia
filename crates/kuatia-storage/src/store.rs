@@ -8,7 +8,8 @@
 
 use async_trait::async_trait;
 use kuatia_types::{
-    Account, AccountId, AssetId, Envelope, EnvelopeId, Posting, PostingId, PostingStatus, Receipt,
+    Account, AccountId, AssetId, Envelope, EnvelopeId, Journal, JournalId, Posting, PostingId,
+    PostingStatus, Receipt,
 };
 
 use crate::error::StoreError;
@@ -49,10 +50,8 @@ pub struct TransferQuery {
     pub from_ts: Option<i64>,
     /// Exclusive upper bound (unix millis).
     pub to_ts: Option<i64>,
-    /// Filter by book label.
-    pub book: Option<u32>,
-    /// Filter by code.
-    pub code: Option<u32>,
+    /// Filter by journal.
+    pub journal: Option<JournalId>,
     /// Max results to return.
     pub limit: Option<u32>,
     /// Number of results to skip.
@@ -174,13 +173,8 @@ pub trait TransferStore: Send + Sync {
                 {
                     return false;
                 }
-                if let Some(book) = query.book
-                    && r.envelope.book() != book
-                {
-                    return false;
-                }
-                if let Some(code) = query.code
-                    && r.envelope.code() != code
+                if let Some(journal) = query.journal
+                    && r.envelope.journal() != journal
                 {
                     return false;
                 }
@@ -208,11 +202,28 @@ pub trait SagaStore: Send + Sync {
     async fn delete_saga(&self, id: &i64) -> Result<(), StoreError>;
 }
 
+/// Journal persistence.
+#[async_trait]
+pub trait JournalStore: Send + Sync {
+    /// Create a new journal.
+    async fn create_journal(&self, journal: Journal) -> Result<(), StoreError>;
+    /// Fetch a journal by id.
+    async fn get_journal(&self, id: &JournalId) -> Result<Journal, StoreError>;
+    /// List all journals.
+    async fn list_journals(&self) -> Result<Vec<Journal>, StoreError>;
+}
+
 // ---------------------------------------------------------------------------
 // Composite trait
 // ---------------------------------------------------------------------------
 
 /// Async storage abstraction composing all sub-traits.
-pub trait Store: AccountStore + PostingStore + TransferStore + SagaStore + EventStore {}
+pub trait Store:
+    AccountStore + PostingStore + TransferStore + SagaStore + EventStore + JournalStore
+{
+}
 
-impl<T: AccountStore + PostingStore + TransferStore + SagaStore + EventStore> Store for T {}
+impl<T: AccountStore + PostingStore + TransferStore + SagaStore + EventStore + JournalStore> Store
+    for T
+{
+}

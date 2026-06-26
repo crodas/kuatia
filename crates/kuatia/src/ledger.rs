@@ -219,8 +219,7 @@ impl Ledger {
         let mut envelope = EnvelopeBuilder::new()
             .consumes(consumes)
             .creates(creates)
-            .book(transfer.book)
-            .code(transfer.code)
+            .journal(transfer.journal)
             .user_data(transfer.user_data.clone())
             .metadata(transfer.metadata.clone())
             .build();
@@ -265,7 +264,7 @@ impl Ledger {
     /// Steps: resolve movements into envelope -> reserve consumed postings ->
     /// validate -> finalize.
     /// On failure, legend compensates completed steps in reverse order.
-    #[instrument(skip(self, transfer), fields(book = transfer.book, code = transfer.code), name = "ledger.commit")]
+    #[instrument(skip(self, transfer), fields(journal = transfer.journal.0), name = "ledger.commit")]
     pub async fn commit(self: &Arc<Self>, transfer: Transfer) -> Result<Receipt, LedgerError> {
         let saga = TransferSaga::new(TransferSagaInputs {
             resolve: ResolveInput {
@@ -353,8 +352,7 @@ impl Ledger {
         let reverse_envelope = EnvelopeBuilder::new()
             .consumes(created_posting_ids)
             .creates(new_postings)
-            .book(original.book())
-            .code(original.code())
+            .journal(original.journal())
             .metadata(original.metadata().clone())
             .build();
 
@@ -561,6 +559,27 @@ impl Ledger {
             })
             .await;
         Ok(())
+    }
+
+    /// Create a new journal.
+    pub async fn create_journal(
+        &self,
+        journal: kuatia_core::Journal,
+    ) -> Result<(), LedgerError> {
+        Ok(self.store.create_journal(journal).await?)
+    }
+
+    /// Fetch a journal by id.
+    pub async fn get_journal(
+        &self,
+        id: &kuatia_core::JournalId,
+    ) -> Result<kuatia_core::Journal, LedgerError> {
+        Ok(self.store.get_journal(id).await?)
+    }
+
+    /// List all journals.
+    pub async fn list_journals(&self) -> Result<Vec<kuatia_core::Journal>, LedgerError> {
+        Ok(self.store.list_journals().await?)
     }
 
     /// Query ledger events after a given sequence number.

@@ -25,8 +25,7 @@ fn make_account(id: i64, policy: AccountPolicy) -> Account {
         version: 1,
         policy,
         flags: AccountFlags::empty(),
-        book: 0,
-        code: 0,
+        journal: JournalId(0),
         user_data: UserData::default(),
         metadata: BTreeMap::new(),
     }
@@ -51,7 +50,7 @@ fn make_posting(
     }
 }
 
-fn make_envelope_with_book(book: u32) -> (Envelope, EnvelopeId) {
+fn make_envelope_with_journal(journal: JournalId) -> (Envelope, EnvelopeId) {
     let t = EnvelopeBuilder::new()
         .creates(vec![
             NewPosting {
@@ -67,11 +66,11 @@ fn make_envelope_with_book(book: u32) -> (Envelope, EnvelopeId) {
                 payer: None,
             },
         ])
-        .book(book)
+        .journal(journal)
         .build();
-    // Use book value to create distinct EnvelopeIds.
+    // Use journal id to create distinct EnvelopeIds.
     let mut tid_bytes = [0u8; 32];
-    tid_bytes[0] = book as u8;
+    tid_bytes[0] = journal.0 as u8;
     tid_bytes[1] = 42;
     (t, EnvelopeId(tid_bytes))
 }
@@ -495,7 +494,7 @@ pub async fn query_transfers_by_date_range(store: &(impl Store + 'static)) {
         .await
         .unwrap();
 
-    let (e2, t2) = make_envelope_with_book(1);
+    let (e2, t2) = make_envelope_with_journal(JournalId(1));
     store
         .store_transfer(EnvelopeRecord {
             envelope: e2,
@@ -572,7 +571,7 @@ pub async fn query_transfers_by_book(store: &(impl Store + 'static)) {
         .await
         .unwrap();
 
-    let (e2, t2) = make_envelope_with_book(5);
+    let (e2, t2) = make_envelope_with_journal(JournalId(5));
     store
         .store_transfer(EnvelopeRecord {
             envelope: e2,
@@ -585,13 +584,13 @@ pub async fn query_transfers_by_book(store: &(impl Store + 'static)) {
     let page = store
         .query_transfers(&TransferQuery {
             account: Some(AccountId::new(1)),
-            book: Some(5),
+            journal: Some(JournalId(5)),
             ..Default::default()
         })
         .await
         .unwrap();
     assert_eq!(page.total, 1);
-    assert_eq!(page.items[0].envelope.book(), 5);
+    assert_eq!(page.items[0].envelope.journal(), JournalId(5));
 }
 
 // ---------------------------------------------------------------------------

@@ -7,11 +7,15 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 
 use kuatia_types::autoid::AutoId;
-use kuatia_types::{Account, AccountId, AssetId, EnvelopeId, Posting, PostingId, PostingStatus};
+use kuatia_types::{
+    Account, AccountId, AssetId, EnvelopeId, Journal, JournalId, Posting, PostingId, PostingStatus,
+};
 
 use crate::error::StoreError;
 use crate::events::{EventStore, LedgerEvent};
-use crate::store::{AccountStore, EnvelopeRecord, PostingStore, SagaStore, TransferStore};
+use crate::store::{
+    AccountStore, EnvelopeRecord, JournalStore, PostingStore, SagaStore, TransferStore,
+};
 
 /// In-memory [`Store`](crate::store::Store) implementation backed by `RwLock<HashMap>`.
 pub struct InMemoryStore {
@@ -20,6 +24,7 @@ pub struct InMemoryStore {
     transfers: RwLock<HashMap<EnvelopeId, EnvelopeRecord>>,
     sagas: RwLock<HashMap<i64, Vec<u8>>>,
     events: RwLock<Vec<LedgerEvent>>,
+    journals: RwLock<HashMap<JournalId, Journal>>,
     autoid: AutoId,
 }
 
@@ -38,6 +43,7 @@ impl InMemoryStore {
             transfers: RwLock::new(HashMap::new()),
             sagas: RwLock::new(HashMap::new()),
             events: RwLock::new(Vec::new()),
+            journals: RwLock::new(HashMap::new()),
             autoid: AutoId::new(),
         }
     }
@@ -312,5 +318,33 @@ impl EventStore for InMemoryStore {
             .take(limit as usize)
             .cloned()
             .collect())
+    }
+}
+
+#[async_trait]
+impl JournalStore for InMemoryStore {
+    async fn create_journal(&self, journal: Journal) -> Result<(), StoreError> {
+        let mut journals = self.journals.write().await;
+        if journals.contains_key(&journal.id) {
+            return Err(StoreError::AlreadyExists(format!(
+                "journal {:?}",
+                journal.id
+            )));
+        }
+        journals.insert(journal.id, journal);
+        Ok(())
+    }
+
+    async fn get_journal(&self, id: &JournalId) -> Result<Journal, StoreError> {
+        let journals = self.journals.read().await;
+        journals
+            .get(id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(format!("journal {id:?}")))
+    }
+
+    async fn list_journals(&self) -> Result<Vec<Journal>, StoreError> {
+        let journals = self.journals.read().await;
+        Ok(journals.values().cloned().collect())
     }
 }
