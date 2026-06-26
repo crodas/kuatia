@@ -9,8 +9,10 @@ Auditable, multi-asset UTXO-style ledger in Rust.
 
 kuatia models value as **postings** — signed amounts owned by exactly one account.
 Transfers atomically consume existing postings and create new ones, enforcing
-per-asset conservation (double-entry bookkeeping). There are no mutable balance
-fields; an account's balance is always the sum of its active postings.
+per-asset conservation. This gives the same safety guarantee as double-entry
+bookkeeping (`Σ debits = Σ credits`), expressed as `sum(consumed) == sum(created)`
+per asset over signed postings. There are no mutable balance fields; an account's
+balance is always the sum of its active postings.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -36,7 +38,7 @@ fields; an account's balance is always the sum of its active postings.
 |-------|---------|
 | **kuatia-types** | Domain types — `AccountId`, `Posting`, `Transfer`, `Cent`, etc. |
 | **kuatia-core** | Pure, sans-IO decision logic — validation, hashing, posting selection. |
-| **kuatia-storage** | `Store` trait (5 sub-traits), `InMemoryStore`, `store_tests!` conformance macro. |
+| **kuatia-storage** | `Store` trait (6 sub-traits), `InMemoryStore`, `store_tests!` conformance macro. |
 | **kuatia-storage-sql** | SQL-backed `Store` — SQLite and PostgreSQL via sqlx. |
 | **kuatia** | Async resource layer — `Ledger`, saga commit pipeline, intent-layer API. |
 
@@ -70,6 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - [Crate Reference](doc/crates.md) — modules, types, and APIs per crate
 - [Accounts](doc/accounts.md) — account model, policies, and lifecycle
 - [Transfers](doc/transfers.md) — Movement struct, resolve algorithm, and TransferBuilder API
+- [Glossary](doc/glossary.md) — terms, book scoping, and worked examples
+- [Accounting Mapping](doc/accounting-mapping.md) — how classical double-entry concepts map onto kuatia
 
 ## License
 

@@ -1,5 +1,6 @@
 [package]
 name = "kuatia"
+description = "Append-only, auditable, multi-asset UTXO-style ledger: async resource and saga commit pipeline."
 version = "0.1.0"
 edition = "2024"
 license.workspace = true

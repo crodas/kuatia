@@ -30,5 +30,5 @@ store.migrate().await?;
 
 ## Schema
 
-Five tables: `accounts`, `postings`, `transfers`, `transfer_accounts`, `sagas`.
-Migrations run via `store.migrate()`.
+Tables: `accounts`, `postings`, `transfers`, `transfer_accounts`, `sagas`,
+`events`, `books`. Migrations run via `store.migrate()`.

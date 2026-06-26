@@ -2,7 +2,7 @@
 
 ## What is this
 
-Kuatia is an append-only, auditable, multi-asset UTXO-style ledger library in Rust. Value is tracked as signed postings — no mutable balance fields. Transfers atomically consume and create postings, enforcing per-asset conservation (double-entry bookkeeping).
+Kuatia is an append-only, auditable, multi-asset UTXO-style ledger library in Rust. Value is tracked as signed postings — no mutable balance fields. Transfers atomically consume and create postings, enforcing per-asset conservation — the double-entry-style safety invariant (`sum(consumed) == sum(created)` per asset).
 
 ## Crate layout
 
@@ -10,7 +10,7 @@ Kuatia is an append-only, auditable, multi-asset UTXO-style ledger library in Ru
 crates/
   kuatia-types/     Domain types: AccountId, Posting, Movement, Cent, AutoId, etc.
   kuatia-core/      Pure, sync, no-IO logic: validation, hashing, posting selection
-  kuatia-storage/   Store trait (5 sub-traits), InMemoryStore, conformance tests
+  kuatia-storage/   Store trait (6 sub-traits), InMemoryStore, conformance tests
   kuatia-storage-sql/  SQL backend: SQLite/PostgreSQL via sqlx
   kuatia/           Async layer: Ledger resource, saga pipeline, intent API
 doc/
@@ -19,6 +19,7 @@ doc/
   accounts.md       Account model, policies, lifecycle
   transfers.md      Transfer/Movement API, resolve algorithm
   glossary.md       Terms, book design, exchange & supermarket examples
+  accounting-mapping.md  Classical double-entry ↔ Kuatia term mapping
 ```
 
 ## Key concepts
@@ -60,7 +61,7 @@ Deposit: two movements cancel to zero net debit on the system account — no pos
 ## Testing
 
 ```bash
-cargo test          # runs all 119 tests across all crates
+cargo test          # runs all tests across all crates
 cargo test -p kuatia-core   # pure core tests only
 cargo test -p kuatia        # integration + saga tests
 ```

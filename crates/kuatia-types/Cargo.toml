@@ -1,5 +1,6 @@
 [package]
 name = "kuatia-types"
+description = "Domain types for the Kuatia ledger: postings, accounts, transfers, books."
 version = "0.1.0"
 edition = "2024"
 license.workspace = true

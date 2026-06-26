@@ -1,5 +1,7 @@
 # Glossary & Usage Guide
 
+> Coming from classical accounting? See [accounting-mapping.md](accounting-mapping.md) for how journals, entries, and ledgers map onto Kuatia's transfers, postings, and books.
+
 ## Terms
 
 ### Posting
@@ -49,7 +51,7 @@ An empty policy (no restrictions) allows any account and any asset.
 
 ### Conservation
 
-For every transfer, for each asset: `sum(consumed) == sum(created)`. This is the double-entry bookkeeping invariant, enforced at the type level. No value is created or destroyed — it only moves.
+For every transfer, for each asset: `sum(consumed) == sum(created)`. This is the double-entry-style safety invariant (the UTXO-model equivalent of `Σ debits = Σ credits`), enforced at the type level. No value is created or destroyed — it only moves.
 
 ### AutoId
 

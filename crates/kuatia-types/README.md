@@ -14,9 +14,10 @@ This crate is the foundation — every other kuatia crate depends on it.
 | `EnvelopeId([u8; 32])` | Content-addressed transfer hash |
 | `PostingId { transfer, index }` | Posting identity within a transfer |
 | `Cent(i64)` | Smallest monetary unit, checked arithmetic |
-| `Posting` | Signed amount owned by one account |
+| `Posting` | Signed amount owned by one account (positive = held, negative = offset) |
 | `Transfer` | Atomic unit: consumes + creates postings |
-| `Account` | Versioned entity with policy and flags |
+| `Account` | Versioned entity with policy, flags, and book |
+| `Book` / `BookId` | Transfer policy scope — gates which accounts/assets may participate |
 | `PostingStatus` | `Active` → `PendingInactive` → `Inactive` |
 
 ## Traits

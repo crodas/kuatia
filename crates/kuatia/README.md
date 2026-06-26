@@ -68,3 +68,9 @@ legend! {
     }
 }
 ```
+
+## See also
+
+- [doc/accounting-mapping.md](../../doc/accounting-mapping.md) — how classical
+  double-entry concepts (journal, journal entry, ledger) map onto kuatia's
+  transfer log, transfers, and postings.
