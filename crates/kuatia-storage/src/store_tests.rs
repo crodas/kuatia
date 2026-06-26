@@ -25,7 +25,7 @@ fn make_account(id: i64, policy: AccountPolicy) -> Account {
         version: 1,
         policy,
         flags: AccountFlags::empty(),
-        journal: JournalId(0),
+        book: BookId(0),
         user_data: UserData::default(),
         metadata: BTreeMap::new(),
     }
@@ -50,7 +50,7 @@ fn make_posting(
     }
 }
 
-fn make_envelope_with_journal(journal: JournalId) -> (Envelope, EnvelopeId) {
+fn make_envelope_with_book(book: BookId) -> (Envelope, EnvelopeId) {
     let t = EnvelopeBuilder::new()
         .creates(vec![
             NewPosting {
@@ -66,11 +66,11 @@ fn make_envelope_with_journal(journal: JournalId) -> (Envelope, EnvelopeId) {
                 payer: None,
             },
         ])
-        .journal(journal)
+        .book(book)
         .build();
-    // Use journal id to create distinct EnvelopeIds.
+    // Use book id to create distinct EnvelopeIds.
     let mut tid_bytes = [0u8; 32];
-    tid_bytes[0] = journal.0 as u8;
+    tid_bytes[0] = book.0 as u8;
     tid_bytes[1] = 42;
     (t, EnvelopeId(tid_bytes))
 }
@@ -494,7 +494,7 @@ pub async fn query_transfers_by_date_range(store: &(impl Store + 'static)) {
         .await
         .unwrap();
 
-    let (e2, t2) = make_envelope_with_journal(JournalId(1));
+    let (e2, t2) = make_envelope_with_book(BookId(1));
     store
         .store_transfer(EnvelopeRecord {
             envelope: e2,
@@ -571,7 +571,7 @@ pub async fn query_transfers_by_book(store: &(impl Store + 'static)) {
         .await
         .unwrap();
 
-    let (e2, t2) = make_envelope_with_journal(JournalId(5));
+    let (e2, t2) = make_envelope_with_book(BookId(5));
     store
         .store_transfer(EnvelopeRecord {
             envelope: e2,
@@ -584,13 +584,13 @@ pub async fn query_transfers_by_book(store: &(impl Store + 'static)) {
     let page = store
         .query_transfers(&TransferQuery {
             account: Some(AccountId::new(1)),
-            journal: Some(JournalId(5)),
+            book: Some(BookId(5)),
             ..Default::default()
         })
         .await
         .unwrap();
     assert_eq!(page.total, 1);
-    assert_eq!(page.items[0].envelope.journal(), JournalId(5));
+    assert_eq!(page.items[0].envelope.book(), BookId(5));
 }
 
 // ---------------------------------------------------------------------------
@@ -673,6 +673,50 @@ pub async fn events_sequence_ordering(store: &(impl Store + 'static)) {
 }
 
 // ---------------------------------------------------------------------------
+// BookStore
+// ---------------------------------------------------------------------------
+
+fn make_book(id: i64, name: &str) -> Book {
+    BookBuilder::new(name)
+        .id(BookId::new(id))
+        .allow_asset(AssetId::new(1))
+        .build()
+}
+
+/// Create a book and read it back.
+pub async fn create_and_get_book(store: &(impl Store + 'static)) {
+    let book = make_book(1, "sales");
+    store.create_book(book.clone()).await.unwrap();
+    let got = store.get_book(&BookId::new(1)).await.unwrap();
+    assert_eq!(got, book);
+}
+
+/// Duplicate book creation fails.
+pub async fn create_duplicate_book_fails(store: &(impl Store + 'static)) {
+    let book = make_book(1, "sales");
+    store.create_book(book.clone()).await.unwrap();
+    let err = store.create_book(book).await.unwrap_err();
+    assert!(matches!(err, StoreError::AlreadyExists(_)));
+}
+
+/// Get a non-existent book returns NotFound.
+pub async fn get_missing_book_fails(store: &(impl Store + 'static)) {
+    let err = store.get_book(&BookId::new(999)).await.unwrap_err();
+    assert!(matches!(err, StoreError::NotFound(_)));
+}
+
+/// List all books.
+pub async fn list_books(store: &(impl Store + 'static)) {
+    store.create_book(make_book(1, "sales")).await.unwrap();
+    store.create_book(make_book(2, "inventory")).await.unwrap();
+    let mut books = store.list_books().await.unwrap();
+    books.sort_by_key(|b| b.id.0);
+    assert_eq!(books.len(), 2);
+    assert_eq!(books[0].name, "sales");
+    assert_eq!(books[1].name, "inventory");
+}
+
+// ---------------------------------------------------------------------------
 // Macro
 // ---------------------------------------------------------------------------
 
@@ -723,6 +767,11 @@ macro_rules! store_tests {
             // EventStore
             append_and_query_events,
             events_sequence_ordering,
+            // BookStore
+            create_and_get_book,
+            create_duplicate_book_fails,
+            get_missing_book_fails,
+            list_books,
         );
     };
 

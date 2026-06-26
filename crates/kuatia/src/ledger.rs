@@ -219,7 +219,7 @@ impl Ledger {
         let mut envelope = EnvelopeBuilder::new()
             .consumes(consumes)
             .creates(creates)
-            .journal(transfer.journal)
+            .book(transfer.book)
             .user_data(transfer.user_data.clone())
             .metadata(transfer.metadata.clone())
             .build();
@@ -264,7 +264,7 @@ impl Ledger {
     /// Steps: resolve movements into envelope -> reserve consumed postings ->
     /// validate -> finalize.
     /// On failure, legend compensates completed steps in reverse order.
-    #[instrument(skip(self, transfer), fields(journal = transfer.journal.0), name = "ledger.commit")]
+    #[instrument(skip(self, transfer), fields(book = transfer.book.0), name = "ledger.commit")]
     pub async fn commit(self: &Arc<Self>, transfer: Transfer) -> Result<Receipt, LedgerError> {
         let saga = TransferSaga::new(TransferSagaInputs {
             resolve: ResolveInput {
@@ -352,7 +352,7 @@ impl Ledger {
         let reverse_envelope = EnvelopeBuilder::new()
             .consumes(created_posting_ids)
             .creates(new_postings)
-            .journal(original.journal())
+            .book(original.book())
             .metadata(original.metadata().clone())
             .build();
 
@@ -561,25 +561,25 @@ impl Ledger {
         Ok(())
     }
 
-    /// Create a new journal.
-    pub async fn create_journal(
+    /// Create a new book.
+    pub async fn create_book(
         &self,
-        journal: kuatia_core::Journal,
+        book: kuatia_core::Book,
     ) -> Result<(), LedgerError> {
-        Ok(self.store.create_journal(journal).await?)
+        Ok(self.store.create_book(book).await?)
     }
 
-    /// Fetch a journal by id.
-    pub async fn get_journal(
+    /// Fetch a book by id.
+    pub async fn get_book(
         &self,
-        id: &kuatia_core::JournalId,
-    ) -> Result<kuatia_core::Journal, LedgerError> {
-        Ok(self.store.get_journal(id).await?)
+        id: &kuatia_core::BookId,
+    ) -> Result<kuatia_core::Book, LedgerError> {
+        Ok(self.store.get_book(id).await?)
     }
 
-    /// List all journals.
-    pub async fn list_journals(&self) -> Result<Vec<kuatia_core::Journal>, LedgerError> {
-        Ok(self.store.list_journals().await?)
+    /// List all books.
+    pub async fn list_books(&self) -> Result<Vec<kuatia_core::Book>, LedgerError> {
+        Ok(self.store.list_books().await?)
     }
 
     /// Query ledger events after a given sequence number.

@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use kuatia_types::{
-    Account, AccountId, AssetId, Envelope, EnvelopeId, Journal, JournalId, Posting, PostingId,
+    Account, AccountId, AssetId, Envelope, EnvelopeId, Book, BookId, Posting, PostingId,
     PostingStatus, Receipt,
 };
 
@@ -50,8 +50,8 @@ pub struct TransferQuery {
     pub from_ts: Option<i64>,
     /// Exclusive upper bound (unix millis).
     pub to_ts: Option<i64>,
-    /// Filter by journal.
-    pub journal: Option<JournalId>,
+    /// Filter by book.
+    pub book: Option<BookId>,
     /// Max results to return.
     pub limit: Option<u32>,
     /// Number of results to skip.
@@ -173,8 +173,8 @@ pub trait TransferStore: Send + Sync {
                 {
                     return false;
                 }
-                if let Some(journal) = query.journal
-                    && r.envelope.journal() != journal
+                if let Some(book) = query.book
+                    && r.envelope.book() != book
                 {
                     return false;
                 }
@@ -202,15 +202,15 @@ pub trait SagaStore: Send + Sync {
     async fn delete_saga(&self, id: &i64) -> Result<(), StoreError>;
 }
 
-/// Journal persistence.
+/// Book persistence.
 #[async_trait]
-pub trait JournalStore: Send + Sync {
-    /// Create a new journal.
-    async fn create_journal(&self, journal: Journal) -> Result<(), StoreError>;
-    /// Fetch a journal by id.
-    async fn get_journal(&self, id: &JournalId) -> Result<Journal, StoreError>;
-    /// List all journals.
-    async fn list_journals(&self) -> Result<Vec<Journal>, StoreError>;
+pub trait BookStore: Send + Sync {
+    /// Create a new book.
+    async fn create_book(&self, book: Book) -> Result<(), StoreError>;
+    /// Fetch a book by id.
+    async fn get_book(&self, id: &BookId) -> Result<Book, StoreError>;
+    /// List all books.
+    async fn list_books(&self) -> Result<Vec<Book>, StoreError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -219,11 +219,11 @@ pub trait JournalStore: Send + Sync {
 
 /// Async storage abstraction composing all sub-traits.
 pub trait Store:
-    AccountStore + PostingStore + TransferStore + SagaStore + EventStore + JournalStore
+    AccountStore + PostingStore + TransferStore + SagaStore + EventStore + BookStore
 {
 }
 
-impl<T: AccountStore + PostingStore + TransferStore + SagaStore + EventStore + JournalStore> Store
+impl<T: AccountStore + PostingStore + TransferStore + SagaStore + EventStore + BookStore> Store
     for T
 {
 }

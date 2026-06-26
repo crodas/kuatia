@@ -8,13 +8,13 @@ use tokio::sync::RwLock;
 
 use kuatia_types::autoid::AutoId;
 use kuatia_types::{
-    Account, AccountId, AssetId, EnvelopeId, Journal, JournalId, Posting, PostingId, PostingStatus,
+    Account, AccountId, AssetId, EnvelopeId, Book, BookId, Posting, PostingId, PostingStatus,
 };
 
 use crate::error::StoreError;
 use crate::events::{EventStore, LedgerEvent};
 use crate::store::{
-    AccountStore, EnvelopeRecord, JournalStore, PostingStore, SagaStore, TransferStore,
+    AccountStore, EnvelopeRecord, BookStore, PostingStore, SagaStore, TransferStore,
 };
 
 /// In-memory [`Store`](crate::store::Store) implementation backed by `RwLock<HashMap>`.
@@ -24,7 +24,7 @@ pub struct InMemoryStore {
     transfers: RwLock<HashMap<EnvelopeId, EnvelopeRecord>>,
     sagas: RwLock<HashMap<i64, Vec<u8>>>,
     events: RwLock<Vec<LedgerEvent>>,
-    journals: RwLock<HashMap<JournalId, Journal>>,
+    books: RwLock<HashMap<BookId, Book>>,
     autoid: AutoId,
 }
 
@@ -43,7 +43,7 @@ impl InMemoryStore {
             transfers: RwLock::new(HashMap::new()),
             sagas: RwLock::new(HashMap::new()),
             events: RwLock::new(Vec::new()),
-            journals: RwLock::new(HashMap::new()),
+            books: RwLock::new(HashMap::new()),
             autoid: AutoId::new(),
         }
     }
@@ -322,29 +322,29 @@ impl EventStore for InMemoryStore {
 }
 
 #[async_trait]
-impl JournalStore for InMemoryStore {
-    async fn create_journal(&self, journal: Journal) -> Result<(), StoreError> {
-        let mut journals = self.journals.write().await;
-        if journals.contains_key(&journal.id) {
+impl BookStore for InMemoryStore {
+    async fn create_book(&self, book: Book) -> Result<(), StoreError> {
+        let mut books = self.books.write().await;
+        if books.contains_key(&book.id) {
             return Err(StoreError::AlreadyExists(format!(
-                "journal {:?}",
-                journal.id
+                "book {:?}",
+                book.id
             )));
         }
-        journals.insert(journal.id, journal);
+        books.insert(book.id, book);
         Ok(())
     }
 
-    async fn get_journal(&self, id: &JournalId) -> Result<Journal, StoreError> {
-        let journals = self.journals.read().await;
-        journals
+    async fn get_book(&self, id: &BookId) -> Result<Book, StoreError> {
+        let books = self.books.read().await;
+        books
             .get(id)
             .cloned()
-            .ok_or_else(|| StoreError::NotFound(format!("journal {id:?}")))
+            .ok_or_else(|| StoreError::NotFound(format!("book {id:?}")))
     }
 
-    async fn list_journals(&self) -> Result<Vec<Journal>, StoreError> {
-        let journals = self.journals.read().await;
-        Ok(journals.values().cloned().collect())
+    async fn list_books(&self) -> Result<Vec<Book>, StoreError> {
+        let books = self.books.read().await;
+        Ok(books.values().cloned().collect())
     }
 }

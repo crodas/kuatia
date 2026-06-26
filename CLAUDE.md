@@ -18,7 +18,7 @@ doc/
   crates.md         Crate reference: modules, types, APIs
   accounts.md       Account model, policies, lifecycle
   transfers.md      Transfer/Movement API, resolve algorithm
-  glossary.md       Terms, journal design, exchange & supermarket examples
+  glossary.md       Terms, book design, exchange & supermarket examples
 ```
 
 ## Key concepts

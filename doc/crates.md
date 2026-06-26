@@ -30,7 +30,7 @@ Pure, sans-IO (Input/Output) decision logic. No async runtime, near-zero depende
 | `NewPosting` | Posting to be created (no id yet — assigned during validation) |
 | `Transfer` | Atomic unit: consumes postings + creates postings + metadata |
 | `EnvelopeBuilder` | Fluent builder for `Transfer` construction |
-| `Account` | Versioned entity with policy, flags, book/code, user_data, metadata |
+| `Account` | Versioned entity with policy, flags, book, user_data, metadata |
 | `AccountPolicy` | Balance floor rule: `NoOverdraft`, `CappedOverdraft`, `UncappedOverdraft`, `SystemAccount`, `ExternalAccount` |
 | `AccountFlags` | Bitflags: `FROZEN`, `CLOSED` |
 | `UserData` | Fixed 28 bytes (u128 + u64 + u32) for correlation IDs, external refs |
@@ -150,7 +150,7 @@ Transfers are built via `TransferBuilder` and committed with `ledger.commit(tran
 | `balance(account, asset)` | Sum of non-Inactive postings (computed by Ledger) |
 | `list_accounts()` | All current account snapshots |
 | `get_account(id)` | Latest account snapshot |
-| `query_transfers(query)` | Paginated, filtered transfer history (by date range, book, code) |
+| `query_transfers(query)` | Paginated, filtered transfer history (by date range, book) |
 | `history(account)` | All transfers involving an account |
 | `postings(account)` | All postings (any status) |
 | `query_postings(query)` | Paginated, filtered postings (by asset, status) |

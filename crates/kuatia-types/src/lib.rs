@@ -411,17 +411,17 @@ impl AssetId {
     }
 }
 
-/// Identifies a journal — a named scope for transfers.
+/// Identifies a book — a named scope for transfers.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct JournalId(pub i64);
+pub struct BookId(pub i64);
 
-impl fmt::Debug for JournalId {
+impl fmt::Debug for BookId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "JournalId({})", self.0)
+        write!(f, "BookId({})", self.0)
     }
 }
 
-impl Default for JournalId {
+impl Default for BookId {
     fn default() -> Self {
         thread_local! {
             static GEN: crate::autoid::AutoId = crate::autoid::AutoId::new();
@@ -430,25 +430,34 @@ impl Default for JournalId {
     }
 }
 
-impl JournalId {
-    /// Create a `JournalId` from an `i64`.
+impl BookId {
+    /// Create a `BookId` from an `i64`.
     pub const fn new(id: i64) -> Self {
         Self(id)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Journal
+// Book
 // ---------------------------------------------------------------------------
 
-/// A journal scopes which accounts and assets may participate in transfers.
-/// Accounts and balances are global — journals only gate participation.
+/// A Book is a transfer policy scope: it gates which accounts and assets may
+/// participate in a transfer. It is **not** the chronological entry log (the
+/// transfer log plays that role), and it does **not** partition balances —
+/// balances are global; a Book only gates participation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Journal {
-    /// Stable identity for this journal.
-    pub id: JournalId,
+pub struct Book {
+    /// Stable identity for this book.
+    pub id: BookId,
     /// Human-readable name.
     pub name: String,
+    /// Participation rules for this book.
+    pub policy: BookPolicy,
+}
+
+/// The participation rules for a [`Book`]. An empty field means "no restriction".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookPolicy {
     /// If non-empty, only these assets may appear in movements.
     pub allowed_assets: Vec<AssetId>,
     /// If non-empty, accounts with ANY of these flags may participate.
@@ -457,52 +466,54 @@ pub struct Journal {
     pub allowed_accounts: Vec<AccountId>,
 }
 
-/// Builder for constructing [`Journal`] values.
-pub struct JournalBuilder {
-    journal: Journal,
+/// Builder for constructing [`Book`] values.
+pub struct BookBuilder {
+    book: Book,
 }
 
-impl JournalBuilder {
-    /// Create a new journal builder with the given name.
+impl BookBuilder {
+    /// Create a new book builder with the given name.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
-            journal: Journal {
-                id: JournalId::default(),
+            book: Book {
+                id: BookId::default(),
                 name: name.into(),
-                allowed_assets: Vec::new(),
-                allowed_flags: AccountFlags::empty(),
-                allowed_accounts: Vec::new(),
+                policy: BookPolicy {
+                    allowed_assets: Vec::new(),
+                    allowed_flags: AccountFlags::empty(),
+                    allowed_accounts: Vec::new(),
+                },
             },
         }
     }
 
-    /// Set the journal id explicitly.
-    pub fn id(mut self, id: JournalId) -> Self {
-        self.journal.id = id;
+    /// Set the book id explicitly.
+    pub fn id(mut self, id: BookId) -> Self {
+        self.book.id = id;
         self
     }
 
     /// Add an allowed asset.
     pub fn allow_asset(mut self, asset: AssetId) -> Self {
-        self.journal.allowed_assets.push(asset);
+        self.book.policy.allowed_assets.push(asset);
         self
     }
 
     /// Set allowed account flags — accounts with ANY of these flags may participate.
     pub fn allow_flags(mut self, flags: AccountFlags) -> Self {
-        self.journal.allowed_flags = flags;
+        self.book.policy.allowed_flags = flags;
         self
     }
 
     /// Add a specific allowed account.
     pub fn allow_account(mut self, account: AccountId) -> Self {
-        self.journal.allowed_accounts.push(account);
+        self.book.policy.allowed_accounts.push(account);
         self
     }
 
-    /// Consume the builder and return the [`Journal`].
-    pub fn build(self) -> Journal {
-        self.journal
+    /// Consume the builder and return the [`Book`].
+    pub fn build(self) -> Book {
+        self.book
     }
 }
 
@@ -604,8 +615,8 @@ pub struct Envelope {
     pub creates: Vec<NewPosting>,
     /// Account version pins for optimistic concurrency.
     pub account_snapshots: Vec<AccountSnapshotId>,
-    /// Journal this envelope belongs to.
-    pub journal: JournalId,
+    /// Book this envelope belongs to.
+    pub book: BookId,
     /// Fixed-width secondary identifiers.
     pub user_data: UserData,
     /// Free-form key-value metadata.
@@ -628,9 +639,9 @@ impl Envelope {
         &self.account_snapshots
     }
 
-    /// Journal this envelope belongs to.
-    pub fn journal(&self) -> JournalId {
-        self.journal
+    /// Book this envelope belongs to.
+    pub fn book(&self) -> BookId {
+        self.book
     }
 
     /// Fixed-width secondary identifiers.
@@ -685,9 +696,9 @@ impl EnvelopeBuilder {
         self
     }
 
-    /// Set the journal.
-    pub fn journal(mut self, journal: JournalId) -> Self {
-        self.envelope.journal = journal;
+    /// Set the book.
+    pub fn book(mut self, book: BookId) -> Self {
+        self.envelope.book = book;
         self
     }
 
@@ -742,8 +753,8 @@ bitflags::bitflags! {
     /// Lifecycle and user-defined flags for an [`Account`].
     ///
     /// Bits 0–7 are reserved for system flags. Bits 8–31 are available for
-    /// user-defined flags, which can be used with [`Journal::allowed_flags`]
-    /// to scope which accounts may participate in a journal.
+    /// user-defined flags, which can be used with [`BookPolicy::allowed_flags`]
+    /// to scope which accounts may participate in a book.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AccountFlags: u32 {
         /// Account may not be the source or destination of any transfer.
@@ -782,8 +793,8 @@ pub struct Account {
     pub policy: AccountPolicy,
     /// Lifecycle flags (frozen, closed).
     pub flags: AccountFlags,
-    /// Journal this entity belongs to.
-    pub journal: JournalId,
+    /// Book this entity belongs to.
+    pub book: BookId,
     /// Fixed-width secondary identifiers.
     pub user_data: UserData,
     /// Free-form key-value metadata.
@@ -843,8 +854,8 @@ pub struct Movement {
 pub struct Transfer {
     /// Movements to execute atomically.
     pub movements: Vec<Movement>,
-    /// Journal this entity belongs to.
-    pub journal: JournalId,
+    /// Book this entity belongs to.
+    pub book: BookId,
     /// Fixed-width secondary identifiers.
     pub user_data: UserData,
     /// Free-form key-value metadata.
@@ -912,9 +923,9 @@ impl TransferBuilder {
         self.movement(from, external, asset, amount)
     }
 
-    /// Set the journal.
-    pub fn journal(mut self, journal: JournalId) -> Self {
-        self.transfer.journal = journal;
+    /// Set the book.
+    pub fn book(mut self, book: BookId) -> Self {
+        self.transfer.book = book;
         self
     }
 
@@ -1009,7 +1020,7 @@ impl ToBytes for AccountFlags {
     }
 }
 
-impl ToBytes for JournalId {
+impl ToBytes for BookId {
     fn to_bytes(&self) -> Vec<u8> {
         self.0.to_be_bytes().to_vec()
     }
@@ -1068,7 +1079,7 @@ impl ToBytes for Envelope {
             buf.extend(snap.to_bytes());
         }
 
-        buf.extend(self.journal.to_bytes());
+        buf.extend(self.book.to_bytes());
         buf.extend(self.user_data.to_bytes());
 
         write_u32(&mut buf, self.metadata.len() as u32);
@@ -1092,7 +1103,7 @@ impl ToBytes for Account {
         write_u64(&mut buf, self.version);
         buf.extend(self.policy.to_bytes());
         buf.extend(self.flags.to_bytes());
-        buf.extend(self.journal.to_bytes());
+        buf.extend(self.book.to_bytes());
         buf.extend(self.user_data.to_bytes());
 
         write_u32(&mut buf, self.metadata.len() as u32);

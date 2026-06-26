@@ -180,7 +180,7 @@ The `commit()` convenience method auto-populates snapshots when none are provide
 
 The conservation invariant is: for each asset, the sum of consumed posting values must equal the sum of created posting values.
 
-Conservation boundaries are **per-asset only**. The `book` and `code` fields on transfers and accounts are grouping labels for reporting — they do not affect conservation enforcement.
+Conservation boundaries are **per-asset only**. The `book` field on transfers and accounts is a transfer policy scope (which accounts/assets may participate) — it does not affect conservation enforcement, and it does not partition balances.
 
 ## Account Policies
 

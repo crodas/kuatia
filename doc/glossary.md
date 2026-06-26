@@ -15,7 +15,7 @@ Lifecycle: `Active` → `PendingInactive` (reserved by saga) → `Inactive` (con
 
 A versioned entity that owns postings. Balance is never stored — it is always the sum of non-inactive postings for a given (account, asset) pair.
 
-Accounts have a **policy** (balance floor rule), **flags** (lifecycle + user-defined), and a **journal** assignment.
+Accounts have a **policy** (balance floor rule), **flags** (lifecycle + user-defined), and a **book** assignment.
 
 ### Asset
 
@@ -33,16 +33,19 @@ One or more movements to execute atomically. Built via `TransferBuilder`, commit
 
 The resolved, concrete form of a transfer: which postings to consume and which to create. Produced internally by the resolve step. Available for direct use via `commit_atomic(envelope)`.
 
-### Journal
+### Book
 
-A named scope that controls which accounts and assets may participate in transfers. Journals do **not** partition balances — accounts and their balances are global. Journals only gate *who can transact with whom in what context*.
+A **Book is a transfer policy scope** — it gates which accounts and assets may participate in a transfer. Note what it is *not*:
 
-A journal has:
+- It is **not** the classical accounting journal (the chronological book of entries). That role is played by the append-only transfer log itself.
+- It does **not** partition balances. Accounts and their balances are global; a Book only gates *who can transact with whom in what context*.
+
+A book is `{ id, name, policy }`, where the `policy` (`BookPolicy`) holds:
 - `allowed_assets` — if non-empty, only these assets may appear in movements.
 - `allowed_flags` — if non-empty, accounts with ANY of these flags may participate.
 - `allowed_accounts` — if non-empty, these specific accounts may participate (in addition to flag matches).
 
-An empty journal (no restrictions) allows any account and any asset.
+An empty policy (no restrictions) allows any account and any asset.
 
 ### Conservation
 
@@ -69,29 +72,29 @@ use kuatia::prelude::*;
 let usd = AssetId::new(1);
 let eur = AssetId::new(2);
 
-// Journals — separate deposit/withdrawal flows from trading
-let deposits_journal = JournalBuilder::new("deposits")
+// Books — separate deposit/withdrawal flows from trading
+let deposits_book = BookBuilder::new("deposits")
     .allow_asset(usd)
     .allow_asset(eur)
     .allow_flags(AccountFlags::USER_0 | AccountFlags::USER_1) // wallets + bank
     .build();
 
-let trading_journal = JournalBuilder::new("trading")
+let trading_book = BookBuilder::new("trading")
     .allow_asset(usd)
     .allow_asset(eur)
     .allow_flags(AccountFlags::USER_0) // only user wallets
     .allow_account(exchange_pool)       // + the exchange pool
     .build();
 
-ledger.create_journal(deposits_journal).await?;
-ledger.create_journal(trading_journal).await?;
+ledger.create_book(deposits_book).await?;
+ledger.create_book(trading_book).await?;
 
 // Accounts
 let bank = Account {
     id: AccountId::default(),
     policy: AccountPolicy::ExternalAccount,
     flags: AccountFlags::USER_1, // bank flag
-    journal: deposits_journal.id,
+    book: deposits_book.id,
     ..Default::default()
 };
 
@@ -99,7 +102,7 @@ let alice = Account {
     id: AccountId::default(),
     policy: AccountPolicy::NoOverdraft,
     flags: AccountFlags::USER_0, // wallet flag
-    journal: deposits_journal.id,
+    book: deposits_book.id,
     ..Default::default()
 };
 
@@ -107,7 +110,7 @@ let exchange_pool = Account {
     id: AccountId::default(),
     policy: AccountPolicy::SystemAccount,
     flags: AccountFlags::empty(),
-    journal: trading_journal.id,
+    book: trading_book.id,
     ..Default::default()
 };
 ```
@@ -116,7 +119,7 @@ let exchange_pool = Account {
 
 ```rust
 let deposit = TransferBuilder::new()
-    .journal(deposits_journal.id)
+    .book(deposits_book.id)
     .deposit(alice.id, usd, Cent::from(10_000), bank.id)?
     .build();
 ledger.commit(deposit).await?;
@@ -128,7 +131,7 @@ ledger.commit(deposit).await?;
 
 ```rust
 let trade = TransferBuilder::new()
-    .journal(trading_journal.id)
+    .book(trading_book.id)
     .pay(alice.id, exchange_pool, usd, Cent::from(5_000))
     .pay(exchange_pool, alice.id, eur, Cent::from(4_600))
     .build();
@@ -141,7 +144,7 @@ ledger.commit(trade).await?;
 
 ```rust
 let withdrawal = TransferBuilder::new()
-    .journal(deposits_journal.id)
+    .book(deposits_book.id)
     .withdraw(alice.id, eur, Cent::from(4_600), bank.id)
     .build();
 ledger.commit(withdrawal).await?;
@@ -170,22 +173,22 @@ const CUSTOMER: AccountFlags = AccountFlags::USER_1;
 const REVENUE: AccountFlags = AccountFlags::USER_2;
 const BANK: AccountFlags = AccountFlags::USER_3;
 
-// Journals
-let sales_journal = JournalBuilder::new("sales")
+// Books
+let sales_book = BookBuilder::new("sales")
     .allow_asset(gs)
     .allow_asset(product_a)
     .allow_asset(product_b)
     .allow_flags(WAREHOUSE | CUSTOMER | REVENUE)
     .build();
 
-let inventory_journal = JournalBuilder::new("inventory")
+let inventory_book = BookBuilder::new("inventory")
     .allow_asset(product_a)
     .allow_asset(product_b)
     .allow_flags(WAREHOUSE)
     .allow_account(world) // issuance source
     .build();
 
-let banking_journal = JournalBuilder::new("banking")
+let banking_book = BookBuilder::new("banking")
     .allow_asset(gs)
     .allow_flags(WAREHOUSE | BANK)
     .build();
@@ -232,7 +235,7 @@ let bank = Account {
 
 ```rust
 let receipt = TransferBuilder::new()
-    .journal(inventory_journal.id)
+    .book(inventory_book.id)
     .pay(world, warehouse.id, product_a, Cent::from(50_000)) // 50.000 units (precision 3)
     .build();
 ledger.commit(receipt).await?;
@@ -244,7 +247,7 @@ ledger.commit(receipt).await?;
 
 ```rust
 let sale = TransferBuilder::new()
-    .journal(sales_journal.id)
+    .book(sales_book.id)
     // Move product from warehouse to customer (consumed by sale)
     .pay(warehouse.id, customer.id, product_a, Cent::from(2_000))
     // Customer pays cash
@@ -261,7 +264,7 @@ ledger.commit(sale).await?;
 
 ```rust
 let deposit = TransferBuilder::new()
-    .journal(banking_journal.id)
+    .book(banking_book.id)
     .pay(cash_register.id, bank.id, gs, Cent::from(30_000))
     .build();
 ledger.commit(deposit).await?;
@@ -283,19 +286,19 @@ let total_cogs = ledger.balance(&cogs.id, &gs).await?;
 // 20,000 Gs — gross profit = revenue - cogs = 10,000 Gs
 ```
 
-**Why journals matter here:** The `sales` journal prevents a bug where a bank transfer accidentally credits the revenue account. The `banking` journal ensures only cash and bank accounts participate in deposits. Each flow is isolated by scope while sharing the same global balances.
+**Why books matter here:** The `sales` book prevents a bug where a bank transfer accidentally credits the revenue account. The `banking` book ensures only cash and bank accounts participate in deposits. Each flow is isolated by scope while sharing the same global balances.
 
 ---
 
-## Journal Design
+## Book Design
 
-### When to use journals
+### When to use books
 
-- **Always** — even if you only have one flow, defining a journal documents what assets and accounts are expected.
-- **Multiple flows** — separate journals for sales, payments, inventory, banking. Prevents cross-contamination.
-- **Multi-tenant** — one journal per tenant with `allowed_accounts` restricting to that tenant's accounts.
+- **Always** — even if you only have one flow, defining a book documents what assets and accounts are expected.
+- **Multiple flows** — separate books for sales, payments, inventory, banking. Prevents cross-contamination.
+- **Multi-tenant** — one book per tenant with `allowed_accounts` restricting to that tenant's accounts.
 
-### Journal scoping rules
+### Book scoping rules
 
 | Field | Empty | Non-empty |
 |-------|-------|-----------|
@@ -303,13 +306,13 @@ let total_cogs = ledger.balance(&cogs.id, &gs).await?;
 | `allowed_flags` | Flag check skipped | Accounts with ANY matching flag pass |
 | `allowed_accounts` | Account check skipped | Listed accounts always pass (even without matching flags) |
 
-An account passes the journal check if:
+An account passes the book check if:
 1. It matches `allowed_flags` (any flag in common), OR
 2. It is explicitly listed in `allowed_accounts`, OR
-3. Both lists are empty (unrestricted journal).
+3. Both lists are empty (unrestricted book).
 
-### Journals do NOT partition balances
+### Books do NOT partition balances
 
-An account's balance is the sum of all its non-inactive postings across ALL journals. If Alice receives 100 USD via the `deposits` journal and spends 50 USD via the `trading` journal, her balance is 50 USD — not 100 in one journal and -50 in another.
+An account's balance is the sum of all its non-inactive postings across ALL books. If Alice receives 100 USD via the `deposits` book and spends 50 USD via the `trading` book, her balance is 50 USD — not 100 in one book and -50 in another.
 
-This is intentional: journals scope *access*, not *state*.
+This is intentional: books scope *access*, not *state*.
