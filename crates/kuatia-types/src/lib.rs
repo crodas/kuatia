@@ -859,6 +859,21 @@ pub struct Account {
 }
 
 impl Account {
+    /// Create a version-1 account with the given policy: no flags, the default
+    /// book, and empty user data / metadata. Convenience for the common case —
+    /// set the other fields explicitly when you need them.
+    pub fn new(id: AccountId, policy: AccountPolicy) -> Self {
+        Self {
+            id,
+            version: 1,
+            policy,
+            flags: AccountFlags::empty(),
+            book: DEFAULT_BOOK,
+            user_data: UserData::default(),
+            metadata: Metadata::new(),
+        }
+    }
+
     /// Returns `true` if the account has the `FROZEN` flag set.
     pub fn is_frozen(&self) -> bool {
         self.flags.contains(AccountFlags::FROZEN)

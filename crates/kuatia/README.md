@@ -31,7 +31,7 @@ let receipt = ledger.commit(transfer).await?;
 1. **Resolve** — convert Transfer intent into concrete Envelope
 2. **Reserve** — batch CAS: Active → PendingInactive
 3. **Validate** — pure `validate_and_plan()`
-4. **Finalize** — PendingInactive → Inactive, create new postings, emit event
+4. **Finalize** — one atomic `commit_transfer`: deactivate consumed postings, create new ones, persist the transfer record and account index, and emit the event — all in a single transaction
 
 ### Atomic commit
 
@@ -68,6 +68,20 @@ legend! {
     }
 }
 ```
+
+## Examples
+
+Runnable programs in [`examples/`](examples/) connect to a real SQLite-backed
+ledger (via `sqlx`) and walk through the core operations:
+
+```sh
+cargo run -p kuatia --example create_accounts   # create user/system/external accounts
+cargo run -p kuatia --example fund_and_trade     # fund two accounts in different assets, then swap
+cargo run -p kuatia --example withdraw           # fund an account, then withdraw out of the ledger
+```
+
+Each opens an in-memory SQLite database (`sqlite::memory:`); point the
+connection string at a file or a Postgres URL for a persistent ledger.
 
 ## See also
 

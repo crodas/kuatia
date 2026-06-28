@@ -586,9 +586,11 @@ dependencies = [
  "async-trait",
  "kuatia-core",
  "kuatia-storage",
+ "kuatia-storage-sql",
  "kuatia-types",
  "legend",
  "serde",
+ "sqlx",
  "tokio",
  "tracing",
 ]

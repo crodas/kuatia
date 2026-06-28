@@ -20,3 +20,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# For the runnable examples — connect to a real SQLite-backed ledger.
+kuatia-storage-sql = { path = "../kuatia-storage-sql" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "any", "sqlite"] }
