@@ -161,6 +161,7 @@ impl Ledger {
                 deactivate: &plan.postings_to_deactivate,
                 create: &plan.postings_to_create,
                 cas_guards: &plan.cas_guards,
+                account_guards: &plan.account_guards,
                 reservation: None,
                 record: EnvelopeRecord {
                     envelope: envelope.clone(),
@@ -458,14 +459,13 @@ impl Ledger {
         next.version = next.version.checked_add(1).ok_or(LedgerError::Overflow)?;
         next.flags |= kuatia_core::AccountFlags::FROZEN;
         self.store.append_account_version(next).await?;
-        let _ = self
-            .store
+        self.store
             .append_event(&LedgerEvent {
                 seq: 0,
                 timestamp: now_millis()?,
                 kind: LedgerEventKind::AccountFrozen { account_id: *id },
             })
-            .await;
+            .await?;
         Ok(())
     }
 
@@ -484,14 +484,13 @@ impl Ledger {
         next.version = next.version.checked_add(1).ok_or(LedgerError::Overflow)?;
         next.flags.remove(kuatia_core::AccountFlags::FROZEN);
         self.store.append_account_version(next).await?;
-        let _ = self
-            .store
+        self.store
             .append_event(&LedgerEvent {
                 seq: 0,
                 timestamp: now_millis()?,
                 kind: LedgerEventKind::AccountUnfrozen { account_id: *id },
             })
-            .await;
+            .await?;
         Ok(())
     }
 
@@ -506,12 +505,16 @@ impl Ledger {
         if current.is_closed() {
             return Err(LedgerError::AccountAlreadyClosed(*id));
         }
-        let has_active = !self
+        // Reject if any posting is still live — Active or PendingInactive
+        // (reserved, i.e. a transfer in flight). Only fully Inactive postings
+        // (or none) permit a close.
+        let blocking = self
             .store
-            .get_postings_by_account(id, None, Some(PostingStatus::Active))
+            .get_postings_by_account(id, None, None)
             .await?
-            .is_empty();
-        if has_active {
+            .into_iter()
+            .any(|p| p.status != PostingStatus::Inactive);
+        if blocking {
             return Err(LedgerError::AccountNotEmpty(*id));
         }
         let mut next = current.clone();
@@ -519,14 +522,13 @@ impl Ledger {
         next.flags |= kuatia_core::AccountFlags::CLOSED;
         next.flags.remove(kuatia_core::AccountFlags::FROZEN);
         self.store.append_account_version(next).await?;
-        let _ = self
-            .store
+        self.store
             .append_event(&LedgerEvent {
                 seq: 0,
                 timestamp: now_millis()?,
                 kind: LedgerEventKind::AccountClosed { account_id: *id },
             })
-            .await;
+            .await?;
         Ok(())
     }
 
@@ -600,14 +602,13 @@ impl Ledger {
     pub async fn create_account(&self, account: kuatia_core::Account) -> Result<(), LedgerError> {
         let id = account.id;
         self.store.create_account(account).await?;
-        let _ = self
-            .store
+        self.store
             .append_event(&LedgerEvent {
                 seq: 0,
                 timestamp: now_millis()?,
                 kind: LedgerEventKind::AccountCreated { account_id: id },
             })
-            .await;
+            .await?;
         Ok(())
     }
 

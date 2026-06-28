@@ -531,6 +531,29 @@ async fn close_account_with_balance_rejected() {
 }
 
 #[tokio::test]
+async fn close_rejects_reserved_postings() {
+    let ledger = setup_ledger().await;
+
+    deposit(&ledger, account(1), usd(), Cent::from(100), external()).await;
+
+    // Reserve the account's only posting (a transfer in flight): Active → PendingInactive.
+    let postings = ledger
+        .store()
+        .get_postings_by_account(&account(1), Some(&usd()), Some(PostingStatus::Active))
+        .await
+        .unwrap();
+    ledger
+        .store()
+        .reserve_postings(&[postings[0].id], ReservationId::new(1))
+        .await
+        .unwrap();
+
+    // Close must reject: the posting is live (PendingInactive), not Inactive.
+    let result = ledger.close(&account(1)).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
 async fn freeze_closed_account_rejected() {
     let ledger = setup_ledger().await;
 

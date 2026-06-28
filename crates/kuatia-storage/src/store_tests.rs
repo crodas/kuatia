@@ -96,6 +96,88 @@ fn make_envelope() -> (Envelope, EnvelopeId) {
     (t, tid)
 }
 
+/// Seed `create` as Active postings. Since the split write APIs are gone,
+/// `commit_transfer` is the only mutation path; we wrap it in a throwaway
+/// transfer whose envelope mirrors the seeded postings so both the SQL index
+/// (`transfer_accounts`, built from `req.create`) and the InMemory index (built
+/// from the envelope) stay consistent. `tag` keeps the seed transfer id unique
+/// within a test so idempotency doesn't swallow the insert.
+async fn seed_active(store: &(impl Store + 'static), tag: u8, create: &[Posting]) {
+    let creates: Vec<NewPosting> = create
+        .iter()
+        .map(|p| NewPosting {
+            owner: p.owner,
+            asset: p.asset,
+            value: p.value,
+            payer: None,
+        })
+        .collect();
+    let envelope = EnvelopeBuilder::new().creates(creates).build();
+    let mut tid_bytes = [0u8; 32];
+    tid_bytes[0] = tag;
+    let tid = EnvelopeId(tid_bytes);
+    store
+        .commit_transfer(CommitRequest {
+            deactivate: &[],
+            create,
+            cas_guards: &[],
+            account_guards: &[],
+            reservation: None,
+            record: EnvelopeRecord {
+                envelope,
+                receipt: Receipt { transfer_id: tid },
+                created_at: 0,
+            },
+            events: &[],
+        })
+        .await
+        .unwrap();
+}
+
+/// Persist `envelope` as a committed transfer, deriving its created postings the
+/// way the ledger does (`PostingId { transfer: tid, index }`). The faithful
+/// replacement for the removed `store_transfer` — it populates the account index
+/// on both backends.
+async fn commit_envelope(
+    store: &(impl Store + 'static),
+    envelope: Envelope,
+    tid: EnvelopeId,
+    created_at: i64,
+) {
+    let create: Vec<Posting> = envelope
+        .creates()
+        .iter()
+        .enumerate()
+        .map(|(i, np)| {
+            Posting::new(
+                PostingId {
+                    transfer: tid,
+                    index: i as u16,
+                },
+                np.owner,
+                np.asset,
+                np.value,
+            )
+        })
+        .collect();
+    store
+        .commit_transfer(CommitRequest {
+            deactivate: &[],
+            create: &create,
+            cas_guards: &[],
+            account_guards: &[],
+            reservation: None,
+            record: EnvelopeRecord {
+                envelope,
+                receipt: Receipt { transfer_id: tid },
+                created_at,
+            },
+            events: &[],
+        })
+        .await
+        .unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // AccountStore tests
 // ---------------------------------------------------------------------------
@@ -199,13 +281,10 @@ pub async fn list_accounts(store: &(impl Store + 'static)) {
 // PostingStore tests
 // ---------------------------------------------------------------------------
 
-/// Finalize with empty deactivate creates new postings.
-pub async fn finalize_creates_postings(store: &(impl Store + 'static)) {
+/// Committing with empty deactivate creates new postings.
+pub async fn commit_creates_postings(store: &(impl Store + 'static)) {
     let p = make_posting([1; 32], 0, 1, 1, 100);
-    store
-        .finalize_postings(&[], std::slice::from_ref(&p))
-        .await
-        .unwrap();
+    seed_active(store, 200, std::slice::from_ref(&p)).await;
 
     let got = store.get_postings(&[p.id]).await.unwrap();
     assert_eq!(got.len(), 1);
@@ -227,7 +306,7 @@ pub async fn get_postings_by_account_filters(store: &(impl Store + 'static)) {
     let p1 = make_posting([1; 32], 0, 1, 1, 100);
     let p2 = make_posting([1; 32], 1, 1, 2, 200);
     let p3 = make_posting([1; 32], 2, 2, 1, 300);
-    store.finalize_postings(&[], &[p1, p2, p3]).await.unwrap();
+    seed_active(store, 200, &[p1, p2, p3]).await;
 
     let all = store
         .get_postings_by_account(&AccountId::new(1), None, None)
@@ -255,7 +334,7 @@ pub async fn query_postings_pagination(store: &(impl Store + 'static)) {
     let postings: Vec<Posting> = (0..5)
         .map(|i| make_posting([1; 32], i, 1, 1, (i as i64 + 1) * 100))
         .collect();
-    store.finalize_postings(&[], &postings).await.unwrap();
+    seed_active(store, 200, &postings).await;
 
     // Page 1: first 2
     let page1 = store
@@ -318,10 +397,7 @@ pub async fn query_postings_pagination(store: &(impl Store + 'static)) {
 pub async fn reserve_postings_batch(store: &(impl Store + 'static)) {
     let p1 = make_posting([1; 32], 0, 1, 1, 100);
     let p2 = make_posting([1; 32], 1, 1, 1, 200);
-    store
-        .finalize_postings(&[], &[p1.clone(), p2.clone()])
-        .await
-        .unwrap();
+    seed_active(store, 200, &[p1.clone(), p2.clone()]).await;
 
     store.reserve_postings(&[p1.id, p2.id], ReservationId::new(1)).await.unwrap();
 
@@ -336,10 +412,7 @@ pub async fn reserve_postings_batch(store: &(impl Store + 'static)) {
 pub async fn reserve_non_active_fails(store: &(impl Store + 'static)) {
     let p1 = make_posting([1; 32], 0, 1, 1, 100);
     let p2 = make_posting([1; 32], 1, 1, 1, 200);
-    store
-        .finalize_postings(&[], &[p1.clone(), p2.clone()])
-        .await
-        .unwrap();
+    seed_active(store, 200, &[p1.clone(), p2.clone()]).await;
 
     store.reserve_postings(&[p1.id], ReservationId::new(1)).await.unwrap();
 
@@ -353,10 +426,7 @@ pub async fn reserve_non_active_fails(store: &(impl Store + 'static)) {
 /// Release reserved postings back to Active.
 pub async fn release_postings_batch(store: &(impl Store + 'static)) {
     let p1 = make_posting([1; 32], 0, 1, 1, 100);
-    store
-        .finalize_postings(&[], std::slice::from_ref(&p1))
-        .await
-        .unwrap();
+    seed_active(store, 200, std::slice::from_ref(&p1)).await;
     store.reserve_postings(&[p1.id], ReservationId::new(1)).await.unwrap();
 
     store.release_postings(&[p1.id], ReservationId::new(1)).await.unwrap();
@@ -368,10 +438,7 @@ pub async fn release_postings_batch(store: &(impl Store + 'static)) {
 /// Releasing an Active posting is a no-op (succeeds silently).
 pub async fn release_active_is_noop(store: &(impl Store + 'static)) {
     let p1 = make_posting([1; 32], 0, 1, 1, 100);
-    store
-        .finalize_postings(&[], std::slice::from_ref(&p1))
-        .await
-        .unwrap();
+    seed_active(store, 200, std::slice::from_ref(&p1)).await;
 
     store.release_postings(&[p1.id], ReservationId::new(1)).await.unwrap();
 
@@ -382,29 +449,45 @@ pub async fn release_active_is_noop(store: &(impl Store + 'static)) {
 /// Releasing an Inactive (void) posting fails.
 pub async fn release_inactive_fails(store: &(impl Store + 'static)) {
     let p1 = make_posting([1; 32], 0, 1, 1, 100);
+    seed_active(store, 200, std::slice::from_ref(&p1)).await;
+
+    // Deactivate p1 (raw path: still Active) so the release sees a void posting.
     store
-        .finalize_postings(&[], std::slice::from_ref(&p1))
+        .commit_transfer(CommitRequest {
+            deactivate: &[p1.id],
+            create: &[],
+            cas_guards: &[],
+            account_guards: &[],
+            reservation: None,
+            record: commit_record(EnvelopeId([3; 32]), vec![p1.id]),
+            events: &[],
+        })
         .await
         .unwrap();
-
-    store.finalize_postings(&[p1.id], &[]).await.unwrap();
 
     let err = store.release_postings(&[p1.id], ReservationId::new(1)).await.unwrap_err();
     assert!(matches!(err, StoreError::PostingInactive(_)));
 }
 
-/// Finalize transitions PendingInactive → Inactive.
-pub async fn finalize_deactivates_postings(store: &(impl Store + 'static)) {
+/// Committing a reserved posting transitions it PendingInactive → Inactive while
+/// inserting the newly created posting.
+pub async fn commit_deactivates_postings(store: &(impl Store + 'static)) {
     let p1 = make_posting([1; 32], 0, 1, 1, 100);
-    store
-        .finalize_postings(&[], std::slice::from_ref(&p1))
-        .await
-        .unwrap();
+    seed_active(store, 200, std::slice::from_ref(&p1)).await;
     store.reserve_postings(&[p1.id], ReservationId::new(1)).await.unwrap();
 
     let p2 = make_posting([2; 32], 0, 1, 1, 100);
+    // Saga path: p1 is PendingInactive owned by reservation 1.
     store
-        .finalize_postings(&[p1.id], std::slice::from_ref(&p2))
+        .commit_transfer(CommitRequest {
+            deactivate: &[p1.id],
+            create: std::slice::from_ref(&p2),
+            cas_guards: &[],
+            account_guards: &[],
+            reservation: Some(ReservationId::new(1)),
+            record: commit_record(EnvelopeId([2; 32]), vec![p1.id]),
+            events: &[],
+        })
         .await
         .unwrap();
 
@@ -442,10 +525,7 @@ fn commit_record(tid: EnvelopeId, consumes: Vec<PostingId>) -> EnvelopeRecord {
 /// events atomically; the consumed-only owner is indexed for history.
 pub async fn commit_transfer_atomic(store: &(impl Store + 'static)) {
     let consumed = make_posting([7; 32], 0, 1, 1, 100); // owned by account 1
-    store
-        .finalize_postings(&[], std::slice::from_ref(&consumed))
-        .await
-        .unwrap();
+    seed_active(store, 200, std::slice::from_ref(&consumed)).await;
 
     let created = make_posting([8; 32], 0, 2, 1, 100); // owned by account 2
     let tid = EnvelopeId([8; 32]);
@@ -459,6 +539,7 @@ pub async fn commit_transfer_atomic(store: &(impl Store + 'static)) {
             deactivate: &[consumed.id],
             create: std::slice::from_ref(&created),
             cas_guards: &[],
+            account_guards: &[],
             reservation: None,
             record: commit_record(tid, vec![consumed.id]),
             events: &events,
@@ -480,6 +561,8 @@ pub async fn commit_transfer_atomic(store: &(impl Store + 'static)) {
     assert!(store.get_transfer(&tid).await.unwrap().is_some());
 
     // History indexes BOTH the created owner (2) and the consumed-only owner (1).
+    // Account 2 appears only in this transfer; account 1 appears here and in the
+    // seed transfer that funded it, so its history contains this transfer.
     assert_eq!(
         store
             .get_transfers_for_account(&AccountId::new(2))
@@ -488,13 +571,13 @@ pub async fn commit_transfer_atomic(store: &(impl Store + 'static)) {
             .len(),
         1
     );
-    assert_eq!(
+    assert!(
         store
             .get_transfers_for_account(&AccountId::new(1))
             .await
             .unwrap()
-            .len(),
-        1
+            .iter()
+            .any(|r| r.receipt.transfer_id == tid)
     );
 
     // The event was appended in the same commit.
@@ -504,10 +587,7 @@ pub async fn commit_transfer_atomic(store: &(impl Store + 'static)) {
 /// A second commit of the same transfer id is a no-op (idempotent).
 pub async fn commit_transfer_idempotent(store: &(impl Store + 'static)) {
     let consumed = make_posting([7; 32], 0, 1, 1, 100);
-    store
-        .finalize_postings(&[], std::slice::from_ref(&consumed))
-        .await
-        .unwrap();
+    seed_active(store, 200, std::slice::from_ref(&consumed)).await;
     let created = make_posting([8; 32], 0, 2, 1, 100);
     let tid = EnvelopeId([8; 32]);
     store
@@ -515,6 +595,7 @@ pub async fn commit_transfer_idempotent(store: &(impl Store + 'static)) {
             deactivate: &[],
             create: std::slice::from_ref(&created),
             cas_guards: &[],
+            account_guards: &[],
             reservation: None,
             record: commit_record(tid, vec![]),
             events: &[],
@@ -527,6 +608,7 @@ pub async fn commit_transfer_idempotent(store: &(impl Store + 'static)) {
             deactivate: &[],
             create: std::slice::from_ref(&created),
             cas_guards: &[],
+            account_guards: &[],
             reservation: None,
             record: commit_record(tid, vec![]),
             events: &[],
@@ -539,10 +621,7 @@ pub async fn commit_transfer_idempotent(store: &(impl Store + 'static)) {
 /// commit_transfer rejects consuming a posting reserved by a different saga.
 pub async fn commit_transfer_reservation_mismatch(store: &(impl Store + 'static)) {
     let consumed = make_posting([7; 32], 0, 1, 1, 100);
-    store
-        .finalize_postings(&[], std::slice::from_ref(&consumed))
-        .await
-        .unwrap();
+    seed_active(store, 200, std::slice::from_ref(&consumed)).await;
     // Reserved under reservation 1.
     store
         .reserve_postings(&[consumed.id], ReservationId::new(1))
@@ -557,6 +636,7 @@ pub async fn commit_transfer_reservation_mismatch(store: &(impl Store + 'static)
             deactivate: &[consumed.id],
             create: std::slice::from_ref(&created),
             cas_guards: &[],
+            account_guards: &[],
             reservation: Some(ReservationId::new(2)),
             record: commit_record(tid, vec![consumed.id]),
             events: &[],
@@ -569,10 +649,7 @@ pub async fn commit_transfer_reservation_mismatch(store: &(impl Store + 'static)
 /// commit_transfer aborts with Conflict when a CAS guard's balance is stale.
 pub async fn commit_transfer_cas_conflict(store: &(impl Store + 'static)) {
     let consumed = make_posting([7; 32], 0, 1, 1, 100);
-    store
-        .finalize_postings(&[], std::slice::from_ref(&consumed))
-        .await
-        .unwrap();
+    seed_active(store, 200, std::slice::from_ref(&consumed)).await;
     let created = make_posting([8; 32], 0, 2, 1, 100);
     let tid = EnvelopeId([8; 32]);
     // Guard claims account 1 holds 50, but it actually holds 100.
@@ -581,6 +658,7 @@ pub async fn commit_transfer_cas_conflict(store: &(impl Store + 'static)) {
             deactivate: &[consumed.id],
             create: std::slice::from_ref(&created),
             cas_guards: &[(AccountId::new(1), AssetId::new(1), Cent::from(50))],
+            account_guards: &[],
             reservation: None,
             record: commit_record(tid, vec![consumed.id]),
             events: &[],
@@ -593,18 +671,94 @@ pub async fn commit_transfer_cas_conflict(store: &(impl Store + 'static)) {
 }
 
 // ---------------------------------------------------------------------------
+// Race regressions — the conditional-update / guard fixes. Expressed
+// sequentially (the conformance harness holds a single `&store`); the second
+// attempt is what must fail.
+// ---------------------------------------------------------------------------
+
+/// Reserving an already-reserved posting fails — no two reservations can own it.
+pub async fn reserve_twice_second_fails(store: &(impl Store + 'static)) {
+    let p1 = make_posting([1; 32], 0, 1, 1, 100);
+    seed_active(store, 200, std::slice::from_ref(&p1)).await;
+
+    store.reserve_postings(&[p1.id], ReservationId::new(1)).await.unwrap();
+    let err = store
+        .reserve_postings(&[p1.id], ReservationId::new(2))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::PostingNotActive(_)));
+}
+
+/// A posting cannot be consumed twice: once committed (Inactive), a second raw
+/// commit consuming it is rejected — the double-spend guard.
+pub async fn commit_double_spend_second_fails(store: &(impl Store + 'static)) {
+    let consumed = make_posting([7; 32], 0, 1, 1, 100);
+    seed_active(store, 200, std::slice::from_ref(&consumed)).await;
+
+    let created1 = make_posting([8; 32], 0, 2, 1, 100);
+    store
+        .commit_transfer(CommitRequest {
+            deactivate: &[consumed.id],
+            create: std::slice::from_ref(&created1),
+            cas_guards: &[],
+            account_guards: &[],
+            reservation: None,
+            record: commit_record(EnvelopeId([8; 32]), vec![consumed.id]),
+            events: &[],
+        })
+        .await
+        .unwrap();
+
+    let created2 = make_posting([9; 32], 0, 2, 1, 100);
+    let err = store
+        .commit_transfer(CommitRequest {
+            deactivate: &[consumed.id],
+            create: std::slice::from_ref(&created2),
+            cas_guards: &[],
+            account_guards: &[],
+            reservation: None,
+            record: commit_record(EnvelopeId([9; 32]), vec![consumed.id]),
+            events: &[],
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ReservationMismatch(_)));
+}
+
+/// A commit whose pinned account version is stale aborts with VersionConflict,
+/// closing the validate→commit window against a concurrent lifecycle mutation.
+pub async fn commit_stale_account_guard_fails(store: &(impl Store + 'static)) {
+    let acc = make_account(1, AccountPolicy::NoOverdraft); // version 1
+    store.create_account(acc.clone()).await.unwrap();
+    // A concurrent freeze/close would bump the version like this.
+    let mut bumped = acc.clone();
+    bumped.version = 2;
+    store.append_account_version(bumped).await.unwrap();
+
+    let created = make_posting([8; 32], 0, 1, 1, 100);
+    let err = store
+        .commit_transfer(CommitRequest {
+            deactivate: &[],
+            create: std::slice::from_ref(&created),
+            cas_guards: &[],
+            account_guards: &[(AccountId::new(1), 1)],
+            reservation: None,
+            record: commit_record(EnvelopeId([8; 32]), vec![]),
+            events: &[],
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::VersionConflict { .. }));
+}
+
+// ---------------------------------------------------------------------------
 // TransferStore tests
 // ---------------------------------------------------------------------------
 
-/// Store a transfer record and retrieve by id.
-pub async fn store_and_get_transfer(store: &(impl Store + 'static)) {
+/// Commit a transfer and retrieve it by id.
+pub async fn commit_and_get_transfer(store: &(impl Store + 'static)) {
     let (envelope, tid) = make_envelope();
-    let record = EnvelopeRecord {
-        envelope,
-        receipt: Receipt { transfer_id: tid },
-        created_at: 1000,
-    };
-    store.store_transfer(record.clone()).await.unwrap();
+    commit_envelope(store, envelope, tid, 1000).await;
 
     let got = store.get_transfer(&tid).await.unwrap();
     assert!(got.is_some());
@@ -620,12 +774,7 @@ pub async fn get_missing_transfer(store: &(impl Store + 'static)) {
 /// Query transfers by account.
 pub async fn get_transfers_for_account(store: &(impl Store + 'static)) {
     let (envelope, tid) = make_envelope();
-    let record = EnvelopeRecord {
-        envelope,
-        receipt: Receipt { transfer_id: tid },
-        created_at: 1000,
-    };
-    store.store_transfer(record).await.unwrap();
+    commit_envelope(store, envelope, tid, 1000).await;
 
     let records = store
         .get_transfers_for_account(&AccountId::new(1))
@@ -640,15 +789,10 @@ pub async fn get_transfers_for_account(store: &(impl Store + 'static)) {
     assert!(empty.is_empty());
 }
 
-/// Verify that created_at roundtrips through store/retrieve.
-pub async fn store_transfer_preserves_created_at(store: &(impl Store + 'static)) {
+/// Verify that created_at roundtrips through commit/retrieve.
+pub async fn commit_preserves_created_at(store: &(impl Store + 'static)) {
     let (envelope, tid) = make_envelope();
-    let record = EnvelopeRecord {
-        envelope,
-        receipt: Receipt { transfer_id: tid },
-        created_at: 1718000000000,
-    };
-    store.store_transfer(record.clone()).await.unwrap();
+    commit_envelope(store, envelope, tid, 1718000000000).await;
 
     let got = store.get_transfer(&tid).await.unwrap().unwrap();
     assert_eq!(got.created_at, 1718000000000);
@@ -661,24 +805,10 @@ pub async fn store_transfer_preserves_created_at(store: &(impl Store + 'static))
 /// Query transfers by date range.
 pub async fn query_transfers_by_date_range(store: &(impl Store + 'static)) {
     let (e1, t1) = make_envelope();
-    store
-        .store_transfer(EnvelopeRecord {
-            envelope: e1,
-            receipt: Receipt { transfer_id: t1 },
-            created_at: 1000,
-        })
-        .await
-        .unwrap();
+    commit_envelope(store, e1, t1, 1000).await;
 
     let (e2, t2) = make_envelope_with_book(BookId(1));
-    store
-        .store_transfer(EnvelopeRecord {
-            envelope: e2,
-            receipt: Receipt { transfer_id: t2 },
-            created_at: 2000,
-        })
-        .await
-        .unwrap();
+    commit_envelope(store, e2, t2, 2000).await;
 
     let page = store
         .query_transfers(&TransferQuery {
@@ -700,14 +830,7 @@ pub async fn query_transfers_pagination(store: &(impl Store + 'static)) {
         tid_bytes[0] = i + 10;
         let (envelope, _) = make_envelope();
         let tid = EnvelopeId(tid_bytes);
-        store
-            .store_transfer(EnvelopeRecord {
-                envelope,
-                receipt: Receipt { transfer_id: tid },
-                created_at: (i as i64 + 1) * 1000,
-            })
-            .await
-            .unwrap();
+        commit_envelope(store, envelope, tid, (i as i64 + 1) * 1000).await;
     }
 
     let page = store
@@ -738,24 +861,10 @@ pub async fn query_transfers_pagination(store: &(impl Store + 'static)) {
 /// Query transfers by book.
 pub async fn query_transfers_by_book(store: &(impl Store + 'static)) {
     let (e1, t1) = make_envelope(); // book = 0
-    store
-        .store_transfer(EnvelopeRecord {
-            envelope: e1,
-            receipt: Receipt { transfer_id: t1 },
-            created_at: 1000,
-        })
-        .await
-        .unwrap();
+    commit_envelope(store, e1, t1, 1000).await;
 
     let (e2, t2) = make_envelope_with_book(BookId(5));
-    store
-        .store_transfer(EnvelopeRecord {
-            envelope: e2,
-            receipt: Receipt { transfer_id: t2 },
-            created_at: 2000,
-        })
-        .await
-        .unwrap();
+    commit_envelope(store, e2, t2, 2000).await;
 
     let page = store
         .query_transfers(&TransferQuery {
@@ -918,7 +1027,7 @@ macro_rules! store_tests {
             get_account_history,
             list_accounts,
             // PostingStore
-            finalize_creates_postings,
+            commit_creates_postings,
             get_postings_missing_fails,
             get_postings_by_account_filters,
             query_postings_pagination,
@@ -927,17 +1036,20 @@ macro_rules! store_tests {
             release_postings_batch,
             release_active_is_noop,
             release_inactive_fails,
-            finalize_deactivates_postings,
+            commit_deactivates_postings,
             // CommitStore
             commit_transfer_atomic,
             commit_transfer_idempotent,
             commit_transfer_reservation_mismatch,
             commit_transfer_cas_conflict,
+            reserve_twice_second_fails,
+            commit_double_spend_second_fails,
+            commit_stale_account_guard_fails,
             // TransferStore
-            store_and_get_transfer,
+            commit_and_get_transfer,
             get_missing_transfer,
             get_transfers_for_account,
-            store_transfer_preserves_created_at,
+            commit_preserves_created_at,
             // TransferQuery
             query_transfers_by_date_range,
             query_transfers_pagination,

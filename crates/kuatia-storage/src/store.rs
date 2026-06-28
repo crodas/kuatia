@@ -40,6 +40,10 @@ pub struct CommitRequest<'a> {
     /// `(account, asset, expected_balance)` guards to verify before mutating —
     /// a mismatch means a concurrent transfer moved the balance ([`StoreError::Conflict`]).
     pub cas_guards: &'a [(AccountId, AssetId, Cent)],
+    /// `(account, expected_version)` guards re-checked atomically at commit — a
+    /// mismatch means a concurrent lifecycle mutation (freeze/unfreeze/close)
+    /// bumped the account version after validation ([`StoreError::VersionConflict`]).
+    pub account_guards: &'a [(AccountId, u64)],
     /// Reservation authorizing consumption of `deactivate`.
     /// - `None` — raw path: the postings must be `Active`.
     /// - `Some(rid)` — saga path: the postings must be `PendingInactive` owned by `rid`.
@@ -142,12 +146,6 @@ pub trait PostingStore: Send + Sync {
         ids: &[PostingId],
         reservation: ReservationId,
     ) -> Result<(), StoreError>;
-    /// Deactivate postings and insert newly created postings.
-    async fn finalize_postings(
-        &self,
-        deactivate: &[PostingId],
-        create: &[Posting],
-    ) -> Result<(), StoreError>;
 
     /// Query postings with filtering and pagination.
     async fn query_postings(&self, query: &PostingQuery) -> Result<Page<Posting>, StoreError> {
@@ -171,8 +169,6 @@ pub trait PostingStore: Send + Sync {
 pub trait TransferStore: Send + Sync {
     /// Fetch a transfer record by its content-addressed id.
     async fn get_transfer(&self, id: &EnvelopeId) -> Result<Option<EnvelopeRecord>, StoreError>;
-    /// Persist a committed transfer and its receipt.
-    async fn store_transfer(&self, record: EnvelopeRecord) -> Result<(), StoreError>;
     /// Return all transfers involving the given account.
     async fn get_transfers_for_account(
         &self,

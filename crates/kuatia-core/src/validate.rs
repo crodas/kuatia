@@ -45,6 +45,10 @@ pub struct Plan {
     pub postings_to_create: Vec<Posting>,
     /// CAS guards for CappedOverdraft accounts: (account, asset, expected_balance).
     pub cas_guards: Vec<(AccountId, AssetId, Cent)>,
+    /// Account version guards: (account, expected_version). Each pinned account
+    /// snapshot is re-checked atomically at commit so a concurrent
+    /// freeze/unfreeze/close (which bump `version`) aborts the transfer.
+    pub account_guards: Vec<(AccountId, u64)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +284,9 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
     }
 
     // 5b. Snapshot pinning: each account_snapshot must match current state.
+    //     Emit a version guard per pinned account so the commit boundary can
+    //     re-check atomically against concurrent lifecycle mutations.
+    let mut account_guards: Vec<(AccountId, u64)> = Vec::new();
     for snap in envelope.account_snapshots() {
         let account = input
             .accounts
@@ -293,6 +300,7 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
                 actual,
             });
         }
+        account_guards.push((snap.account, account.version));
     }
 
     // 5c. Book policy: gate which assets and accounts may participate. Enforced
@@ -475,6 +483,7 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
         postings_to_deactivate,
         postings_to_create,
         cas_guards,
+        account_guards,
     })
 }
 

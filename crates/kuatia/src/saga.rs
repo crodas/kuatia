@@ -346,6 +346,7 @@ impl Step<LedgerCtx, SagaError> for FinalizeTransferStep {
                     deactivate: &plan.postings_to_deactivate,
                     create: &plan.postings_to_create,
                     cas_guards: &plan.cas_guards,
+                    account_guards: &plan.account_guards,
                     reservation: Some(ctx.reservation),
                     record: EnvelopeRecord {
                         envelope: envelope.clone(),

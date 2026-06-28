@@ -218,24 +218,6 @@ impl PostingStore for InMemoryStore {
         Ok(())
     }
 
-    async fn finalize_postings(
-        &self,
-        deactivate: &[PostingId],
-        create: &[Posting],
-    ) -> Result<(), StoreError> {
-        let mut postings = self.postings.write().await;
-        for pid in deactivate {
-            let p = postings
-                .get_mut(pid)
-                .ok_or_else(|| StoreError::NotFound(format!("posting {pid:?}")))?;
-            p.status = PostingStatus::Inactive;
-            p.reservation = None;
-        }
-        for posting in create {
-            postings.insert(posting.id, posting.clone());
-        }
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,12 +229,6 @@ impl TransferStore for InMemoryStore {
     async fn get_transfer(&self, id: &EnvelopeId) -> Result<Option<EnvelopeRecord>, StoreError> {
         let transfers = self.transfers.read().await;
         Ok(transfers.get(id).cloned())
-    }
-
-    async fn store_transfer(&self, record: EnvelopeRecord) -> Result<(), StoreError> {
-        let mut transfers = self.transfers.write().await;
-        transfers.insert(record.receipt.transfer_id, record);
-        Ok(())
     }
 
     async fn get_transfers_for_account(
@@ -376,8 +352,11 @@ impl BookStore for InMemoryStore {
 #[async_trait]
 impl CommitStore for InMemoryStore {
     async fn commit_transfer(&self, req: CommitRequest<'_>) -> Result<(), StoreError> {
-        // Lock order postings → transfers → events; every reader that takes more
-        // than one of these must follow the same order.
+        // Lock order accounts → postings → transfers → events; every reader that
+        // takes more than one of these must follow the same order. Holding the
+        // accounts read lock for the whole commit keeps the version guard (step
+        // 2b) atomic against a concurrent lifecycle mutation.
+        let accounts = self.accounts.read().await;
         let mut postings = self.postings.write().await;
         let mut transfers = self.transfers.write().await;
         let mut events = self.events.write().await;
@@ -407,6 +386,23 @@ impl CommitStore for InMemoryStore {
                 return Err(StoreError::Conflict {
                     account: *account,
                     asset: *asset,
+                });
+            }
+        }
+
+        // 2b. Account version guards — a concurrent freeze/unfreeze/close bumps
+        //     the version, invalidating the snapshot pinned at validation.
+        for (account, expected) in req.account_guards {
+            let actual = accounts
+                .get(account)
+                .and_then(|versions| versions.last())
+                .map(|a| a.version)
+                .ok_or(StoreError::NotFound(format!("account {account:?}")))?;
+            if actual != *expected {
+                return Err(StoreError::VersionConflict {
+                    account: *account,
+                    expected: *expected,
+                    actual,
                 });
             }
         }

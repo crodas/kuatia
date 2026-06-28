@@ -436,7 +436,11 @@ impl PostingStore for SqlStore {
         ids: &[PostingId],
         reservation: ReservationId,
     ) -> Result<(), StoreError> {
-        // Validate all Active first, then update in a transaction.
+        // Conditional update: each posting transitions Active → PendingInactive
+        // only if it is still Active. The status precondition lives in the WHERE
+        // clause so a concurrent transition cannot slip between a check and the
+        // write; `rows_affected() == 1` is the authorization. A missing row and a
+        // non-Active row are indistinguishable here — both are "not reservable".
         let mut tx = self
             .pool
             .begin()
@@ -444,33 +448,20 @@ impl PostingStore for SqlStore {
             .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         for id in ids {
-            let row =
-                sqlx::query("SELECT status FROM postings WHERE transfer_id = $1 AND idx = $2")
-                    .bind(id.transfer.0.as_slice())
-                    .bind(id.index as i16)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StoreError::Internal(e.to_string()))?
-                    .ok_or_else(|| StoreError::NotFound(format!("posting {id:?}")))?;
-            let status: i16 = row
-                .try_get("status")
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
-            if status != 0 {
-                return Err(StoreError::PostingNotActive(*id));
-            }
-        }
-
-        for id in ids {
-            sqlx::query(
-                "UPDATE postings SET status = $1, reservation = $2 WHERE transfer_id = $3 AND idx = $4",
+            let res = sqlx::query(
+                "UPDATE postings SET status = $1, reservation = $2 WHERE transfer_id = $3 AND idx = $4 AND status = $5",
             )
             .bind(status_to_i16(PostingStatus::PendingInactive))
             .bind(reservation.0)
             .bind(id.transfer.0.as_slice())
             .bind(id.index as i16)
+            .bind(status_to_i16(PostingStatus::Active))
             .execute(&mut *tx)
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
+            if res.rows_affected() != 1 {
+                return Err(StoreError::PostingNotActive(*id));
+            }
         }
 
         tx.commit()
@@ -490,6 +481,9 @@ impl PostingStore for SqlStore {
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
 
+        // Classify then conditionally release in one pass. Releasing an Active
+        // posting is a no-op (matches InMemory); releasing a reserved one must
+        // affect exactly one row, otherwise it changed under us concurrently.
         for id in ids {
             let row = sqlx::query(
                 "SELECT status, reservation FROM postings WHERE transfer_id = $1 AND idx = $2",
@@ -512,69 +506,29 @@ impl PostingStore for SqlStore {
             if status == 1 && owner != Some(reservation.0) {
                 return Err(StoreError::ReservationMismatch(*id));
             }
-        }
 
-        for id in ids {
-            sqlx::query("UPDATE postings SET status = $1, reservation = NULL WHERE transfer_id = $2 AND idx = $3 AND status = $4")
+            let res = sqlx::query("UPDATE postings SET status = $1, reservation = NULL WHERE transfer_id = $2 AND idx = $3 AND status = $4 AND reservation = $5")
                 .bind(status_to_i16(PostingStatus::Active))
                 .bind(id.transfer.0.as_slice())
                 .bind(id.index as i16)
                 .bind(status_to_i16(PostingStatus::PendingInactive))
+                .bind(reservation.0)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn finalize_postings(
-        &self,
-        deactivate: &[PostingId],
-        create: &[Posting],
-    ) -> Result<(), StoreError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
-
-        for id in deactivate {
-            let res = sqlx::query("UPDATE postings SET status = $1, reservation = NULL WHERE transfer_id = $2 AND idx = $3")
-                .bind(status_to_i16(PostingStatus::Inactive))
-                .bind(id.transfer.0.as_slice())
-                .bind(id.index as i16)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
-            if res.rows_affected() == 0 {
-                return Err(StoreError::NotFound(format!("posting {id:?}")));
+            // status == 1 was reserved by us → the row must flip; status == 0
+            // (Active) is a no-op with zero rows affected.
+            if status == 1 && res.rows_affected() != 1 {
+                return Err(StoreError::ReservationMismatch(*id));
             }
         }
 
-        for posting in create {
-            sqlx::query(
-                "INSERT INTO postings (transfer_id, idx, owner, asset, value, status) VALUES ($1, $2, $3, $4, $5, $6)"
-            )
-                .bind(posting.id.transfer.0.as_slice())
-                .bind(posting.id.index as i16)
-                .bind(posting.owner.0)
-                .bind(posting.asset.0 as i32)
-                .bind(posting.value.value())
-                .bind(status_to_i16(posting.status))
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
-        }
-
         tx.commit()
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         Ok(())
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -609,48 +563,6 @@ impl TransferStore for SqlStore {
                 }))
             }
         }
-    }
-
-    async fn store_transfer(&self, record: EnvelopeRecord) -> Result<(), StoreError> {
-        let tid = record.receipt.transfer_id;
-        let transfer_bytes = serialize_blob(&record.envelope)?;
-        let receipt_bytes = serialize_blob(&record.receipt)?;
-
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
-
-        sqlx::query("INSERT INTO transfers (id, transfer, receipt, created_at, book) VALUES ($1, $2, $3, $4, $5)")
-            .bind(tid.0.as_slice())
-            .bind(&transfer_bytes)
-            .bind(&receipt_bytes)
-            .bind(record.created_at)
-            .bind(record.envelope.book().0)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
-
-        // Populate transfer_accounts join table
-        let mut account_ids: HashSet<i64> = HashSet::new();
-        for np in record.envelope.creates() {
-            account_ids.insert(np.owner.0);
-        }
-
-        for aid in &account_ids {
-            sqlx::query("INSERT INTO transfer_accounts (transfer_id, account_id) VALUES ($1, $2)")
-                .bind(tid.0.as_slice())
-                .bind(*aid)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
-        Ok(())
     }
 
     async fn get_transfers_for_account(
@@ -962,6 +874,29 @@ impl CommitStore for SqlStore {
             }
         }
 
+        // 2b. Account version guards — re-check each pinned account version in the
+        //     same transaction so a concurrent freeze/unfreeze/close (which bumps
+        //     version) aborts the commit instead of racing past validation.
+        for (account, expected) in req.account_guards {
+            let actual: i64 = sqlx::query(
+                "SELECT version FROM accounts WHERE id = $1 ORDER BY version DESC LIMIT 1",
+            )
+            .bind(account.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?
+            .ok_or(StoreError::NotFound(format!("account {account:?}")))?
+            .try_get("version")
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+            if actual as u64 != *expected {
+                return Err(StoreError::VersionConflict {
+                    account: *account,
+                    expected: *expected,
+                    actual: actual as u64,
+                });
+            }
+        }
+
         // 3. Authorize consumed postings and collect their owners.
         let mut account_ids: HashSet<i64> = HashSet::new();
         for pid in req.deactivate {
@@ -1000,15 +935,35 @@ impl CommitStore for SqlStore {
             account_ids.insert(owner);
         }
 
-        // 4. Deactivate consumed postings, asserting each affects exactly one row.
+        // 4. Deactivate consumed postings. The authorization precondition lives in
+        //    the WHERE clause (not just the step-3 read) so two concurrent commits
+        //    cannot both deactivate the same posting under READ COMMITTED. The raw
+        //    path requires it still Active; the saga path requires it still
+        //    PendingInactive owned by this reservation. `rows_affected() == 1` is
+        //    the authorization.
         for pid in req.deactivate {
-            let res = sqlx::query("UPDATE postings SET status = $1, reservation = NULL WHERE transfer_id = $2 AND idx = $3")
-                .bind(status_to_i16(PostingStatus::Inactive))
-                .bind(pid.transfer.0.as_slice())
-                .bind(pid.index as i16)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            let res = match req.reservation {
+                None => {
+                    sqlx::query("UPDATE postings SET status = $1, reservation = NULL WHERE transfer_id = $2 AND idx = $3 AND status = $4")
+                        .bind(status_to_i16(PostingStatus::Inactive))
+                        .bind(pid.transfer.0.as_slice())
+                        .bind(pid.index as i16)
+                        .bind(status_to_i16(PostingStatus::Active))
+                        .execute(&mut *tx)
+                        .await
+                }
+                Some(rid) => {
+                    sqlx::query("UPDATE postings SET status = $1, reservation = NULL WHERE transfer_id = $2 AND idx = $3 AND status = $4 AND reservation = $5")
+                        .bind(status_to_i16(PostingStatus::Inactive))
+                        .bind(pid.transfer.0.as_slice())
+                        .bind(pid.index as i16)
+                        .bind(status_to_i16(PostingStatus::PendingInactive))
+                        .bind(rid.0)
+                        .execute(&mut *tx)
+                        .await
+                }
+            }
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
             if res.rows_affected() != 1 {
                 return Err(StoreError::ReservationMismatch(*pid));
             }
