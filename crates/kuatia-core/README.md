@@ -23,8 +23,9 @@ with golden vectors. Depends only on `kuatia-types` and `sha2`.
 4. All consumed postings are Active or PendingInactive
 5. All accounts exist, not frozen, not closed
 6. Account snapshot pinning (OCC)
-7. Per-asset conservation: `sum(consumed) == sum(created)`
-8. Negative postings only on SystemAccount or ExternalAccount
-9. Account policy enforcement (overdraft limits)
+7. Book policy (if a book is loaded): referenced assets/accounts/flags allowed
+8. Per-asset conservation: `sum(consumed) == sum(created)`
+9. Negative postings forbidden only on `NoOverdraft` (allowed on overdraft/system/external)
+10. Account policy enforcement (overdraft limits)
 
 Returns a `Plan` on success, or a `ValidationError` describing the violation.

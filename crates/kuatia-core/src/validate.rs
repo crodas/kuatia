@@ -26,6 +26,11 @@ pub struct PlanInput<'a> {
     pub accounts: &'a HashMap<AccountId, Account>,
     /// Current balances keyed by (account, asset).
     pub balances: &'a HashMap<(AccountId, AssetId), Cent>,
+    /// The book gating this transfer, if one is loaded. `Some` enforces the
+    /// book's [`BookPolicy`] (allowed assets/accounts/flags); `None` means the
+    /// implicit unrestricted default book. The async layer is responsible for
+    /// rejecting a *named* book id that has no row before reaching here.
+    pub book: Option<&'a Book>,
 }
 
 /// The validated effects to apply atomically. Produced only when every
@@ -101,7 +106,7 @@ pub enum ValidationError {
         /// The actual current snapshot hash.
         actual: [u8; 32],
     },
-    /// A negative posting targets an account that is not a system or external account.
+    /// A negative posting targets an account whose policy forbids offset positions.
     NegativePostingOnNonSystemAccount {
         /// The account that would receive the negative posting.
         account: AccountId,
@@ -109,6 +114,20 @@ pub enum ValidationError {
         asset: AssetId,
         /// The negative value.
         value: Cent,
+    },
+    /// An asset is not permitted by the transfer's book policy.
+    BookAssetNotAllowed {
+        /// The book whose policy rejected the asset.
+        book: BookId,
+        /// The disallowed asset.
+        asset: AssetId,
+    },
+    /// An account is not permitted to participate by the transfer's book policy.
+    BookAccountNotAllowed {
+        /// The book whose policy rejected the account.
+        book: BookId,
+        /// The disallowed account.
+        account: AccountId,
     },
     /// An arithmetic operation overflowed.
     Overflow,
@@ -172,8 +191,14 @@ impl std::fmt::Display for ValidationError {
             } => {
                 write!(
                     f,
-                    "negative posting ({value}) on non-system account {account:?}/{asset:?}"
+                    "negative posting ({value}) on account {account:?}/{asset:?} whose policy forbids offsets"
                 )
+            }
+            Self::BookAssetNotAllowed { book, asset } => {
+                write!(f, "asset {asset:?} not allowed by book {book:?}")
+            }
+            Self::BookAccountNotAllowed { book, account } => {
+                write!(f, "account {account:?} not allowed by book {book:?}")
             }
             Self::Overflow => write!(f, "monetary amount overflow"),
         }
@@ -270,6 +295,47 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
         }
     }
 
+    // 5c. Book policy: gate which assets and accounts may participate. Enforced
+    //     only when a book is loaded; an empty policy field means "no restriction".
+    if let Some(book) = input.book {
+        let policy = &book.policy;
+
+        if !policy.allowed_assets.is_empty() {
+            let mut referenced_assets: HashSet<AssetId> = HashSet::new();
+            for pid in envelope.consumes() {
+                referenced_assets.insert(consumed_by_id[pid].asset);
+            }
+            for np in envelope.creates() {
+                referenced_assets.insert(np.asset);
+            }
+            for asset in &referenced_assets {
+                if !policy.allowed_assets.contains(asset) {
+                    return Err(ValidationError::BookAssetNotAllowed {
+                        book: book.id,
+                        asset: *asset,
+                    });
+                }
+            }
+        }
+
+        let no_account_restriction =
+            policy.allowed_accounts.is_empty() && policy.allowed_flags.is_empty();
+        if !no_account_restriction {
+            for aid in &all_account_ids {
+                let account = &input.accounts[aid];
+                let listed = policy.allowed_accounts.contains(aid);
+                let flag_match = !policy.allowed_flags.is_empty()
+                    && account.flags.intersects(policy.allowed_flags);
+                if !(listed || flag_match) {
+                    return Err(ValidationError::BookAccountNotAllowed {
+                        book: book.id,
+                        account: *aid,
+                    });
+                }
+            }
+        }
+    }
+
     // 6. Per-asset conservation: Σ consumed == Σ created
     let mut consumed_by_asset: HashMap<AssetId, Cent> = HashMap::new();
     for pid in envelope.consumes() {
@@ -301,7 +367,9 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
         }
     }
 
-    // 7. Negative postings may only target system or external accounts.
+    // 7. Negative postings (offset positions) may target system, external, or
+    //    overdraft accounts. Overdraft floors are enforced separately in step 8.
+    //    Only NoOverdraft forbids holding a negative posting.
     for np in envelope.creates() {
         if np.value.is_negative() {
             let account = input
@@ -309,8 +377,11 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
                 .get(&np.owner)
                 .ok_or(ValidationError::AccountNotFound(np.owner))?;
             match account.policy {
-                AccountPolicy::SystemAccount | AccountPolicy::ExternalAccount => {}
-                _ => {
+                AccountPolicy::SystemAccount
+                | AccountPolicy::ExternalAccount
+                | AccountPolicy::UncappedOverdraft
+                | AccountPolicy::CappedOverdraft { .. } => {}
+                AccountPolicy::NoOverdraft => {
                     return Err(ValidationError::NegativePostingOnNonSystemAccount {
                         account: np.owner,
                         asset: np.asset,
@@ -386,15 +457,16 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
         .creates
         .iter()
         .enumerate()
-        .map(|(i, np)| Posting {
-            id: PostingId {
-                transfer: tid,
-                index: i as u16,
-            },
-            owner: np.owner,
-            asset: np.asset,
-            value: np.value,
-            status: PostingStatus::Active,
+        .map(|(i, np)| {
+            Posting::new(
+                PostingId {
+                    transfer: tid,
+                    index: i as u16,
+                },
+                np.owner,
+                np.asset,
+                np.value,
+            )
         })
         .collect();
 
@@ -466,6 +538,7 @@ mod tests {
             consumed_postings: &[],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         let plan = validate_and_plan(input).unwrap();
@@ -490,6 +563,7 @@ mod tests {
             consumed_postings: &[],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         assert_eq!(
@@ -520,6 +594,7 @@ mod tests {
             consumed_postings: &[],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         match validate_and_plan(input) {
@@ -549,6 +624,7 @@ mod tests {
             consumed_postings: &[],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         assert_eq!(
@@ -569,6 +645,7 @@ mod tests {
             asset: AssetId::new(1),
             value: Cent::from(100),
             status: PostingStatus::Inactive, // already consumed
+            reservation: None,
         };
         let envelope = Envelope {
             consumes: vec![pid],
@@ -593,6 +670,7 @@ mod tests {
             consumed_postings: &[posting],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         assert_eq!(
@@ -613,6 +691,7 @@ mod tests {
             consumed_postings: &[],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         assert_eq!(
@@ -633,6 +712,7 @@ mod tests {
             consumed_postings: &[],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         assert_eq!(
@@ -653,6 +733,7 @@ mod tests {
             asset: AssetId::new(1),
             value: Cent::from(50),
             status: PostingStatus::Active,
+            reservation: None,
         };
         // Try to send 50 but create 100 for recipient (conservation will fail first,
         // but let's test overdraft with a valid conservation)
@@ -683,6 +764,7 @@ mod tests {
             consumed_postings: &[posting],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         match validate_and_plan(input) {
@@ -705,6 +787,7 @@ mod tests {
             asset: AssetId::new(1),
             value: Cent::from(100),
             status: PostingStatus::Active,
+            reservation: None,
         };
         let envelope = Envelope {
             consumes: vec![pid],
@@ -737,6 +820,7 @@ mod tests {
             consumed_postings: &[posting],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         let plan = validate_and_plan(input).unwrap();
@@ -757,6 +841,7 @@ mod tests {
             asset: AssetId::new(1),
             value: Cent::from(100),
             status: PostingStatus::Active,
+            reservation: None,
         };
         let envelope = Envelope {
             consumes: vec![pid],
@@ -789,6 +874,7 @@ mod tests {
             consumed_postings: &[posting],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         match validate_and_plan(input) {
@@ -814,6 +900,7 @@ mod tests {
             asset: AssetId::new(1),
             value: Cent::from(100),
             status: PostingStatus::Active,
+            reservation: None,
         };
         let envelope = Envelope {
             consumes: vec![pid],
@@ -841,6 +928,7 @@ mod tests {
             consumed_postings: &[posting],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         let plan = validate_and_plan(input).unwrap();
@@ -868,6 +956,7 @@ mod tests {
             consumed_postings: &[],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         assert_eq!(
@@ -889,6 +978,7 @@ mod tests {
             asset: AssetId::new(1),
             value: Cent::from(100),
             status: PostingStatus::Active,
+            reservation: None,
         };
         let envelope = Envelope {
             consumes: vec![pid],
@@ -923,6 +1013,7 @@ mod tests {
             consumed_postings: &[posting],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         let plan = validate_and_plan(input).unwrap();
@@ -963,6 +1054,7 @@ mod tests {
             consumed_postings: &[],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         assert_eq!(
@@ -1001,6 +1093,7 @@ mod tests {
             consumed_postings: &[],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         assert_eq!(
@@ -1026,6 +1119,7 @@ mod tests {
             consumed_postings: &[],
             accounts: &accounts,
             balances: &balances,
+            book: None,
         };
 
         let plan = validate_and_plan(input).unwrap();

@@ -92,16 +92,15 @@ mod tests {
     use kuatia_types::*;
 
     fn make_posting(index: u16, value: i64) -> Posting {
-        Posting {
-            id: PostingId {
+        Posting::new(
+            PostingId {
                 transfer: EnvelopeId([1; 32]),
                 index,
             },
-            owner: AccountId::new(1),
-            asset: AssetId::new(1),
-            value: Cent::from(value),
-            status: PostingStatus::Active,
-        }
+            AccountId::new(1),
+            AssetId::new(1),
+            Cent::from(value),
+        )
     }
 
     #[test]
@@ -155,16 +154,15 @@ mod tests {
 
     #[test]
     fn ignores_negative_postings() {
-        let negative = Posting {
-            id: PostingId {
+        let negative = Posting::new(
+            PostingId {
                 transfer: EnvelopeId([1; 32]),
                 index: 0,
             },
-            owner: AccountId::new(1),
-            asset: AssetId::new(1),
-            value: Cent::from(-100),
-            status: PostingStatus::Active,
-        };
+            AccountId::new(1),
+            AssetId::new(1),
+            Cent::from(-100),
+        );
         let good = make_posting(1, 50);
         let postings = vec![negative, good];
         let result = select_postings(&postings, AssetId::new(1), Cent::from(50)).unwrap();

@@ -10,7 +10,7 @@ Kuatia is an append-only, auditable, multi-asset UTXO-style ledger library in Ru
 crates/
   kuatia-types/     Domain types: AccountId, Posting, Movement, Cent, AutoId, etc.
   kuatia-core/      Pure, sync, no-IO logic: validation, hashing, posting selection
-  kuatia-storage/   Store trait (6 sub-traits), InMemoryStore, conformance tests
+  kuatia-storage/   Store trait (7 sub-traits), InMemoryStore, conformance tests
   kuatia-storage-sql/  SQL backend: SQLite/PostgreSQL via sqlx
   kuatia/           Async layer: Ledger resource, saga pipeline, intent API
 doc/
@@ -28,7 +28,8 @@ doc/
 - **Movement**: `{ from, to, asset, amount }` — the fundamental unit of intent. All operations (pay, deposit, withdraw) are one or more movements.
 - **Envelope**: concrete postings to consume and create — the resolved form of movements.
 - **Conservation**: for each asset, `sum(consumed) == sum(created)`.
-- **Account policies**: NoOverdraft, CappedOverdraft, UncappedOverdraft, SystemAccount, ExternalAccount. Only SystemAccount and ExternalAccount may hold negative postings.
+- **Account policies**: NoOverdraft, CappedOverdraft, UncappedOverdraft, SystemAccount, ExternalAccount. Only `NoOverdraft` forbids negative postings; the other four permit them. An overdraft is a negative posting that covers a shortfall — down to the floor for `CappedOverdraft`, unbounded for `UncappedOverdraft`.
+- **Atomic commit**: `CommitStore::commit_transfer` is the single atomic boundary — postings, transfer record, account index, and events apply in one transaction. It enforces `CappedOverdraft` CAS guards and reservation ownership. `reserve_postings`/`release_postings` carry a `ReservationId` so only the owning saga can finalize/release a reserved posting.
 
 ## Architecture
 
@@ -42,7 +43,7 @@ doc/
 
 Two-pass:
 1. For each movement, create output posting on `to` and accumulate net debit on `from`.
-2. For each (account, asset) with positive net debit, select postings (greedy largest-first) and compute change.
+2. For each (account, asset) with positive net debit, select postings (greedy largest-first) and compute change. If positive postings are insufficient: `CappedOverdraft`/`UncappedOverdraft` accounts consume all positives and create a negative posting for the shortfall (floor enforced in validation); other policies fail with `InsufficientFunds`.
 
 Deposit: two movements cancel to zero net debit on the system account — no posting selection needed.
 
@@ -54,9 +55,10 @@ Deposit: two movements cancel to zero net debit on the system account — no pos
 4. Consumed postings Active or PendingInactive
 5. Referenced accounts exist, not frozen, not closed
 6. Account snapshot pinning
-7. Per-asset conservation
-8. Negative postings only on SystemAccount/ExternalAccount
-9. Policy enforcement (balance floor)
+7. Book policy (if a book is loaded): referenced assets/accounts/flags allowed by the book
+8. Per-asset conservation
+9. Negative postings forbidden only on `NoOverdraft` (allowed on overdraft/system/external)
+10. Policy enforcement (balance floor)
 
 ## Testing
 
@@ -82,7 +84,7 @@ cargo test -p kuatia        # integration + saga tests
    ^sign (always 0 = positive)
   ```
   - Bit 63: always 0 (keeps i64 positive)
-  - Bits 62–23: Unix milliseconds (40 bits ≈ 34.8 years from epoch)
+  - Bits 62–23: milliseconds since `KUATIA_EPOCH_MS` (2026-01-01T00:00:00Z), not the Unix epoch — 40 bits ≈ 34.8 years going forward (until ~2060)
   - Bits 22–0: lower 23 bits of CRC32 of context-specific data (e.g. serialized event)
   - When no data is provided, an internal atomic counter is used (wraps on 23-bit overflow)
   - Implementation: `AutoId` in `kuatia-types/src/autoid.rs`, includes inline CRC32 (IEEE)

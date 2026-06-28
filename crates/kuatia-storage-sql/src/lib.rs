@@ -35,14 +35,37 @@ impl SqlStore {
         }
     }
 
-    /// Run database migrations.
+    /// Run database migrations. Idempotent: a `_migrations` ledger records what
+    /// has been applied, so re-running is a no-op. The DDL is selected per
+    /// backend (SQLite uses `BLOB`, PostgreSQL uses `BYTEA`).
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        for sql in [
-            include_str!("migrations/001_init.sql"),
-            include_str!("migrations/002_timestamps_and_columns.sql"),
-            include_str!("migrations/003_events.sql"),
-            include_str!("migrations/004_books.sql"),
-        ] {
+        // Detect the backend. `sqlite_version()` exists only on SQLite.
+        let is_sqlite = sqlx::query("SELECT sqlite_version()")
+            .fetch_optional(&self.pool)
+            .await
+            .is_ok();
+
+        sqlx::query("CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        let migrations: &[(&str, &str)] = if is_sqlite {
+            &[("001_init", include_str!("migrations/sqlite/001_init.sql"))]
+        } else {
+            &[("001_init", include_str!("migrations/postgres/001_init.sql"))]
+        };
+
+        for (name, sql) in migrations {
+            let applied = sqlx::query("SELECT 1 FROM _migrations WHERE name = $1")
+                .bind(*name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            if applied.is_some() {
+                continue;
+            }
+
             for statement in sql.split(';') {
                 let trimmed = statement.trim();
                 if !trimmed.is_empty() {
@@ -52,6 +75,12 @@ impl SqlStore {
                         .map_err(|e| StoreError::Internal(e.to_string()))?;
                 }
             }
+
+            sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
+                .bind(*name)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
         }
         Ok(())
     }
@@ -148,6 +177,9 @@ fn row_to_posting(row: &sqlx::any::AnyRow) -> Result<Posting, StoreError> {
     let status: i16 = row
         .try_get("status")
         .map_err(|e| StoreError::Internal(e.to_string()))?;
+    let reservation: Option<i64> = row
+        .try_get("reservation")
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
 
     let mut tid = [0u8; 32];
     tid.copy_from_slice(&transfer_id);
@@ -161,6 +193,7 @@ fn row_to_posting(row: &sqlx::any::AnyRow) -> Result<Posting, StoreError> {
         asset: AssetId::new(asset as u32),
         value: Cent::from(value),
         status: status_from_i16(status)?,
+        reservation: reservation.map(ReservationId::new),
     })
 }
 
@@ -398,7 +431,11 @@ impl PostingStore for SqlStore {
         })
     }
 
-    async fn reserve_postings(&self, ids: &[PostingId]) -> Result<(), StoreError> {
+    async fn reserve_postings(
+        &self,
+        ids: &[PostingId],
+        reservation: ReservationId,
+    ) -> Result<(), StoreError> {
         // Validate all Active first, then update in a transaction.
         let mut tx = self
             .pool
@@ -424,13 +461,16 @@ impl PostingStore for SqlStore {
         }
 
         for id in ids {
-            sqlx::query("UPDATE postings SET status = $1 WHERE transfer_id = $2 AND idx = $3")
-                .bind(status_to_i16(PostingStatus::PendingInactive))
-                .bind(id.transfer.0.as_slice())
-                .bind(id.index as i16)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            sqlx::query(
+                "UPDATE postings SET status = $1, reservation = $2 WHERE transfer_id = $3 AND idx = $4",
+            )
+            .bind(status_to_i16(PostingStatus::PendingInactive))
+            .bind(reservation.0)
+            .bind(id.transfer.0.as_slice())
+            .bind(id.index as i16)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
         }
 
         tx.commit()
@@ -439,7 +479,11 @@ impl PostingStore for SqlStore {
         Ok(())
     }
 
-    async fn release_postings(&self, ids: &[PostingId]) -> Result<(), StoreError> {
+    async fn release_postings(
+        &self,
+        ids: &[PostingId],
+        reservation: ReservationId,
+    ) -> Result<(), StoreError> {
         let mut tx = self
             .pool
             .begin()
@@ -447,24 +491,31 @@ impl PostingStore for SqlStore {
             .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         for id in ids {
-            let row =
-                sqlx::query("SELECT status FROM postings WHERE transfer_id = $1 AND idx = $2")
-                    .bind(id.transfer.0.as_slice())
-                    .bind(id.index as i16)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StoreError::Internal(e.to_string()))?
-                    .ok_or_else(|| StoreError::NotFound(format!("posting {id:?}")))?;
+            let row = sqlx::query(
+                "SELECT status, reservation FROM postings WHERE transfer_id = $1 AND idx = $2",
+            )
+            .bind(id.transfer.0.as_slice())
+            .bind(id.index as i16)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?
+            .ok_or_else(|| StoreError::NotFound(format!("posting {id:?}")))?;
             let status: i16 = row
                 .try_get("status")
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
             if status == 2 {
                 return Err(StoreError::PostingInactive(*id));
             }
+            let owner: Option<i64> = row
+                .try_get("reservation")
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            if status == 1 && owner != Some(reservation.0) {
+                return Err(StoreError::ReservationMismatch(*id));
+            }
         }
 
         for id in ids {
-            sqlx::query("UPDATE postings SET status = $1 WHERE transfer_id = $2 AND idx = $3 AND status = $4")
+            sqlx::query("UPDATE postings SET status = $1, reservation = NULL WHERE transfer_id = $2 AND idx = $3 AND status = $4")
                 .bind(status_to_i16(PostingStatus::Active))
                 .bind(id.transfer.0.as_slice())
                 .bind(id.index as i16)
@@ -492,13 +543,16 @@ impl PostingStore for SqlStore {
             .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         for id in deactivate {
-            sqlx::query("UPDATE postings SET status = $1 WHERE transfer_id = $2 AND idx = $3")
+            let res = sqlx::query("UPDATE postings SET status = $1, reservation = NULL WHERE transfer_id = $2 AND idx = $3")
                 .bind(status_to_i16(PostingStatus::Inactive))
                 .bind(id.transfer.0.as_slice())
                 .bind(id.index as i16)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
+            if res.rows_affected() == 0 {
+                return Err(StoreError::NotFound(format!("posting {id:?}")));
+            }
         }
 
         for posting in create {
@@ -705,12 +759,15 @@ impl TransferStore for SqlStore {
 #[async_trait]
 impl SagaStore for SqlStore {
     async fn save_saga(&self, id: &i64, data: Vec<u8>) -> Result<(), StoreError> {
-        sqlx::query("INSERT OR REPLACE INTO sagas (id, data) VALUES ($1, $2)")
-            .bind(*id)
-            .bind(&data)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        sqlx::query(
+            "INSERT INTO sagas (id, data) VALUES ($1, $2) \
+             ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+        )
+        .bind(*id)
+        .bind(&data)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -847,5 +904,173 @@ impl BookStore for SqlStore {
                 deserialize_blob(&data)
             })
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CommitStore — the single atomic commit boundary
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl CommitStore for SqlStore {
+    async fn commit_transfer(&self, req: CommitRequest<'_>) -> Result<(), StoreError> {
+        let tid = req.record.receipt.transfer_id;
+        let transfer_bytes = serialize_blob(&req.record.envelope)?;
+        let receipt_bytes = serialize_blob(&req.record.receipt)?;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        // 1. Idempotency: already committed?
+        let exists = sqlx::query("SELECT 1 FROM transfers WHERE id = $1")
+            .bind(tid.0.as_slice())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        if exists.is_some() {
+            return Ok(());
+        }
+
+        // 2. CAS guards — recompute Σ(non-Inactive) in Rust and compare.
+        for (account, asset, expected) in req.cas_guards {
+            let rows = sqlx::query(
+                "SELECT value FROM postings WHERE owner = $1 AND asset = $2 AND status != $3",
+            )
+            .bind(account.0)
+            .bind(asset.0 as i32)
+            .bind(status_to_i16(PostingStatus::Inactive))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+            let mut sum: i64 = 0;
+            for row in &rows {
+                let v: i64 = row
+                    .try_get("value")
+                    .map_err(|e| StoreError::Internal(e.to_string()))?;
+                sum = sum
+                    .checked_add(v)
+                    .ok_or_else(|| StoreError::Internal("balance overflow during cas".into()))?;
+            }
+            if sum != expected.value() {
+                return Err(StoreError::Conflict {
+                    account: *account,
+                    asset: *asset,
+                });
+            }
+        }
+
+        // 3. Authorize consumed postings and collect their owners.
+        let mut account_ids: HashSet<i64> = HashSet::new();
+        for pid in req.deactivate {
+            let row = sqlx::query(
+                "SELECT owner, status, reservation FROM postings WHERE transfer_id = $1 AND idx = $2",
+            )
+            .bind(pid.transfer.0.as_slice())
+            .bind(pid.index as i16)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?
+            .ok_or(StoreError::ReservationMismatch(*pid))?;
+            let owner: i64 = row
+                .try_get("owner")
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            let status: i16 = row
+                .try_get("status")
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            let reservation: Option<i64> = row
+                .try_get("reservation")
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            match req.reservation {
+                None => {
+                    if status != status_to_i16(PostingStatus::Active) {
+                        return Err(StoreError::ReservationMismatch(*pid));
+                    }
+                }
+                Some(rid) => {
+                    if status != status_to_i16(PostingStatus::PendingInactive)
+                        || reservation != Some(rid.0)
+                    {
+                        return Err(StoreError::ReservationMismatch(*pid));
+                    }
+                }
+            }
+            account_ids.insert(owner);
+        }
+
+        // 4. Deactivate consumed postings, asserting each affects exactly one row.
+        for pid in req.deactivate {
+            let res = sqlx::query("UPDATE postings SET status = $1, reservation = NULL WHERE transfer_id = $2 AND idx = $3")
+                .bind(status_to_i16(PostingStatus::Inactive))
+                .bind(pid.transfer.0.as_slice())
+                .bind(pid.index as i16)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            if res.rows_affected() != 1 {
+                return Err(StoreError::ReservationMismatch(*pid));
+            }
+        }
+
+        // 5. Insert created postings (Active, unreserved → reservation defaults NULL).
+        for posting in req.create {
+            sqlx::query(
+                "INSERT INTO postings (transfer_id, idx, owner, asset, value, status) VALUES ($1, $2, $3, $4, $5, $6)"
+            )
+                .bind(posting.id.transfer.0.as_slice())
+                .bind(posting.id.index as i16)
+                .bind(posting.owner.0)
+                .bind(posting.asset.0 as i32)
+                .bind(posting.value.value())
+                .bind(status_to_i16(posting.status))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            account_ids.insert(posting.owner.0);
+        }
+
+        // 6. Persist the transfer record.
+        sqlx::query("INSERT INTO transfers (id, transfer, receipt, created_at, book) VALUES ($1, $2, $3, $4, $5)")
+            .bind(tid.0.as_slice())
+            .bind(&transfer_bytes)
+            .bind(&receipt_bytes)
+            .bind(req.record.created_at)
+            .bind(req.record.envelope.book().0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        // 7. Index transfer_accounts from BOTH created and consumed owners.
+        for aid in &account_ids {
+            sqlx::query("INSERT INTO transfer_accounts (transfer_id, account_id) VALUES ($1, $2)")
+                .bind(tid.0.as_slice())
+                .bind(*aid)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+        }
+
+        // 8. Append events within the same transaction.
+        for event in req.events {
+            let kind_str = serde_json::to_string(&event.kind)
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            let data = serialize_blob(event)?;
+            let seq = self.autoid.next() as u64;
+            sqlx::query("INSERT INTO events (seq, timestamp, kind, data) VALUES ($1, $2, $3, $4)")
+                .bind(seq as i64)
+                .bind(event.timestamp)
+                .bind(&kind_str)
+                .bind(&data)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
     }
 }

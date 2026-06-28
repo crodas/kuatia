@@ -4,7 +4,7 @@
 //! and from storage, so callers get a single error type from every API.
 
 use kuatia_core::{
-    AccountId, EnvelopeId, OverflowError, PostingId, SelectionError, ValidationError,
+    AccountId, BookId, EnvelopeId, OverflowError, PostingId, SelectionError, ValidationError,
 };
 use kuatia_storage::error::StoreError;
 
@@ -27,6 +27,8 @@ pub enum LedgerError {
     AccountNotEmpty(AccountId),
     /// The account is already closed.
     AccountAlreadyClosed(AccountId),
+    /// A transfer named a book that does not exist.
+    BookNotFound(BookId),
     /// Monetary arithmetic overflow.
     Overflow,
     /// A saga step failed and its compensation also failed.
@@ -49,6 +51,7 @@ impl std::fmt::Display for LedgerError {
             Self::AccountNotFound(id) => write!(f, "account not found: {id:?}"),
             Self::AccountNotEmpty(id) => write!(f, "account not empty: {id:?}"),
             Self::AccountAlreadyClosed(id) => write!(f, "account already closed: {id:?}"),
+            Self::BookNotFound(id) => write!(f, "book not found: {id:?}"),
             Self::Overflow => write!(f, "monetary amount overflow"),
             Self::CompensationFailed {
                 original,

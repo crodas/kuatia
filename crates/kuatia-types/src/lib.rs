@@ -421,12 +421,16 @@ impl fmt::Debug for BookId {
     }
 }
 
+/// The implicit book used when a transfer does not name one. Fixed so that two
+/// otherwise-identical transfers hash to the same [`EnvelopeId`] — a random
+/// default would break content-addressed idempotency.
+pub const DEFAULT_BOOK: BookId = BookId(0);
+
 impl Default for BookId {
+    /// Deterministic: returns [`DEFAULT_BOOK`]. Use [`BookId::generate`] to mint
+    /// a fresh unique id for a real book.
     fn default() -> Self {
-        thread_local! {
-            static GEN: crate::autoid::AutoId = crate::autoid::AutoId::new();
-        }
-        GEN.with(|g| Self(g.next()))
+        DEFAULT_BOOK
     }
 }
 
@@ -434,6 +438,43 @@ impl BookId {
     /// Create a `BookId` from an `i64`.
     pub const fn new(id: i64) -> Self {
         Self(id)
+    }
+
+    /// Mint a fresh, process-unique book id. Unlike [`Default`], this is not
+    /// stable across calls — use it when creating a new [`Book`], never for the
+    /// implicit book of a transfer.
+    pub fn generate() -> Self {
+        thread_local! {
+            static GEN: crate::autoid::AutoId = crate::autoid::AutoId::new();
+        }
+        GEN.with(|g| Self(g.next()))
+    }
+}
+
+/// Identifies a reservation — the owner token stamped on a posting while it is
+/// `PendingInactive`, so only the saga that reserved it may finalize or release it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ReservationId(pub i64);
+
+impl fmt::Debug for ReservationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ReservationId({})", self.0)
+    }
+}
+
+impl ReservationId {
+    /// Create a `ReservationId` from an `i64`.
+    pub const fn new(id: i64) -> Self {
+        Self(id)
+    }
+}
+
+impl Default for ReservationId {
+    fn default() -> Self {
+        thread_local! {
+            static GEN: crate::autoid::AutoId = crate::autoid::AutoId::new();
+        }
+        GEN.with(|g| Self(g.next()))
     }
 }
 
@@ -476,7 +517,7 @@ impl BookBuilder {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             book: Book {
-                id: BookId::default(),
+                id: BookId::generate(),
                 name: name.into(),
                 policy: BookPolicy {
                     allowed_assets: Vec::new(),
@@ -549,8 +590,8 @@ pub enum PostingStatus {
 /// A signed amount of one asset, owned by exactly one account.
 ///
 /// A positive posting is value controlled by the account; a negative posting is
-/// an offset position (issuance, external flow, or system balancing), only
-/// allowed on `SystemAccount` or `ExternalAccount`.
+/// an offset position (issuance, external flow, overdraft, or system balancing).
+/// Negative postings are allowed on every policy except `NoOverdraft`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Posting {
     /// Unique identifier derived from the creating transfer.
@@ -563,9 +604,25 @@ pub struct Posting {
     pub value: Cent,
     /// Lifecycle state — only `Active` postings count toward balance.
     pub status: PostingStatus,
+    /// Owner token while `PendingInactive`. `Some(rid)` iff reserved by saga
+    /// `rid`; `None` when `Active` or `Inactive`. Only the holder of a matching
+    /// `ReservationId` may finalize or release a reserved posting.
+    pub reservation: Option<ReservationId>,
 }
 
 impl Posting {
+    /// Construct an `Active`, unreserved posting.
+    pub fn new(id: PostingId, owner: AccountId, asset: AssetId, value: Cent) -> Self {
+        Self {
+            id,
+            owner,
+            asset,
+            value,
+            status: PostingStatus::Active,
+            reservation: None,
+        }
+    }
+
     /// Returns `true` if this posting's status is [`PostingStatus::Active`].
     pub fn is_active(&self) -> bool {
         self.status == PostingStatus::Active

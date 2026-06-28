@@ -1,6 +1,6 @@
 //! Error types for storage implementations.
 
-use kuatia_types::{AccountId, PostingId};
+use kuatia_types::{AccountId, AssetId, PostingId};
 
 /// Errors produced by [`Store`](crate::store::Store) implementations.
 #[derive(Debug)]
@@ -24,6 +24,17 @@ pub enum StoreError {
     PostingNotActive(PostingId),
     /// Attempted to release a void (Inactive) posting.
     PostingInactive(PostingId),
+    /// A CAS guard's expected balance no longer matches the current balance —
+    /// a concurrent transfer moved it. The caller should re-validate and retry.
+    Conflict {
+        /// Account whose balance changed under the guard.
+        account: AccountId,
+        /// Asset whose balance changed.
+        asset: AssetId,
+    },
+    /// A posting's reservation owner did not match the caller's reservation —
+    /// it is reserved by a different saga (or not reserved at all).
+    ReservationMismatch(PostingId),
 }
 
 impl std::fmt::Display for StoreError {
@@ -44,6 +55,10 @@ impl std::fmt::Display for StoreError {
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
             Self::PostingNotActive(id) => write!(f, "posting not active: {id:?}"),
             Self::PostingInactive(id) => write!(f, "posting is void (inactive): {id:?}"),
+            Self::Conflict { account, asset } => {
+                write!(f, "cas conflict on {account:?}/{asset:?}: balance changed")
+            }
+            Self::ReservationMismatch(id) => write!(f, "reservation mismatch on posting {id:?}"),
         }
     }
 }

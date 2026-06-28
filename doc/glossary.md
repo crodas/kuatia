@@ -9,9 +9,9 @@
 A signed amount of one asset owned by one account. The fundamental unit of value in the ledger. Postings are immutable once created — consumed postings are marked `Inactive` but never deleted.
 
 - **Positive posting**: value controlled by the account.
-- **Negative posting**: an offset position — only allowed for accounts whose policy permits issuance, external flow, or system balancing (`SystemAccount`, `ExternalAccount`).
+- **Negative posting**: an offset position — allowed on any policy except `NoOverdraft`. It represents issuance, external flow, system balancing (`SystemAccount`, `ExternalAccount`), or an overdraft (`CappedOverdraft`/`UncappedOverdraft`).
 
-Lifecycle: `Active` → `PendingInactive` (reserved by saga) → `Inactive` (consumed).
+Lifecycle: `Active` → `PendingInactive` (reserved by a saga, stamped with its `ReservationId`) → `Inactive` (consumed). **Ledger balance** sums `Active + PendingInactive` postings; **available balance** sums only `Active` (postings reserved for an in-flight transfer are not available to spend).
 
 ### Account
 
@@ -55,7 +55,7 @@ For every transfer, for each asset: `sum(consumed) == sum(created)`. This is the
 
 ### AutoId
 
-Snowflake-inspired `i64` identifier: `[0 sign bit][40-bit ms timestamp][23-bit counter or CRC32]`. Generated in Rust — the database never assigns IDs.
+Snowflake-inspired `i64` identifier: `[0 sign bit][40-bit ms timestamp][23-bit counter or CRC32]`. The timestamp counts milliseconds since `KUATIA_EPOCH_MS` (2026-01-01T00:00:00Z), giving ~34.8 years of range going forward. Generated in Rust — the database never assigns IDs.
 
 ---
 

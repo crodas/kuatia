@@ -4,7 +4,7 @@
 
 Value is stored as **postings** — signed amounts of a single asset owned by exactly one account. A positive posting is value controlled by the account; a negative posting is an offset position (issuance, external flow, or system balancing).
 
-Account balance = sum of active postings for that (account, asset) pair. There is no mutable balance field to drift out of sync.
+Account balance = sum of non-`Inactive` postings (`Active + PendingInactive`) for that (account, asset) pair. There is no mutable balance field to drift out of sync.
 
 Consumed postings are marked inactive but never deleted, preserving a full audit trail.
 
@@ -38,7 +38,7 @@ This separation ensures the auditable heart of the system is fully deterministic
 
 ## Store Sub-Trait Architecture
 
-The `Store` trait is a composite of five focused sub-traits, each responsible for a single domain:
+The `Store` trait is a composite of seven focused sub-traits, each responsible for a single domain:
 
 ```mermaid
 classDiagram
@@ -53,8 +53,8 @@ classDiagram
     class PostingStore {
         +get_postings(ids)
         +get_postings_by_account(account, asset?, status?)
-        +reserve_postings(ids)
-        +release_postings(ids)
+        +reserve_postings(ids, reservation)
+        +release_postings(ids, reservation)
         +finalize_postings(deactivate, create)
     }
     class TransferStore {
@@ -72,6 +72,14 @@ classDiagram
         +append_event(event)
         +get_events_since(after_seq, limit)
     }
+    class BookStore {
+        +create_book(book)
+        +get_book(id)
+        +list_books()
+    }
+    class CommitStore {
+        +commit_transfer(req)
+    }
     class Store {
         <<composite>>
     }
@@ -80,7 +88,11 @@ classDiagram
     Store --|> TransferStore
     Store --|> SagaStore
     Store --|> EventStore
+    Store --|> BookStore
+    Store --|> CommitStore
 ```
+
+`CommitStore::commit_transfer` is the single atomic commit boundary — it applies posting deactivations/creations, the transfer record, the both-sided account index, and events in one transaction, enforcing `CappedOverdraft` CAS guards and reservation ownership.
 
 The store only persists and reads — all domain logic (balance computation, validation, policy enforcement) lives in the Ledger and `kuatia-core`.
 
@@ -164,7 +176,7 @@ All domain types implement deterministic binary serialization (`ToBytes` trait) 
 
 ## Append-Only Account Versioning
 
-Accounts are never modified in place. Each mutation (freeze, unfreeze, close, balance change) appends a new snapshot with an incremented `version` field (starts at 1 on creation).
+Accounts are never modified in place. Each account mutation (freeze, unfreeze, close, or a policy/flags change) appends a new snapshot with an incremented `version` field (starts at 1 on creation). Note that transfers do **not** bump account versions — balances are derived from postings, not stored on the account.
 
 The store enforces that each new version is exactly `current + 1`, preventing gaps or overwrites. The full version history is queryable via `account_history()`.
 
@@ -189,18 +201,18 @@ Each account has a policy controlling its balance floor and whether it may hold 
 | Policy | Balance floor | Negative postings | CAS guard |
 |--------|--------------|-------------------|-----------|
 | `NoOverdraft` | `>= 0` | No | No |
-| `CappedOverdraft { floor }` | `>= floor` | No | Yes |
-| `UncappedOverdraft` | None | No | No |
+| `CappedOverdraft { floor }` | `>= floor` | Yes (down to floor) | Yes |
+| `UncappedOverdraft` | None | Yes (unbounded) | No |
 | `SystemAccount` | None | Yes | No |
 | `ExternalAccount` | None | Yes | No |
 
-Only `SystemAccount` and `ExternalAccount` may receive negative postings (offset positions). Validation rejects any transfer that would create a negative posting on another account type.
+An overdraft is a **negative posting** assigned to the account to cover a shortfall. Only `NoOverdraft` forbids negative postings; validation rejects a negative posting on a `NoOverdraft` account. `CappedOverdraft`'s floor (enforced in validation, with concurrency protected by CAS guards) bounds the negative balance; the other policies are unbounded.
 
 ## CAS (Compare-And-Swap) Guards for CappedOverdraft
 
 `CappedOverdraft` accounts have a balance floor that is not backed by the UTXO model alone — two concurrent transfers could each pass validation but together push the balance below the floor (write-skew).
 
-The validation phase emits `cas_guards: Vec<(AccountId, AssetId, Cent)>` for these accounts. The saga pipeline handles isolation via the reserve step (Active → PendingInactive), which prevents concurrent transfers from consuming the same postings.
+The validation phase emits `cas_guards: Vec<(AccountId, AssetId, Cent)>` for these accounts. They are enforced atomically inside `commit_transfer`: before mutating any state it recomputes each guarded balance and aborts with a retryable `Conflict` if it changed since validation. The saga pipeline additionally isolates the consumed postings via the reserve step (Active → PendingInactive), stamping each reserved posting with a `ReservationId` so only the reserving saga can finalize or release it.
 
 Other policies do not need CAS guards: `NoOverdraft` is fully UTXO-backed (you can only spend postings you own), and unconstrained policies have no floor to violate.
 

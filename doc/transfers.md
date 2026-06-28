@@ -109,9 +109,10 @@ For each movement:
 
 For each `(account, asset)` pair where net debit > 0:
 1. Query active postings for that account and asset
-2. Run greedy largest-first selection to cover the net debit
-3. Compute change = selected sum - net debit
-4. If change > 0, create a change posting returning the remainder to the account
+2. If positive postings cover the net debit: run greedy largest-first selection, compute change = selected sum − net debit, and (if change > 0) create a change posting returning the remainder to the account.
+3. If positive postings are **insufficient**:
+   - For `CappedOverdraft` / `UncappedOverdraft` accounts: consume all positive postings and create a **negative posting** for the shortfall (`net_debit − total_positive`). The `CappedOverdraft` floor is enforced later in validation.
+   - For any other policy: fail with `InsufficientFunds`.
 
 Pairs with net debit <= 0 (e.g. the external account in a deposit) are skipped — no posting selection needed.
 
@@ -187,8 +188,11 @@ Every envelope passes through `validate_and_plan()` before being applied. The va
 4. All consumed postings are Active or PendingInactive
 5. All referenced accounts exist, not frozen, not closed
 6. Account snapshot pinning (if provided)
-7. Per-asset conservation: `sum(consumed) == sum(created)`
-8. Negative postings only on SystemAccount or ExternalAccount
-9. Policy enforcement: projected balance satisfies account floor
+7. Book policy (if a book is loaded): referenced assets/accounts/flags allowed by the book
+8. Per-asset conservation: `sum(consumed) == sum(created)`
+9. Negative postings forbidden only on `NoOverdraft` accounts (allowed on overdraft/system/external)
+10. Policy enforcement: projected balance satisfies account floor
+
+After validation, the effects are applied through a single atomic `commit_transfer` (postings, transfer record, account index, and events commit together or not at all), which also enforces the `CappedOverdraft` CAS guards.
 
 See [architecture.md](architecture.md) for details on each check.

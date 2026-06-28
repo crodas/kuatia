@@ -30,14 +30,14 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use kuatia_core::{
-    AccountId, AssetId, Cent, Envelope, Plan, PlanInput, PostingId, Receipt, Transfer,
-    TransferBuilder, validate_and_plan,
+    AccountId, AssetId, Cent, Envelope, Plan, PlanInput, PostingId, Receipt, ReservationId,
+    Transfer, TransferBuilder, validate_and_plan,
 };
 
 use crate::error::LedgerError;
 use crate::ledger::{Ledger, now_millis};
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
-use kuatia_storage::store::EnvelopeRecord;
+use kuatia_storage::store::{CommitRequest, EnvelopeRecord};
 
 // ---------------------------------------------------------------------------
 // Saga error -- serializable + cloneable wrapper
@@ -85,6 +85,9 @@ pub struct LedgerCtx {
     pub plan: Option<Plan>,
     /// Resolved envelope produced by the resolve step.
     pub envelope: Option<Envelope>,
+    /// Reservation owner token for this saga's reserved postings. Serialized so
+    /// it survives pause/recovery, keeping ownership stable across restarts.
+    pub reservation: ReservationId,
     #[serde(skip)]
     ledger: Option<Arc<Ledger>>,
 }
@@ -109,6 +112,7 @@ impl LedgerCtx {
             reserved_postings: Vec::new(),
             plan: None,
             envelope: None,
+            reservation: ReservationId::default(),
             ledger: Some(ledger),
         }
     }
@@ -207,7 +211,7 @@ impl Step<LedgerCtx, SagaError> for ReservePostingsStep {
 
             ctx.ledger()?
                 .store()
-                .reserve_postings(&posting_ids)
+                .reserve_postings(&posting_ids, ctx.reservation)
                 .await
                 .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
             ctx.reserved_postings.extend_from_slice(&posting_ids);
@@ -223,7 +227,7 @@ impl Step<LedgerCtx, SagaError> for ReservePostingsStep {
     ) -> Result<CompensationOutcome, SagaError> {
         ctx.ledger()?
             .store()
-            .release_postings(&ctx.reserved_postings)
+            .release_postings(&ctx.reserved_postings, ctx.reservation)
             .await
             .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
         ctx.reserved_postings.clear();
@@ -270,6 +274,7 @@ impl Step<LedgerCtx, SagaError> for ValidateTransferStep {
                 consumed_postings: &loaded.consumed_postings,
                 accounts: &loaded.accounts,
                 balances: &loaded.balances,
+                book: loaded.book.as_ref(),
             };
 
             let plan =
@@ -322,32 +327,35 @@ impl Step<LedgerCtx, SagaError> for FinalizeTransferStep {
 
             let store = ctx.ledger()?.store();
 
-            store
-                .finalize_postings(&plan.postings_to_deactivate, &plan.postings_to_create)
-                .await
-                .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
-
             let receipt = Receipt {
                 transfer_id: plan.transfer_id,
             };
+
+            // Saga path: our postings are PendingInactive under `ctx.reservation`.
+            // Postings, transfer record, account index, and event commit atomically.
+            let events = [LedgerEvent {
+                seq: 0,
+                timestamp: now_millis().map_err(SagaError::from)?,
+                kind: LedgerEventKind::TransferCommitted {
+                    transfer_id: receipt.transfer_id,
+                },
+            }];
+
             store
-                .store_transfer(EnvelopeRecord {
-                    envelope: envelope.clone(),
-                    receipt: receipt.clone(),
-                    created_at: now_millis().map_err(SagaError::from)?,
+                .commit_transfer(CommitRequest {
+                    deactivate: &plan.postings_to_deactivate,
+                    create: &plan.postings_to_create,
+                    cas_guards: &plan.cas_guards,
+                    reservation: Some(ctx.reservation),
+                    record: EnvelopeRecord {
+                        envelope: envelope.clone(),
+                        receipt: receipt.clone(),
+                        created_at: now_millis().map_err(SagaError::from)?,
+                    },
+                    events: &events,
                 })
                 .await
                 .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
-
-            let _ = store
-                .append_event(&LedgerEvent {
-                    seq: 0,
-                    timestamp: now_millis().map_err(SagaError::from)?,
-                    kind: LedgerEventKind::TransferCommitted {
-                        transfer_id: receipt.transfer_id,
-                    },
-                })
-                .await;
 
             ctx.receipts.push(receipt);
             ctx.reserved_postings.clear();

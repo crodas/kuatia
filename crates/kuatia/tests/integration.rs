@@ -713,3 +713,129 @@ async fn account_hash_changes_with_version() {
     let h2 = kuatia_core::account_hash(&acc);
     assert_ne!(h1, h2);
 }
+
+// ---------------------------------------------------------------------------
+// Overdraft via negative postings
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn capped_overdraft_creates_negative_posting() {
+    let store = InMemoryStore::new();
+    let ledger = Arc::new(Ledger::new(store));
+    for (id, policy) in [
+        (10, AccountPolicy::CappedOverdraft { floor: Cent::from(-200) }),
+        (2, AccountPolicy::NoOverdraft),
+        (99, AccountPolicy::ExternalAccount),
+    ] {
+        ledger.store().create_account(make_account(id, policy)).await.unwrap();
+    }
+
+    // Fund account 10 with 50, then pay 100 — overdraft covers the 50 shortfall.
+    deposit(&ledger, account(10), usd(), Cent::from(50), external()).await;
+    pay(&ledger, account(10), account(2), usd(), Cent::from(100)).await;
+
+    assert_eq!(ledger.balance(&account(10), &usd()).await.unwrap(), Cent::from(-50));
+    assert_eq!(ledger.balance(&account(2), &usd()).await.unwrap(), Cent::from(100));
+
+    // A negative posting now backs the overdraft.
+    let postings = ledger
+        .store()
+        .get_postings_by_account(&account(10), Some(&usd()), Some(PostingStatus::Active))
+        .await
+        .unwrap();
+    assert!(postings.iter().any(|p| p.value == Cent::from(-50)));
+}
+
+#[tokio::test]
+async fn capped_overdraft_respects_floor() {
+    let store = InMemoryStore::new();
+    let ledger = Arc::new(Ledger::new(store));
+    for (id, policy) in [
+        (10, AccountPolicy::CappedOverdraft { floor: Cent::from(-80) }),
+        (2, AccountPolicy::NoOverdraft),
+        (99, AccountPolicy::ExternalAccount),
+    ] {
+        ledger.store().create_account(make_account(id, policy)).await.unwrap();
+    }
+
+    // Paying 100 from an empty account would project to -100, below the -80 floor.
+    let transfer = TransferBuilder::new()
+        .pay(account(10), account(2), usd(), Cent::from(100))
+        .build();
+    assert!(ledger.commit(transfer).await.is_err());
+    assert_eq!(ledger.balance(&account(10), &usd()).await.unwrap(), Cent::ZERO);
+}
+
+#[tokio::test]
+async fn uncapped_overdraft_allows_arbitrary_negative() {
+    let store = InMemoryStore::new();
+    let ledger = Arc::new(Ledger::new(store));
+    for (id, policy) in [
+        (10, AccountPolicy::UncappedOverdraft),
+        (2, AccountPolicy::NoOverdraft),
+        (99, AccountPolicy::ExternalAccount),
+    ] {
+        ledger.store().create_account(make_account(id, policy)).await.unwrap();
+    }
+
+    pay(&ledger, account(10), account(2), usd(), Cent::from(1_000_000)).await;
+    assert_eq!(
+        ledger.balance(&account(10), &usd()).await.unwrap(),
+        Cent::from(-1_000_000)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Book policy enforcement
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn book_policy_rejects_disallowed_asset() {
+    let ledger = setup_ledger().await;
+    // Book 5 permits only EUR.
+    let book = BookBuilder::new("eur-only")
+        .id(BookId::new(5))
+        .allow_asset(eur())
+        .build();
+    ledger.store().create_book(book).await.unwrap();
+
+    deposit(&ledger, account(1), usd(), Cent::from(100), external()).await;
+
+    // Paying USD under a EUR-only book is rejected, balance unchanged.
+    let transfer = TransferBuilder::new()
+        .book(BookId::new(5))
+        .pay(account(1), account(2), usd(), Cent::from(50))
+        .build();
+    assert!(ledger.commit(transfer).await.is_err());
+    assert_eq!(ledger.balance(&account(1), &usd()).await.unwrap(), Cent::from(100));
+}
+
+#[tokio::test]
+async fn transfer_in_missing_named_book_is_rejected() {
+    let ledger = setup_ledger().await;
+    deposit(&ledger, account(1), usd(), Cent::from(100), external()).await;
+
+    let transfer = TransferBuilder::new()
+        .book(BookId::new(404))
+        .pay(account(1), account(2), usd(), Cent::from(50))
+        .build();
+    assert!(ledger.commit(transfer).await.is_err());
+    assert_eq!(ledger.balance(&account(1), &usd()).await.unwrap(), Cent::from(100));
+}
+
+// ---------------------------------------------------------------------------
+// Content-addressed determinism
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn identical_transfers_share_envelope_id() {
+    // Two independently-built default-book transfers must hash identically.
+    let a = TransferBuilder::new()
+        .pay(account(1), account(2), usd(), Cent::from(10))
+        .build();
+    let b = TransferBuilder::new()
+        .pay(account(1), account(2), usd(), Cent::from(10))
+        .build();
+    assert_eq!(a.book, b.book, "default book must be deterministic");
+    assert_eq!(a.book, DEFAULT_BOOK);
+}

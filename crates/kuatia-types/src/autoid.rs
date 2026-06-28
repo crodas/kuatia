@@ -10,9 +10,15 @@
 //! ```
 //!
 //! - Bit 63: always 0 (keeps i64 positive)
-//! - Bits 62–23: Unix milliseconds (40 bits ≈ 34.8 years from epoch)
+//! - Bits 62–23: milliseconds since [`KUATIA_EPOCH_MS`] (40 bits ≈ 34.8 years)
 //! - Bits 22–0: lower 23 bits of CRC32 of context data, or an internal
 //!   counter that wraps on overflow when no data is provided.
+//!
+//! The millisecond field counts from a fixed recent epoch
+//! ([`KUATIA_EPOCH_MS`] = 2026-01-01T00:00:00Z) rather than the Unix epoch, so
+//! the 40-bit window gives ~34.8 years of range *going forward* (until ~2060)
+//! instead of a window already partly elapsed since 1970. Collision resistance
+//! within a millisecond comes from the CRC32 tail (for content-keyed ids).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,6 +26,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const TIMESTAMP_BITS: u32 = 40;
 const TAIL_BITS: u32 = 23;
 const TAIL_MASK: u32 = (1 << TAIL_BITS) - 1;
+
+/// Custom epoch for the timestamp field: 2026-01-01T00:00:00Z in Unix
+/// milliseconds. Ids generated before this instant clamp to 0.
+pub const KUATIA_EPOCH_MS: u64 = 1_767_225_600_000;
 
 /// Snowflake-style ID generator.
 ///
@@ -63,10 +73,11 @@ impl AutoId {
     }
 
     fn now_ms() -> u64 {
-        SystemTime::now()
+        let unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64
+            .as_millis() as u64;
+        unix_ms.saturating_sub(KUATIA_EPOCH_MS)
     }
 
     fn pack(ms: u64, tail: u32) -> i64 {

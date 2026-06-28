@@ -2,7 +2,7 @@
 
 ## Overview
 
-An account is a versioned entity that owns postings. Balance is never stored — it is always computed as the sum of active postings for a given (account, asset) pair.
+An account is a versioned entity that owns postings. Balance is never stored — it is always computed from postings for a given (account, asset) pair. The **ledger balance** sums non-`Inactive` postings (`Active + PendingInactive`); the **available balance** sums only `Active` postings (excluding those reserved for an in-flight transfer). `balance()` returns the ledger balance.
 
 ## Structure
 
@@ -23,14 +23,14 @@ Each account has a policy that controls what balance constraints apply:
 | Policy | Balance floor | Negative postings | CAS guard |
 |--------|--------------|-------------------|-----------|
 | `NoOverdraft` | `>= 0` | No | No |
-| `CappedOverdraft { floor }` | `>= floor` | No | Yes |
-| `UncappedOverdraft` | None | No | No |
+| `CappedOverdraft { floor }` | `>= floor` | Yes (down to floor) | Yes |
+| `UncappedOverdraft` | None | Yes (unbounded) | No |
 | `SystemAccount` | None | Yes | No |
 | `ExternalAccount` | None | Yes | No |
 
-Only `SystemAccount` and `ExternalAccount` may hold negative postings (offset positions). Validation rejects any transfer that would create a negative posting on another account type.
+An overdraft is represented as a **negative posting** (an offset position) assigned to the account to cover a shortfall. When an account's positive postings are insufficient for a debit, the resolve step consumes them all and creates a negative posting for the remainder. `NoOverdraft` accounts forbid this; validation rejects any transfer that would create a negative posting on a `NoOverdraft` account. `CappedOverdraft`'s floor bounds how negative the balance may go; `UncappedOverdraft`, `SystemAccount`, and `ExternalAccount` are unbounded.
 
-`CappedOverdraft` accounts emit CAS (Compare-And-Swap) guards during validation to prevent write-skew — two concurrent transfers could each pass validation independently but together push the balance below the floor.
+`CappedOverdraft` accounts emit CAS (Compare-And-Swap) guards during validation to prevent write-skew — two concurrent transfers could each pass validation independently but together push the balance below the floor. The guards are enforced atomically inside `commit_transfer` (the commit aborts with a retryable conflict if a guarded balance changed since validation).
 
 ## Lifecycle
 
@@ -101,4 +101,4 @@ Boundary accounts representing the outside world (banks, payment processors). Th
 
 ### Credit accounts (`CappedOverdraft`)
 
-Accounts with a negative floor (e.g. credit lines). The floor is the maximum allowed overdraft. Write-skew prevention via CAS guards ensures concurrent transfers respect the floor.
+Accounts with a negative floor (e.g. credit lines). The floor is the maximum allowed overdraft. When the account's positive postings are insufficient for a debit, a negative posting is created to cover the shortfall, down to the floor. Write-skew prevention via CAS guards (enforced inside `commit_transfer`) ensures concurrent transfers respect the floor.

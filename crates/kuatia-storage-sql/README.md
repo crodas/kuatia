@@ -15,7 +15,13 @@ kuatia-storage-sql = { features = ["sqlite"] }   # or "postgres"
 | Feature | Backend | Status |
 |---------|---------|--------|
 | `sqlite` (default) | SQLite via sqlx | Conformance tests pass |
-| `postgres` | PostgreSQL via sqlx | Feature-flagged, needs running instance |
+| `postgres` | PostgreSQL via sqlx | Portable DDL/queries; needs a running instance to test |
+
+The backend is detected at migration time and the matching DDL is applied from
+`src/migrations/{sqlite,postgres}/` (SQLite uses `BLOB`, PostgreSQL uses
+`BYTEA`). Applied migrations are tracked in a `_migrations` table, so
+`migrate()` is idempotent. Upserts use portable `ON CONFLICT … DO UPDATE`, and
+all ids are generated in Rust (no `AUTOINCREMENT`/`SERIAL`).
 
 ## Usage
 

@@ -2,7 +2,7 @@
 
 Storage abstraction for the kuatia ledger.
 
-Defines the `Store` trait (composed of six sub-traits), provides an
+Defines the `Store` trait (composed of seven sub-traits), provides an
 in-memory implementation for tests, and exports a `store_tests!` conformance
 macro that any backend can use to validate its implementation.
 
@@ -11,13 +11,14 @@ macro that any backend can use to validate its implementation.
 | Trait | Purpose |
 |-------|---------|
 | `AccountStore` | Account CRUD and versioning |
-| `PostingStore` | Posting reads, reserve/release/finalize lifecycle |
+| `PostingStore` | Posting reads, reserve/release/finalize lifecycle (reserve/release carry a `ReservationId`) |
 | `TransferStore` | Transfer persistence and queries |
 | `SagaStore` | Saga state for crash recovery |
 | `EventStore` | Append-only ledger event log |
 | `BookStore` | Book (transfer policy scope) persistence |
+| `CommitStore` | `commit_transfer` — the single atomic commit boundary (postings + transfer + index + events) |
 
-`Store` is a blanket trait — any type implementing all six sub-traits is a `Store`.
+`Store` is a blanket trait — any type implementing all seven sub-traits is a `Store`.
 
 ## Conformance testing
 

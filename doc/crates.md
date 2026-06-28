@@ -26,7 +26,8 @@ Pure, sans-IO (Input/Output) decision logic. No async runtime, near-zero depende
 | `OverflowError` | Returned when a `Cent` operation would overflow or underflow |
 | `PostingStatus` | Posting lifecycle: `Active`, `PendingInactive`, `Inactive` |
 | `Amount` | Parser/formatter for decimal strings. Not stored — use at API boundaries only |
-| `Posting` | Signed amount of one asset owned by one account. Has `status: PostingStatus` |
+| `Posting` | Signed amount of one asset owned by one account. Has `status: PostingStatus` and `reservation: Option<ReservationId>` (owner token while `PendingInactive`) |
+| `ReservationId` | Owner token stamped on a reserved posting so only the reserving saga may finalize/release it |
 | `NewPosting` | Posting to be created (no id yet — assigned during validation) |
 | `Transfer` | Atomic unit: consumes postings + creates postings + metadata |
 | `EnvelopeBuilder` | Fluent builder for `Transfer` construction |
@@ -36,7 +37,7 @@ Pure, sans-IO (Input/Output) decision logic. No async runtime, near-zero depende
 | `UserData` | Fixed 28 bytes (u128 + u64 + u32) for correlation IDs, external refs |
 | `Metadata` | `BTreeMap<String, Vec<u8>>` for free-form key-value data |
 | `Receipt` | Confirmation of a committed transfer (contains `transfer_id`) |
-| `AutoId` | Snowflake-inspired i64 ID generator — `[0][40-bit ms][23-bit CRC32 or counter]`. Lives in `kuatia-types::autoid` |
+| `AutoId` | Snowflake-inspired i64 ID generator — `[0][40-bit ms][23-bit CRC32 or counter]`. The ms field counts from `KUATIA_EPOCH_MS` (2026-01-01T00:00:00Z), giving ~34.8 years forward. Lives in `kuatia-types::autoid` |
 
 ### Validation Invariants
 
@@ -49,9 +50,10 @@ graph TD
     C --> D[4. Posting active or reserved]
     D --> E[5. Account existence & lifecycle]
     E --> F[6. Snapshot pinning]
-    F --> G[7. Per-asset conservation]
-    G --> H[8. Negative posting restriction]
-    H --> J[9. Policy enforcement]
+    F --> BP[7. Book policy]
+    BP --> G[8. Per-asset conservation]
+    G --> H[9. Negative posting restriction]
+    H --> J[10. Policy enforcement]
     J --> I[Plan]
     style I fill:#e8f5e9
 ```
@@ -62,9 +64,10 @@ graph TD
 4. **Posting active or reserved** — consumed postings must be `Active` or `PendingInactive` (prevents double-spend)
 5. **Account existence & lifecycle** — all referenced accounts exist, not frozen, not closed
 6. **Snapshot pinning** — account snapshots (if provided) must match current state
-7. **Per-asset conservation** — `sum(consumed) == sum(created)` for each asset
-8. **Negative posting restriction** — negative postings only allowed on `SystemAccount` or `ExternalAccount`
-9. **Policy enforcement** — projected balance satisfies account's floor
+7. **Book policy** — when a book is loaded, referenced assets/accounts/flags must be allowed by the book
+8. **Per-asset conservation** — `sum(consumed) == sum(created)` for each asset
+9. **Negative posting restriction** — negative postings forbidden only on `NoOverdraft` (allowed on overdraft/system/external)
+10. **Policy enforcement** — projected balance satisfies account's floor
 
 Output is a `Plan` containing `transfer_id`, `postings_to_deactivate`, `postings_to_create`, and `cas_guards` (Compare-And-Swap guards for concurrency safety).
 
@@ -79,7 +82,7 @@ Async resource layer. Depends on `kuatia-core`, `tokio`, `async-trait`, `serde`,
 | Module | Purpose |
 |--------|---------|
 | `kuatia` | `Ledger` — primary API (non-generic, uses `Arc<dyn Store>`), saga commit pipeline, intent layer |
-| `store` | `Store` composite trait + sub-traits (`AccountStore`, `PostingStore`, `TransferStore`, `SagaStore`) |
+| `store` | `Store` composite trait + sub-traits (`AccountStore`, `PostingStore`, `TransferStore`, `SagaStore`, `EventStore`, `BookStore`, `CommitStore`) |
 | `error` | `StoreError`, `LedgerError` — unified error hierarchy |
 | `mem_store` | `InMemoryStore` — in-memory `Store` implementation for tests |
 | `saga` | Pipeline steps (reserve, validate, finalize) + high-level legend step adapters |
@@ -94,7 +97,7 @@ Driven by a `TransferSaga` defined via `legend!` — four steps with automatic r
 graph LR
     A[resolve] -->|Envelope| B[reserve_postings]
     B -->|batch Active→PendingInactive| C[validate_and_plan]
-    C -->|Plan| D[finalize + store + emit event]
+    C -->|Plan| D[commit_transfer atomically]
     D --> E[Receipt]
     style E fill:#e8f5e9
 ```
@@ -159,7 +162,7 @@ Transfers are built via `TransferBuilder` and committed with `ledger.commit(tran
 
 ### Store Trait
 
-The `Store` trait is a composite of five focused sub-traits:
+The `Store` trait is a composite of seven focused sub-traits:
 
 ```mermaid
 graph TB
@@ -168,13 +171,17 @@ graph TB
     Store --> TransferStore
     Store --> SagaStore
     Store --> EventStore
+    Store --> BookStore
+    Store --> CommitStore
 ```
 
 - **`AccountStore`**: `get_account`, `get_accounts`, `create_account`, `append_account_version`, `get_account_history`, `list_accounts`
-- **`PostingStore`**: `get_postings`, `get_postings_by_account(account, asset?, status?)`, `query_postings(query)`, `reserve_postings`, `release_postings`, `finalize_postings`
+- **`PostingStore`**: `get_postings`, `get_postings_by_account(account, asset?, status?)`, `query_postings(query)`, `reserve_postings(ids, reservation)`, `release_postings(ids, reservation)`, `finalize_postings`
 - **`TransferStore`**: `get_transfer`, `store_transfer`, `get_transfers_for_account`, `query_transfers`
 - **`EventStore`**: `append_event`, `get_events_since`
 - **`SagaStore`**: `save_saga`, `list_pending_sagas`, `delete_saga`
+- **`BookStore`**: `create_book`, `get_book`, `list_books`
+- **`CommitStore`**: `commit_transfer(req)` — the single atomic commit boundary. It applies posting deactivations/creations, the transfer record, the both-sided account index, and events in one critical section, enforcing `CappedOverdraft` CAS guards and reservation ownership. `reserve_postings`/`release_postings`/`finalize_postings` remain as lower-level primitives; `commit_transfer` is the production commit path.
 
 #### Batch posting operations
 
@@ -212,6 +219,7 @@ LedgerError
 ├── AccountNotFound
 ├── AccountNotEmpty              // can't close with active postings
 ├── AccountAlreadyClosed
+├── BookNotFound                 // transfer named a book that does not exist
 ├── Overflow                     // monetary arithmetic overflow
 └── CompensationFailed           // saga compensation failed (original + compensation errors)
 ```
@@ -223,7 +231,9 @@ StoreError
 ├── VersionConflict { account, expected, actual }
 ├── Internal(String)
 ├── PostingNotActive(PostingId)   // reserve_postings: posting not Active
-└── PostingInactive(PostingId)    // release_postings: posting is void
+├── PostingInactive(PostingId)    // release_postings: posting is void
+├── Conflict { account, asset }   // commit_transfer: CAS guard balance changed (retryable)
+└── ReservationMismatch(PostingId) // posting reserved by a different saga
 ```
 
 ### Saga Steps

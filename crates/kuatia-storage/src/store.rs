@@ -1,19 +1,22 @@
 //! Storage abstraction separating the pure decision logic from IO.
 //!
-//! The [`Store`] trait composes four focused sub-traits:
+//! The [`Store`] trait composes six focused sub-traits:
 //! - [`AccountStore`] — account CRUD and versioning
 //! - [`PostingStore`] — posting reads and lifecycle transitions
 //! - [`TransferStore`] — transfer persistence and queries
 //! - [`SagaStore`] — saga state for crash recovery
+//! - [`EventStore`](crate::events::EventStore) — the ledger event log
+//! - [`BookStore`] — book persistence
+//! - [`CommitStore`] — the single atomic commit boundary
 
 use async_trait::async_trait;
 use kuatia_types::{
-    Account, AccountId, AssetId, Envelope, EnvelopeId, Book, BookId, Posting, PostingId,
-    PostingStatus, Receipt,
+    Account, AccountId, AssetId, Book, BookId, Cent, Envelope, EnvelopeId, Posting, PostingId,
+    PostingStatus, Receipt, ReservationId,
 };
 
 use crate::error::StoreError;
-use crate::events::EventStore;
+use crate::events::{EventStore, LedgerEvent};
 
 /// Pairs a committed transfer with its receipt.
 #[derive(Debug, Clone)]
@@ -24,6 +27,27 @@ pub struct EnvelopeRecord {
     pub receipt: Receipt,
     /// Unix milliseconds when this record was created.
     pub created_at: i64,
+}
+
+/// Everything one atomic commit must persist together. Carries decomposed
+/// primitives (not `kuatia_core::Plan`) so this crate need not depend on the
+/// pure-core crate.
+pub struct CommitRequest<'a> {
+    /// Consumed postings to mark `Inactive`.
+    pub deactivate: &'a [PostingId],
+    /// New postings to insert (already `Active`, from the validated plan).
+    pub create: &'a [Posting],
+    /// `(account, asset, expected_balance)` guards to verify before mutating —
+    /// a mismatch means a concurrent transfer moved the balance ([`StoreError::Conflict`]).
+    pub cas_guards: &'a [(AccountId, AssetId, Cent)],
+    /// Reservation authorizing consumption of `deactivate`.
+    /// - `None` — raw path: the postings must be `Active`.
+    /// - `Some(rid)` — saga path: the postings must be `PendingInactive` owned by `rid`.
+    pub reservation: Option<ReservationId>,
+    /// The transfer record to persist.
+    pub record: EnvelopeRecord,
+    /// Events to append within the same transaction (e.g. `TransferCommitted`).
+    pub events: &'a [LedgerEvent],
 }
 
 /// Pagination and filtering parameters for posting queries.
@@ -100,15 +124,24 @@ pub trait PostingStore: Send + Sync {
         asset: Option<&AssetId>,
         status: Option<PostingStatus>,
     ) -> Result<Vec<Posting>, StoreError>;
-    /// Reserve postings: Active → PendingInactive.
-    /// Atomic: if any posting is not Active, the entire batch fails.
-    async fn reserve_postings(&self, ids: &[PostingId]) -> Result<(), StoreError>;
-    /// Release postings back from reservation.
-    /// - PendingInactive → Active
+    /// Reserve postings: Active → PendingInactive, stamping `reservation` as the
+    /// owner token. Atomic: if any posting is not Active, the entire batch fails.
+    async fn reserve_postings(
+        &self,
+        ids: &[PostingId],
+        reservation: ReservationId,
+    ) -> Result<(), StoreError>;
+    /// Release postings reserved under `reservation`, back from reservation.
+    /// - PendingInactive owned by `reservation` → Active (clears the owner)
+    /// - PendingInactive owned by a different reservation → fail ([`StoreError::ReservationMismatch`])
     /// - Active → no-op (already released)
     /// - Inactive → fail (void posting cannot be released)
-    /// Atomic: if any posting is Inactive, the entire batch fails.
-    async fn release_postings(&self, ids: &[PostingId]) -> Result<(), StoreError>;
+    /// Atomic: if any posting fails its check, the entire batch fails.
+    async fn release_postings(
+        &self,
+        ids: &[PostingId],
+        reservation: ReservationId,
+    ) -> Result<(), StoreError>;
     /// Deactivate postings and insert newly created postings.
     async fn finalize_postings(
         &self,
@@ -213,17 +246,39 @@ pub trait BookStore: Send + Sync {
     async fn list_books(&self) -> Result<Vec<Book>, StoreError>;
 }
 
+/// The single atomic commit boundary — the one place ledger state changes.
+#[async_trait]
+pub trait CommitStore: Send + Sync {
+    /// Apply a validated transfer atomically: enforce CAS guards, authorize and
+    /// deactivate consumed postings, insert created postings, persist the
+    /// transfer record (indexed by **both** created and consumed account owners),
+    /// and append the events — all in one critical section.
+    ///
+    /// Idempotent on the transfer id: if already committed, returns `Ok(())`.
+    /// Returns [`StoreError::Conflict`] (retryable) if a guard balance changed,
+    /// or [`StoreError::ReservationMismatch`] if a consumed posting is not owned
+    /// as `req.reservation` requires.
+    async fn commit_transfer(&self, req: CommitRequest<'_>) -> Result<(), StoreError>;
+}
+
 // ---------------------------------------------------------------------------
 // Composite trait
 // ---------------------------------------------------------------------------
 
 /// Async storage abstraction composing all sub-traits.
 pub trait Store:
-    AccountStore + PostingStore + TransferStore + SagaStore + EventStore + BookStore
+    AccountStore + PostingStore + TransferStore + SagaStore + EventStore + BookStore + CommitStore
 {
 }
 
-impl<T: AccountStore + PostingStore + TransferStore + SagaStore + EventStore + BookStore> Store
-    for T
+impl<
+    T: AccountStore
+        + PostingStore
+        + TransferStore
+        + SagaStore
+        + EventStore
+        + BookStore
+        + CommitStore,
+> Store for T
 {
 }

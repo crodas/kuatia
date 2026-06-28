@@ -7,9 +7,9 @@ use legend::{ExecutionResult, legend};
 use tracing::instrument;
 
 use kuatia_core::{
-    AccountId, AccountSnapshotId, AssetId, Cent, Envelope, EnvelopeBuilder, EnvelopeId, NewPosting,
-    PlanInput, Posting, PostingId, PostingStatus, Receipt, Transfer, account_snapshot_id,
-    envelope_id, select_postings, validate_and_plan,
+    AccountId, AccountPolicy, AccountSnapshotId, AssetId, Book, Cent, DEFAULT_BOOK, Envelope,
+    EnvelopeBuilder, EnvelopeId, NewPosting, PlanInput, Posting, PostingId, PostingStatus, Receipt,
+    SelectionError, Transfer, account_snapshot_id, envelope_id, select_postings, validate_and_plan,
 };
 
 use crate::error::LedgerError;
@@ -25,8 +25,9 @@ use crate::saga::{
     FinalizeInput, FinalizeTransferStep, LedgerCtx, ReserveInput, ReservePostingsStep,
     ResolveInput, ResolveStep, SagaError, ValidateInput, ValidateTransferStep,
 };
+use kuatia_storage::error::StoreError;
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
-use kuatia_storage::store::{EnvelopeRecord, Store};
+use kuatia_storage::store::{CommitRequest, EnvelopeRecord, Store};
 
 #[allow(missing_docs)]
 mod transfer_saga {
@@ -99,10 +100,21 @@ impl Ledger {
             balances.insert((*account_id, *asset_id), bal);
         }
 
+        // Load the gating book. A missing named (non-default) book is an error;
+        // a missing default book means "unrestricted" (no policy to enforce).
+        let book_id = envelope.book();
+        let book = match self.store.get_book(&book_id).await {
+            Ok(b) => Some(b),
+            Err(StoreError::NotFound(_)) if book_id == DEFAULT_BOOK => None,
+            Err(StoreError::NotFound(_)) => return Err(LedgerError::BookNotFound(book_id)),
+            Err(e) => return Err(e.into()),
+        };
+
         Ok(LoadedState {
             consumed_postings,
             accounts,
             balances,
+            book,
         })
     }
 
@@ -117,6 +129,7 @@ impl Ledger {
             consumed_postings: &loaded.consumed_postings,
             accounts: &loaded.accounts,
             balances: &loaded.balances,
+            book: loaded.book.as_ref(),
         };
         Ok(validate_and_plan(input)?)
     }
@@ -128,32 +141,35 @@ impl Ledger {
         envelope: &Envelope,
         plan: &kuatia_core::Plan,
     ) -> Result<Receipt, LedgerError> {
-        self.store
-            .finalize_postings(&plan.postings_to_deactivate, &plan.postings_to_create)
-            .await?;
-
         let receipt = Receipt {
             transfer_id: plan.transfer_id,
         };
 
+        // Raw path: consumed postings are Active (never reserved), so pass
+        // `reservation: None`. Postings, transfer record, account index, and
+        // event commit atomically.
+        let events = [LedgerEvent {
+            seq: 0,
+            timestamp: now_millis()?,
+            kind: LedgerEventKind::TransferCommitted {
+                transfer_id: receipt.transfer_id,
+            },
+        }];
+
         self.store
-            .store_transfer(EnvelopeRecord {
-                envelope: envelope.clone(),
-                receipt: receipt.clone(),
-                created_at: now_millis()?,
+            .commit_transfer(CommitRequest {
+                deactivate: &plan.postings_to_deactivate,
+                create: &plan.postings_to_create,
+                cas_guards: &plan.cas_guards,
+                reservation: None,
+                record: EnvelopeRecord {
+                    envelope: envelope.clone(),
+                    receipt: receipt.clone(),
+                    created_at: now_millis()?,
+                },
+                events: &events,
             })
             .await?;
-
-        let _ = self
-            .store
-            .append_event(&LedgerEvent {
-                seq: 0,
-                timestamp: now_millis()?,
-                kind: LedgerEventKind::TransferCommitted {
-                    transfer_id: receipt.transfer_id,
-                },
-            })
-            .await;
 
         Ok(receipt)
     }
@@ -195,24 +211,58 @@ impl Ledger {
                 .store
                 .get_postings_by_account(account, Some(asset), Some(PostingStatus::Active))
                 .await?;
-            let selected = select_postings(&available, *asset, *net_debit)?;
-
-            let consumed_sum = Cent::checked_sum(
-                available
-                    .iter()
-                    .filter(|p| selected.contains(&p.id))
-                    .map(|p| p.value),
+            let total_positive = Cent::checked_sum(
+                available.iter().filter(|p| p.value.is_positive()).map(|p| p.value),
             )?;
-            let change = consumed_sum.checked_sub(*net_debit)?;
 
-            consumes.extend_from_slice(&selected);
-            if change.is_positive() {
-                creates.push(NewPosting {
-                    owner: *account,
-                    asset: *asset,
-                    value: change,
-                    payer: None,
-                });
+            if total_positive >= *net_debit {
+                // Enough positive postings: select a subset and compute change.
+                let selected = select_postings(&available, *asset, *net_debit)?;
+                let consumed_sum = Cent::checked_sum(
+                    available
+                        .iter()
+                        .filter(|p| selected.contains(&p.id))
+                        .map(|p| p.value),
+                )?;
+                let change = consumed_sum.checked_sub(*net_debit)?;
+
+                consumes.extend_from_slice(&selected);
+                if change.is_positive() {
+                    creates.push(NewPosting {
+                        owner: *account,
+                        asset: *asset,
+                        value: change,
+                        payer: None,
+                    });
+                }
+            } else {
+                // Not enough positive postings. Overdraft accounts cover the
+                // shortfall with a negative posting (an offset position); the
+                // floor is enforced later in validation. Any other policy fails.
+                let policy = self.store.get_account(account).await?.policy;
+                match policy {
+                    AccountPolicy::CappedOverdraft { .. } | AccountPolicy::UncappedOverdraft => {
+                        let positives: Vec<PostingId> = available
+                            .iter()
+                            .filter(|p| p.value.is_positive())
+                            .map(|p| p.id)
+                            .collect();
+                        consumes.extend_from_slice(&positives);
+                        let shortfall = net_debit.checked_sub(total_positive)?;
+                        creates.push(NewPosting {
+                            owner: *account,
+                            asset: *asset,
+                            value: shortfall.checked_neg()?,
+                            payer: None,
+                        });
+                    }
+                    _ => {
+                        return Err(LedgerError::Selection(SelectionError::InsufficientFunds {
+                            available: total_positive,
+                            requested: *net_debit,
+                        }));
+                    }
+                }
             }
         }
 
@@ -600,4 +650,6 @@ pub struct LoadedState {
     pub accounts: HashMap<AccountId, kuatia_core::Account>,
     /// Current balances for all referenced (account, asset) pairs.
     pub balances: HashMap<(AccountId, AssetId), Cent>,
+    /// The book gating this transfer, if one is loaded (`None` = unrestricted default).
+    pub book: Option<Book>,
 }

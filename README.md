@@ -38,7 +38,7 @@ balance is always the sum of its active postings.
 |-------|---------|
 | **kuatia-types** | Domain types — `AccountId`, `Posting`, `Transfer`, `Cent`, etc. |
 | **kuatia-core** | Pure, sans-IO decision logic — validation, hashing, posting selection. |
-| **kuatia-storage** | `Store` trait (6 sub-traits), `InMemoryStore`, `store_tests!` conformance macro. |
+| **kuatia-storage** | `Store` trait (7 sub-traits), `InMemoryStore`, `store_tests!` conformance macro. |
 | **kuatia-storage-sql** | SQL-backed `Store` — SQLite and PostgreSQL via sqlx. |
 | **kuatia** | Async resource layer — `Ledger`, saga commit pipeline, intent-layer API. |
 
