@@ -92,16 +92,18 @@ Async resource layer. Depends on `kuatia-core`, `tokio`, `async-trait`, `serde`,
 #### Commit (the envelope saga)
 
 `commit(transfer)` resolves the intent into an envelope (read-only) then runs the
-`EnvelopeSaga` (defined via `legend!`) — three steps with automatic retry and
-LIFO compensation. Finalize calls the dumb primitives one by one and interprets
-each affected-row count:
+`EnvelopeSaga` (defined via `legend!`) — **two steps** with automatic retry and
+LIFO compensation. The finalize step re-validates as its last action before the
+writes, then calls the dumb primitives, interpreting/verifying each count:
 
 ```mermaid
 graph LR
-    A[resolve] -->|Envelope| W[save PendingSaga]
+    A[resolve] -->|Envelope| W[save PendingSaga: Reserving]
     W --> B[reserve_postings]
-    B -->|Active→PendingInactive| C[validate_and_plan]
-    C -->|Plan| D[deactivate → insert → store_transfer → append_event]
+    B -->|Active→PendingInactive| F[finalize]
+    F --> V[validate_and_plan re-check]
+    V --> M[mark Finalizing]
+    M --> D[deactivate → insert → store_transfer → append_event]
     D --> E[Receipt + delete PendingSaga]
     style E fill:#e8f5e9
 ```
@@ -118,7 +120,7 @@ through the idempotent primitives (roll-forward). Call it on startup.
 | Method | Description |
 |--------|-------------|
 | `commit(transfer)` | Resolve intent → `commit_envelope` (requires `Arc<Ledger>`) |
-| `commit_envelope(envelope)` | The one commit path: write-ahead → reserve → validate → finalize (for pre-built/FX envelopes) |
+| `commit_envelope(envelope)` | The one commit path: write-ahead → reserve → finalize (finalize re-validates, then writes); for pre-built/FX envelopes |
 | `reverse(transfer_id)` | Builds a compensating envelope and runs `commit_envelope` |
 | `recover()` | Force-completes pending sagas after a crash (call on startup) |
 
@@ -248,8 +250,11 @@ the saga derives meaning from them.
 | Step | Execute | Compensate | Retry |
 |------|---------|------------|-------|
 | `ReservePostingsStep` | `reserve_postings` `Active → PendingInactive`, interpret count | Release back to `Active` | 3 |
-| `ValidateTransferStep` | Load state, `validate_and_plan()` | No-op | None |
-| `FinalizeTransferStep` | `deactivate_postings` → `insert_postings` → `store_transfer` → `append_event` | `reverse(transfer_id)` | 3 |
+| `FinalizeTransferStep` | `Ledger::finalize_envelope`: re-validate (last-step floor/freeze guard) → mark `Finalizing` → `deactivate` → `insert` → `store_transfer` → `append_event`, verifying every end-state | `reverse(transfer_id)` | 3 |
+
+Validation lives inside the finalize step so it runs immediately before the
+writes. Recovery (`recover()`) re-uses `finalize_envelope` for `Finalizing`
+sagas and re-runs the whole saga for `Reserving` ones.
 
 #### High-level steps (for custom saga composition with `legend!`)
 

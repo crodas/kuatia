@@ -157,16 +157,17 @@ A single transfer can contain multiple movements of different types. All movemen
 ### Saga commit (default)
 
 ```
-Transfer → resolve → Envelope → reserve → validate → finalize → Receipt
+Transfer → resolve → Envelope → reserve → finalize(validate → write) → Receipt
 ```
 
-Resolution is read-only; `commit(transfer)` resolves then runs the envelope saga
-(reserve → validate → finalize) with automatic retry and LIFO compensation.
+Resolution is read-only; `commit(transfer)` resolves then runs the two-step
+envelope saga (reserve → finalize) with automatic retry and LIFO compensation.
+Validation runs inside the finalize step, immediately before the writes.
 
 ### Committing a pre-built envelope
 
 ```
-Envelope → reserve → validate → finalize → Receipt
+Envelope → reserve → finalize(validate → write) → Receipt
 ```
 
 `ledger.commit_envelope(envelope)` runs the same saga for an envelope you already
@@ -196,11 +197,14 @@ Every envelope passes through `validate_and_plan()` before being applied. The va
 9. Negative postings forbidden only on `NoOverdraft` accounts (allowed on overdraft/system/external)
 10. Policy enforcement: projected balance satisfies account floor
 
-After validation, the finalize step applies the effects through a sequence of
-dumb, idempotent store primitives (`deactivate_postings` → `insert_postings` →
-`store_transfer` → `append_event`). There is no single transaction; crash-safety
-comes from a write-ahead `PendingSaga` record plus `recover()` roll-forward. The
-`CappedOverdraft` floor is checked in validation (step 10) and is best-effort
-under concurrency — see [architecture.md](architecture.md).
+Validation runs inside the finalize step, immediately before it writes (the
+last-step floor / freeze-close re-check). The finalize step then applies the
+effects through a sequence of dumb, idempotent store primitives
+(`deactivate_postings` → `insert_postings` → `store_transfer` → `append_event`),
+verifying every end-state. There is no single transaction; crash-safety comes
+from a phase-tracked write-ahead `PendingSaga` record plus `recover()`
+roll-forward. The `CappedOverdraft` floor is re-checked as that last step and is
+best-effort (not strictly atomic) under concurrency — see
+[architecture.md](architecture.md).
 
 See [architecture.md](architecture.md) for details on each check.

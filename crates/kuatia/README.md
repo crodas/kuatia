@@ -27,16 +27,15 @@ let receipt = ledger.commit(transfer).await?;
 
 ### Commit
 
-Every commit is the **envelope saga** (reserve → validate → finalize), driven by
-`legend` with automatic retry and LIFO compensation:
+Every commit is the **envelope saga** — two steps driven by `legend` with
+automatic retry and LIFO compensation:
 
 - `commit(transfer)` — resolves the intent into a concrete envelope (read-only),
   then runs `commit_envelope`.
 - `commit_envelope(envelope)` — the one commit path. Persists a write-ahead
-  `PendingSaga` record, then:
+  `PendingSaga` record (phase `Reserving`), then:
   1. **Reserve** — `reserve_postings`: Active → PendingInactive, stamped with this saga's `ReservationId`
-  2. **Validate** — pure `validate_and_plan()`
-  3. **Finalize** — the dumb, idempotent primitives in sequence: `deactivate_postings` → `insert_postings` → `store_transfer` → `append_event`
+  2. **Finalize** — re-validates against current state (the last-step floor / freeze-close guard), marks the saga `Finalizing`, then runs the dumb primitives `deactivate_postings` → `insert_postings` → `store_transfer` → `append_event`, verifying every end-state
 - `reverse(id)` — builds a reversal envelope and runs the same path.
 
 The store reports an **affected-row count** for each primitive; the saga
@@ -46,10 +45,11 @@ monolithic `commit_transfer` and no separate "atomic" path.
 
 ### Crash recovery
 
-`recover()` — call on startup. It force-completes any `PendingSaga` left by a
-crash, pushing the envelope through the idempotent primitives so a commit
-interrupted at any point (pre-reserve, reserved, or mid-finalize) converges to
-the committed state. Roll-forward, not rollback.
+`recover()` — call on startup. It completes any `PendingSaga` left by a crash,
+branching on the persisted phase: a `Reserving` saga is re-run (re-validating,
+aborting cleanly if a posting was taken or an account frozen); a `Finalizing`
+saga is rolled forward through the verified `finalize_envelope`. Roll-forward,
+not rollback.
 
 ### Account lifecycle
 

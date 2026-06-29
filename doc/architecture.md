@@ -97,88 +97,77 @@ The store only persists and reads — all domain logic (balance computation, val
 
 Every commit is the envelope saga. `commit(transfer)` resolves the intent into a
 concrete envelope (read-only), then runs `commit_envelope`, which persists a
-write-ahead `PendingSaga` record and drives three steps. The finalize step calls
-the dumb primitives one by one and interprets each affected-row count.
+write-ahead `PendingSaga` record (phase `Reserving`) and drives **two** steps.
+Validation lives inside the finalize step so it runs as late as possible —
+immediately before the writes.
 
 ```mermaid
 sequenceDiagram
     participant C as Caller
     participant L as Ledger
     participant R as ReserveStep
-    participant V as ValidateStep
     participant F as FinalizeStep
     participant S as Store
 
     C->>L: commit(transfer) → resolve → commit_envelope(envelope)
-    L->>S: save_saga(PendingSaga{envelope, reservation})
+    L->>S: save_saga(PendingSaga{envelope, reservation, Reserving})
     L->>R: execute
     R->>S: reserve_postings(ids, rid) → count
     Note over R: interpret count (full / partial / zero+read)
 
-    L->>V: execute
-    V->>S: get_postings, get_accounts, get_postings_by_account
-    V->>V: validate_and_plan() [pure]
-    V-->>L: Plan stored in LedgerCtx
-
-    L->>F: execute
-    F->>S: deactivate_postings(consumed, rid) → count
-    F->>S: insert_postings(created) → count
-    F->>S: store_transfer(record, involved) → count
-    F->>S: append_event(committed) → count
+    L->>F: execute (finalize_envelope)
+    F->>S: load + validate_and_plan() [last-step floor / freeze-close re-check]
+    F->>S: save_saga(... Finalizing)  [point of no return]
+    F->>S: deactivate_postings(consumed, rid) → verify all Inactive
+    F->>S: insert_postings(created) → verify exist
+    F->>S: store_transfer(record, involved) → verify transfer exists
+    F->>S: append_event(committed)
     F-->>L: Receipt
     L->>S: delete_saga(...)
     L-->>C: Receipt
 ```
 
-On in-process failure, legend compensates completed steps in LIFO order; a crash
-is handled instead by recovery (below).
-
-```mermaid
-sequenceDiagram
-    participant L as Legend
-    participant F as FinalizeStep
-    participant V as ValidateStep
-    participant R as ReserveStep
-    participant S as Store
-
-    Note over L: Step 3 fails...
-    L->>V: compensate
-    Note over V: No-op (reads only)
-    L->>R: compensate
-    R->>S: release_postings(reserved)
-    Note over S: PendingInactive → Active
-```
-
-Each step is a small, shard-local operation with automatic compensation on failure. This design avoids cross-shard transactions: no single step touches multiple shards atomically.
+On in-process failure before the point of no return, legend compensates in LIFO
+order (finalize is a no-op if nothing committed; reserve runs
+`release_postings`). Once the finalize step has marked the saga `Finalizing` and
+begun deactivating, the half-applied commit is **rolled forward** by recovery
+rather than compensated — see below.
 
 ## Durable Crash Recovery
 
-There is no single atomic transaction, so crash-safety comes from a write-ahead
-record plus idempotent roll-forward. `commit_envelope` persists a `PendingSaga
-{envelope, reservation}` via `SagaStore` **before** the saga mutates anything,
-and deletes it once the saga reaches a terminal state.
+There is no single atomic transaction, so crash-safety comes from a phase-tracked
+write-ahead record plus idempotent roll-forward. `commit_envelope` persists a
+`PendingSaga {envelope, reservation, phase}` via `SagaStore` **before** the saga
+mutates anything (`phase = Reserving`); the finalize step bumps it to
+`Finalizing` after validation passes and just before the consumed postings start
+turning `Inactive`. The record is deleted only when the transfer is committed or
+the commit was cleanly abandoned before finalize.
 
-`Ledger::recover()` (call on startup) re-completes any surviving pending saga. It
-does **not** re-run reserve/validate (those reject already-consumed postings);
-instead it force-completes the envelope through the idempotent primitives with
-the original reservation:
+`Ledger::recover()` (call on startup) re-completes any surviving pending saga,
+**branching on the persisted phase** so it never commits something that did not
+validate or consume postings it does not own:
 
 ```mermaid
-graph LR
-    A[get_transfer?] -->|exists| Z[done]
-    A -->|missing| B[reserve_postings]
-    B --> C[deactivate_postings]
-    C --> D[insert_postings]
-    D --> E[store_transfer]
-    E --> F[append_event]
-    F --> Z
+graph TD
+    A[get_transfer?] -->|exists| Z[delete record, done]
+    A -->|missing| P{phase}
+    P -->|Reserving| RR[re-run saga: reserve + finalize]
+    RR -->|re-validates; aborts cleanly if taken/frozen| Z
+    P -->|Finalizing| FF[finalize_envelope: roll forward, verified]
+    FF --> Z
 ```
 
-Because each primitive no-ops what is already done, recovery converges from a
-crash at any point — pre-reserve (postings still Active), reserved
-(PendingInactive), or mid-finalize (already Inactive). It is roll-forward, not
-rollback, so the reservation protocol never leaves orphaned `PendingInactive`
-postings for a separate reconciliation pass to clean up.
+- A **`Reserving`** saga had not necessarily validated, so recovery re-runs the
+  real saga — which re-reserves and **re-validates** against current state. If
+  the postings were taken by another transfer, or an account was frozen, it
+  aborts cleanly (nothing commits) and the record is deleted.
+- A **`Finalizing`** saga had already validated and owns its postings (it reached
+  the point of no return), so recovery rolls it forward through the verified
+  `finalize_envelope`, which checks every end-state and only creates/stores once
+  **all** consumed postings are confirmed `Inactive` — the double-spend guard.
+
+Recovery is roll-forward, not rollback, so the reservation protocol never leaves
+orphaned `PendingInactive` postings for a separate reconciliation pass.
 
 `reverse()` builds a reversal envelope and runs the same `commit_envelope` path —
 there is no separate raw/atomic entry point.
@@ -232,15 +221,19 @@ An overdraft is a **negative posting** assigned to the account to cover a shortf
 model alone — two concurrent transfers could each pass validation but together
 push the balance below the floor (write-skew).
 
-Under the dumb-storage model the floor is checked at **validation time** and is
-**best-effort under concurrency**: there is no atomic re-check at commit (the
-earlier `cas_guards`-inside-`commit_transfer` mechanism was removed with the
-atomic boundary). Double-spend safety still holds unconditionally — the
-reservation protocol (`reserve_postings` is a single atomic conditional update,
-so two sagas cannot both claim the same posting) prevents consuming a posting
-twice. What is best-effort is specifically the *floor* on a `CappedOverdraft`
-account when unrelated concurrent activity moves its balance between validation
-and finalize. This tradeoff is recorded in
+Under the dumb-storage model the floor (and the freeze/close snapshot check) is
+re-validated **as the last thing the finalize step does before it writes** — the
+finalize step re-loads balances and account versions and re-runs
+`validate_and_plan` immediately before `deactivate_postings`. This is the
+*tightest* best-effort: the check-to-write window is one step, not the whole
+saga's lifetime, and it also runs on the recovery path. It is **not strictly
+atomic**, though — without folding the check into the write itself (a CAS) or
+serializing per account, a concurrent commit landing in that last sub-step gap
+can still slip through. Double-spend safety is unaffected and holds
+unconditionally: the reservation protocol (`reserve_postings` is a single atomic
+conditional update, so two sagas cannot both claim the same posting) prevents
+consuming a posting twice. Only the *floor* on a `CappedOverdraft` account is
+best-effort. This tradeoff is recorded in
 [doc/adr/0001-dumb-storage-saga-recovery.md](adr/0001-dumb-storage-saga-recovery.md).
 
 `NoOverdraft` is fully UTXO-backed (you can only spend postings you own), and the
@@ -299,14 +292,13 @@ This enables shard-local writes: each posting reservation is an independent oper
 
 ### Internal pipeline steps
 
-The saga pipeline is built from four `legend::Step` implementations that operate on `LedgerCtx`:
+The envelope saga is two `legend::Step` implementations operating on `LedgerCtx`
+(resolution runs before the saga, in `Ledger::commit`):
 
 | Step | Execute | Compensate | Retry |
 |------|---------|------------|-------|
-| `ResolveStep` | Convert Transfer intent into concrete Envelope | No-op | No retry |
-| `ReservePostingsStep` | Batch reserve postings `Active → PendingInactive` | Release all back to `Active` | 3 retries |
-| `ValidateTransferStep` | Load accounts/balances, run `validate_and_plan()` | No-op (reads only) | No retry |
-| `FinalizeTransferStep` | `PendingInactive → Inactive`, create postings, store transfer, emit event | `reverse(transfer_id)` | 3 retries |
+| `ReservePostingsStep` | Reserve postings `Active → PendingInactive`, interpret the count | Release back to `Active` | 3 retries |
+| `FinalizeTransferStep` | `Ledger::finalize_envelope`: re-validate (last-step floor/freeze guard) → mark `Finalizing` → `deactivate` → `insert` → `store_transfer` → `append_event`, verifying every end-state | `reverse(transfer_id)` | 3 retries |
 
 ### High-level composition steps
 

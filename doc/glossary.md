@@ -45,7 +45,7 @@ The concurrency-control mechanism for consumed postings: `reserve_postings` atom
 
 ### PendingSaga / recovery
 
-A write-ahead record `{envelope, reservation}` persisted via `SagaStore` before a commit mutates anything. `Ledger::recover()` (startup) force-completes any pending saga through the idempotent primitives — roll-forward, converging from a crash at any point.
+A write-ahead record `{envelope, reservation, phase}` persisted via `SagaStore` before a commit mutates anything. The `phase` (`Reserving` → `Finalizing`) tells `Ledger::recover()` (startup) how to complete a crashed saga: a `Reserving` saga is re-run and **re-validated**; a `Finalizing` saga (already validated, owns its postings) is rolled forward through the verified `finalize_envelope`. Roll-forward, not rollback.
 
 ### Book
 

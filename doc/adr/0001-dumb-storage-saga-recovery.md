@@ -50,15 +50,20 @@ Invert the design.
   → finalize). `commit_envelope(envelope)` serves pre-built/FX envelopes;
   `reverse()` uses it. `commit_atomic` is gone.
 
-- **Durable recovery via write-ahead + roll-forward.** `commit_envelope`
-  persists a `PendingSaga {envelope, reservation}` via `SagaStore` before
-  mutating anything, and deletes it on terminal. `Ledger::recover()` (startup)
-  force-completes any surviving pending saga through the idempotent primitives,
-  using the original reservation. It does **not** re-run reserve/validate (those
-  reject already-consumed postings); it converges from a crash at any point
-  (pre-reserve / reserved / mid-finalize). Because recovery is roll-forward, the
-  reservation protocol never leaves orphaned `PendingInactive` postings, so no
-  separate reconciliation pass is needed.
+- **Durable recovery via phase-tracked write-ahead + roll-forward.**
+  `commit_envelope` persists a `PendingSaga {envelope, reservation, phase}` via
+  `SagaStore` before mutating anything (`phase = Reserving`); the finalize step
+  bumps it to `Finalizing` after validation passes and just before the consumed
+  postings start turning `Inactive`. `Ledger::recover()` (startup) branches on
+  that phase: a `Reserving` saga is **re-run through the real saga** (it
+  re-reserves and **re-validates** against current state, aborting cleanly if the
+  postings were taken or an account was frozen); a `Finalizing` saga had already
+  validated and owns its postings, so it is rolled forward through the verified
+  `finalize_envelope`. `finalize_envelope` checks every end-state and never
+  creates/stores unless **all** consumed postings are confirmed `Inactive` — the
+  double-spend guard. The pending record is deleted only on commit or a clean
+  pre-finalize abort. Recovery is roll-forward, so the reservation protocol never
+  leaves orphaned `PendingInactive` postings; no reconciliation pass is needed.
 
 `legend`'s pause/resume is for external waits, not crash checkpoints, so durable
 recovery is this write-ahead layer around legend, not serialization of the
@@ -72,11 +77,14 @@ in-flight execution.
 - **Crash-safety: preserved, differently.** Not one transaction, but write-ahead
   + idempotent roll-forward. Nothing is silently lost; a crash mid-finalize is
   completed by `recover()`.
-- **Overdraft floor + freeze/close guards: now best-effort under concurrency.**
-  They are checked at validation time, not re-checked atomically at commit (the
-  `cas_guards`/`account_guards` and their commit-time re-check are removed). A
-  concurrent, unrelated balance change or a freeze/close between validation and
-  finalize has a small TOCTOU window. Accepted tradeoff for a dumb storage layer.
+- **Overdraft floor + freeze/close guards: tightest best-effort, not strictly
+  atomic.** The finalize step re-validates (re-loads balances + account versions,
+  re-runs `validate_and_plan`) as its last action before writing, so the
+  check-to-write window is one step rather than the whole saga — and this re-check
+  also runs on the recovery path. It is not strictly atomic: without folding the
+  check into the write (a CAS) or per-account serialization, a concurrent commit
+  in that last sub-step gap can still slip through. Accepted tradeoff for a dumb
+  storage layer; double-spend safety is unaffected (reservation protocol).
 - **Simpler, more testable surface.** Storage has no domain logic; all commit
   correctness lives in one place (the saga) with per-primitive count-conformance
   tests and crash-injection recovery tests.

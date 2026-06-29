@@ -30,7 +30,15 @@ Each account has a policy that controls what balance constraints apply:
 
 An overdraft is represented as a **negative posting** (an offset position) assigned to the account to cover a shortfall. When an account's positive postings are insufficient for a debit, the resolve step consumes them all and creates a negative posting for the remainder. `NoOverdraft` accounts forbid this; validation rejects any transfer that would create a negative posting on a `NoOverdraft` account. `CappedOverdraft`'s floor bounds how negative the balance may go; `UncappedOverdraft`, `SystemAccount`, and `ExternalAccount` are unbounded.
 
-`CappedOverdraft`'s floor is checked during validation. Under the dumb-storage model there is no atomic re-check at commit, so the floor is **best-effort under concurrency** — two concurrent transfers could each pass validation independently but together push the balance below the floor (write-skew). Double-spend safety is unaffected: the reservation protocol (an atomic conditional `reserve_postings`) still guarantees a posting cannot be consumed twice. See [accounting-mapping.md](accounting-mapping.md) and the ADR at [adr/0001-dumb-storage-saga-recovery.md](adr/0001-dumb-storage-saga-recovery.md).
+`CappedOverdraft`'s floor is re-validated as the **last step before finalize**
+writes (the finalize step re-loads balances + account versions and re-runs
+validation just before deactivating). This is the *tightest* best-effort —
+the check-to-write window is one step, not the whole saga — but it is **not
+strictly atomic**: a concurrent commit in that last gap can still breach the
+floor (write-skew). Double-spend safety is unaffected: the reservation protocol
+(an atomic conditional `reserve_postings`) guarantees a posting cannot be
+consumed twice. See [accounting-mapping.md](accounting-mapping.md) and the ADR at
+[adr/0001-dumb-storage-saga-recovery.md](adr/0001-dumb-storage-saga-recovery.md).
 
 ## Lifecycle
 
@@ -101,4 +109,4 @@ Boundary accounts representing the outside world (banks, payment processors). Th
 
 ### Credit accounts (`CappedOverdraft`)
 
-Accounts with a negative floor (e.g. credit lines). The floor is the maximum allowed overdraft. When the account's positive postings are insufficient for a debit, a negative posting is created to cover the shortfall, down to the floor. The floor is enforced at validation time and is best-effort under concurrency (see above).
+Accounts with a negative floor (e.g. credit lines). The floor is the maximum allowed overdraft. When the account's positive postings are insufficient for a debit, a negative posting is created to cover the shortfall, down to the floor. The floor is re-validated as the last step before finalize and is best-effort under concurrency (see above).
