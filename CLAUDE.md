@@ -29,14 +29,16 @@ doc/
 - **Envelope**: concrete postings to consume and create — the resolved form of movements.
 - **Conservation**: for each asset, `sum(consumed) == sum(created)`.
 - **Account policies**: NoOverdraft, CappedOverdraft, UncappedOverdraft, SystemAccount, ExternalAccount. Only `NoOverdraft` forbids negative postings; the other four permit them. An overdraft is a negative posting that covers a shortfall — down to the floor for `CappedOverdraft`, unbounded for `UncappedOverdraft`.
-- **Atomic commit**: `CommitStore::commit_transfer` is the single atomic boundary — postings, transfer record, account index, and events apply in one transaction. It enforces `CappedOverdraft` CAS guards and reservation ownership. `reserve_postings`/`release_postings` carry a `ReservationId` so only the owning saga can finalize/release a reserved posting.
+- **Dumb storage**: the `Store` is a thin instruction follower. Write methods apply one update and return the **number of affected rows** (or an I/O error) — they never interpret counts, decide state, enforce idempotency, or compensate. The saga owns all of that. There is no monolithic `commit_transfer`; commit is a sequence of dumb primitives (`reserve_postings`, `deactivate_postings`, `insert_postings`, `store_transfer`, `append_event`), each idempotent. See [doc/adr/0001-dumb-storage-saga-recovery.md](doc/adr/0001-dumb-storage-saga-recovery.md).
 
 ## Architecture
 
 - **Pure core / async layer separation**: kuatia-core has zero IO, fully deterministic, testable with golden vectors. kuatia adds async Store trait and saga pipeline.
-- **Saga commit pipeline**: reserve → validate → finalize, with automatic retry and LIFO compensation via the `legend` crate.
+- **Saga commit pipeline**: every commit is the envelope saga `reserve → validate → finalize`, with automatic retry and LIFO compensation via the `legend` crate. `commit(transfer)` = resolve (read-only) then `commit_envelope`; `reverse()` builds a reversal envelope and runs the same path. There is one commit path, not a separate "atomic" one.
+- **Count interpretation**: the saga reads each primitive's affected-row count — full = continue; partial = error → compensate; zero = read state and continue only if this same envelope/reservation already applied it (idempotency).
+- **Durable recovery**: a write-ahead `PendingSaga {envelope, reservation}` is persisted via `SagaStore` before the saga mutates anything. `Ledger::recover()` (call on startup) force-completes any pending saga through the idempotent primitives — converging from a crash at any point (pre-reserve, reserved, or mid-finalize). Roll-forward, not rollback, so there are no orphaned `PendingInactive` postings to reconcile.
 - **Content-addressed transfers**: EnvelopeId = double-SHA-256 of canonical bytes. Provides idempotency and tamper evidence.
-- **Append-only accounts**: versioned, never modified in place. Snapshot pinning prevents TOCTOU races.
+- **Append-only accounts**: versioned, never modified in place. Snapshot pinning (validate-time) prevents TOCTOU races; under the dumb-storage model the overdraft-floor and freeze/close guards are validate-time and best-effort under concurrency.
 - **Store uses `Arc<dyn Store>`**: Ledger is non-generic, enabling concrete saga types.
 
 ## Resolve algorithm

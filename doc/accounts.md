@@ -30,7 +30,7 @@ Each account has a policy that controls what balance constraints apply:
 
 An overdraft is represented as a **negative posting** (an offset position) assigned to the account to cover a shortfall. When an account's positive postings are insufficient for a debit, the resolve step consumes them all and creates a negative posting for the remainder. `NoOverdraft` accounts forbid this; validation rejects any transfer that would create a negative posting on a `NoOverdraft` account. `CappedOverdraft`'s floor bounds how negative the balance may go; `UncappedOverdraft`, `SystemAccount`, and `ExternalAccount` are unbounded.
 
-`CappedOverdraft` accounts emit CAS (Compare-And-Swap) guards during validation to prevent write-skew — two concurrent transfers could each pass validation independently but together push the balance below the floor. The guards are enforced atomically inside `commit_transfer` (the commit aborts with a retryable conflict if a guarded balance changed since validation).
+`CappedOverdraft`'s floor is checked during validation. Under the dumb-storage model there is no atomic re-check at commit, so the floor is **best-effort under concurrency** — two concurrent transfers could each pass validation independently but together push the balance below the floor (write-skew). Double-spend safety is unaffected: the reservation protocol (an atomic conditional `reserve_postings`) still guarantees a posting cannot be consumed twice. See [accounting-mapping.md](accounting-mapping.md) and the ADR at [adr/0001-dumb-storage-saga-recovery.md](adr/0001-dumb-storage-saga-recovery.md).
 
 ## Lifecycle
 
@@ -101,4 +101,4 @@ Boundary accounts representing the outside world (banks, payment processors). Th
 
 ### Credit accounts (`CappedOverdraft`)
 
-Accounts with a negative floor (e.g. credit lines). The floor is the maximum allowed overdraft. When the account's positive postings are insufficient for a debit, a negative posting is created to cover the shortfall, down to the floor. Write-skew prevention via CAS guards (enforced inside `commit_transfer`) ensures concurrent transfers respect the floor.
+Accounts with a negative floor (e.g. credit lines). The floor is the maximum allowed overdraft. When the account's positive postings are insufficient for a debit, a negative posting is created to cover the shortfall, down to the floor. The floor is enforced at validation time and is best-effort under concurrency (see above).

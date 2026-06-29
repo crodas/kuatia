@@ -1,8 +1,12 @@
 //! Error types for storage implementations.
 
-use kuatia_types::{AccountId, AssetId, PostingId};
+use kuatia_types::AccountId;
 
 /// Errors produced by [`Store`](crate::store::Store) implementations.
+///
+/// The store is a dumb instruction follower: writes report affected-row counts,
+/// not semantic verdicts, so there are no "posting not active"/"reservation
+/// mismatch"/"cas conflict" variants — the saga derives those from counts.
 #[derive(Debug)]
 pub enum StoreError {
     /// The requested entity was not found.
@@ -20,21 +24,6 @@ pub enum StoreError {
     },
     /// Catch-all for unexpected internal errors.
     Internal(String),
-    /// Attempted to reserve a posting that is not Active.
-    PostingNotActive(PostingId),
-    /// Attempted to release a void (Inactive) posting.
-    PostingInactive(PostingId),
-    /// A CAS guard's expected balance no longer matches the current balance —
-    /// a concurrent transfer moved it. The caller should re-validate and retry.
-    Conflict {
-        /// Account whose balance changed under the guard.
-        account: AccountId,
-        /// Asset whose balance changed.
-        asset: AssetId,
-    },
-    /// A posting's reservation owner did not match the caller's reservation —
-    /// it is reserved by a different saga (or not reserved at all).
-    ReservationMismatch(PostingId),
 }
 
 impl std::fmt::Display for StoreError {
@@ -53,12 +42,6 @@ impl std::fmt::Display for StoreError {
                 )
             }
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
-            Self::PostingNotActive(id) => write!(f, "posting not active: {id:?}"),
-            Self::PostingInactive(id) => write!(f, "posting is void (inactive): {id:?}"),
-            Self::Conflict { account, asset } => {
-                write!(f, "cas conflict on {account:?}/{asset:?}: balance changed")
-            }
-            Self::ReservationMismatch(id) => write!(f, "reservation mismatch on posting {id:?}"),
         }
     }
 }

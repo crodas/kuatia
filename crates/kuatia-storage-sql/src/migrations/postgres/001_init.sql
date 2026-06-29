@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS events (
     seq       BIGINT PRIMARY KEY,
     timestamp BIGINT NOT NULL,
     kind      TEXT NOT NULL,
-    data      BYTEA NOT NULL
+    data      BYTEA NOT NULL,
+    dedup_key BYTEA UNIQUE
 );
 
 CREATE TABLE IF NOT EXISTS books (

@@ -38,7 +38,7 @@ This separation ensures the auditable heart of the system is fully deterministic
 
 ## Store Sub-Trait Architecture
 
-The `Store` trait is a composite of seven focused sub-traits, each responsible for a single domain:
+The `Store` trait is a composite of focused sub-traits, each responsible for a single domain. Every write method is a **dumb instruction**: it applies one update and returns the number of affected rows (or an I/O error). It never interprets the count, decides state, enforces idempotency, or compensates — the saga does.
 
 ```mermaid
 classDiagram
@@ -53,13 +53,14 @@ classDiagram
     class PostingStore {
         +get_postings(ids)
         +get_postings_by_account(account, asset?, status?)
-        +reserve_postings(ids, reservation)
-        +release_postings(ids, reservation)
-        +finalize_postings(deactivate, create)
+        +reserve_postings(ids, reservation) u64
+        +release_postings(ids, reservation) u64
+        +deactivate_postings(ids, reservation?) u64
+        +insert_postings(postings) u64
     }
     class TransferStore {
         +get_transfer(id)
-        +store_transfer(record)
+        +store_transfer(record, involved) u64
         +get_transfers_for_account(account)
         +query_transfers(query)
     }
@@ -77,9 +78,6 @@ classDiagram
         +get_book(id)
         +list_books()
     }
-    class CommitStore {
-        +commit_transfer(req)
-    }
     class Store {
         <<composite>>
     }
@@ -89,16 +87,18 @@ classDiagram
     Store --|> SagaStore
     Store --|> EventStore
     Store --|> BookStore
-    Store --|> CommitStore
 ```
 
-`CommitStore::commit_transfer` is the single atomic commit boundary — it applies posting deactivations/creations, the transfer record, the both-sided account index, and events in one transaction, enforcing `CappedOverdraft` CAS guards and reservation ownership.
+There is no single atomic commit boundary. A commit is a sequence of the dumb primitives above (`reserve_postings` → `deactivate_postings` → `insert_postings` → `store_transfer` → `append_event`), each its own atomic update and each idempotent. The saga sequences them and interprets their counts; a crash mid-sequence is completed by roll-forward recovery (see below).
 
-The store only persists and reads — all domain logic (balance computation, validation, policy enforcement) lives in the Ledger and `kuatia-core`.
+The store only persists and reads — all domain logic (balance computation, validation, policy enforcement, and the interpretation of primitive counts) lives in the Ledger/saga and `kuatia-core`.
 
 ## Saga Commit Pipeline
 
-The intent layer uses a saga-based pipeline that breaks the commit into four independently-persisted steps:
+Every commit is the envelope saga. `commit(transfer)` resolves the intent into a
+concrete envelope (read-only), then runs `commit_envelope`, which persists a
+write-ahead `PendingSaga` record and drives three steps. The finalize step calls
+the dumb primitives one by one and interprets each affected-row count.
 
 ```mermaid
 sequenceDiagram
@@ -109,11 +109,11 @@ sequenceDiagram
     participant F as FinalizeStep
     participant S as Store
 
-    C->>L: commit(transfer)
+    C->>L: commit(transfer) → resolve → commit_envelope(envelope)
+    L->>S: save_saga(PendingSaga{envelope, reservation})
     L->>R: execute
-    R->>S: reserve_postings(ids)
-    Note over S: Active → PendingInactive (atomic batch)
-    R-->>L: reserved_postings tracked in LedgerCtx
+    R->>S: reserve_postings(ids, rid) → count
+    Note over R: interpret count (full / partial / zero+read)
 
     L->>V: execute
     V->>S: get_postings, get_accounts, get_postings_by_account
@@ -121,15 +121,17 @@ sequenceDiagram
     V-->>L: Plan stored in LedgerCtx
 
     L->>F: execute
-    F->>S: finalize_postings(deactivate, create)
-    Note over S: PendingInactive → Inactive + insert new
-    F->>S: store_transfer(record)
+    F->>S: deactivate_postings(consumed, rid) → count
+    F->>S: insert_postings(created) → count
+    F->>S: store_transfer(record, involved) → count
+    F->>S: append_event(committed) → count
     F-->>L: Receipt
-
+    L->>S: delete_saga(...)
     L-->>C: Receipt
 ```
 
-On failure, legend compensates completed steps in LIFO order:
+On in-process failure, legend compensates completed steps in LIFO order; a crash
+is handled instead by recovery (below).
 
 ```mermaid
 sequenceDiagram
@@ -149,21 +151,37 @@ sequenceDiagram
 
 Each step is a small, shard-local operation with automatic compensation on failure. This design avoids cross-shard transactions: no single step touches multiple shards atomically.
 
-## Raw Three-Phase Commit
+## Durable Crash Recovery
 
-A lower-level `commit_atomic()` method runs the traditional atomic pipeline in a single pass without reservation. Used internally by `reverse()` and available for callers who need direct control.
+There is no single atomic transaction, so crash-safety comes from a write-ahead
+record plus idempotent roll-forward. `commit_envelope` persists a `PendingSaga
+{envelope, reservation}` via `SagaStore` **before** the saga mutates anything,
+and deletes it once the saga reaches a terminal state.
+
+`Ledger::recover()` (call on startup) re-completes any surviving pending saga. It
+does **not** re-run reserve/validate (those reject already-consumed postings);
+instead it force-completes the envelope through the idempotent primitives with
+the original reservation:
 
 ```mermaid
 graph LR
-    A[load] -->|LoadedState| B[plan]
-    B -->|Plan| C[apply]
-    C -->|Receipt| D[done]
-    style A fill:#e1f5fe
-    style B fill:#fff3e0
-    style C fill:#e8f5e9
+    A[get_transfer?] -->|exists| Z[done]
+    A -->|missing| B[reserve_postings]
+    B --> C[deactivate_postings]
+    C --> D[insert_postings]
+    D --> E[store_transfer]
+    E --> F[append_event]
+    F --> Z
 ```
 
-The three phases can also be called independently: `load()`, `plan()`, `apply()`.
+Because each primitive no-ops what is already done, recovery converges from a
+crash at any point — pre-reserve (postings still Active), reserved
+(PendingInactive), or mid-finalize (already Inactive). It is roll-forward, not
+rollback, so the reservation protocol never leaves orphaned `PendingInactive`
+postings for a separate reconciliation pass to clean up.
+
+`reverse()` builds a reversal envelope and runs the same `commit_envelope` path —
+there is no separate raw/atomic entry point.
 
 ## Content-Addressed Transfers
 
@@ -198,23 +216,35 @@ Conservation boundaries are **per-asset only**. The `book` field on transfers an
 
 Each account has a policy controlling its balance floor and whether it may hold negative postings:
 
-| Policy | Balance floor | Negative postings | CAS guard |
-|--------|--------------|-------------------|-----------|
-| `NoOverdraft` | `>= 0` | No | No |
-| `CappedOverdraft { floor }` | `>= floor` | Yes (down to floor) | Yes |
-| `UncappedOverdraft` | None | Yes (unbounded) | No |
-| `SystemAccount` | None | Yes | No |
-| `ExternalAccount` | None | Yes | No |
+| Policy | Balance floor | Negative postings |
+|--------|--------------|-------------------|
+| `NoOverdraft` | `>= 0` | No |
+| `CappedOverdraft { floor }` | `>= floor` | Yes (down to floor) |
+| `UncappedOverdraft` | None | Yes (unbounded) |
+| `SystemAccount` | None | Yes |
+| `ExternalAccount` | None | Yes |
 
-An overdraft is a **negative posting** assigned to the account to cover a shortfall. Only `NoOverdraft` forbids negative postings; validation rejects a negative posting on a `NoOverdraft` account. `CappedOverdraft`'s floor (enforced in validation, with concurrency protected by CAS guards) bounds the negative balance; the other policies are unbounded.
+An overdraft is a **negative posting** assigned to the account to cover a shortfall. Only `NoOverdraft` forbids negative postings; validation rejects a negative posting on a `NoOverdraft` account. `CappedOverdraft`'s floor (checked in validation) bounds the negative balance; the other policies are unbounded.
 
-## CAS (Compare-And-Swap) Guards for CappedOverdraft
+## The CappedOverdraft Floor Under Concurrency
 
-`CappedOverdraft` accounts have a balance floor that is not backed by the UTXO model alone — two concurrent transfers could each pass validation but together push the balance below the floor (write-skew).
+`CappedOverdraft` accounts have a balance floor that is not backed by the UTXO
+model alone — two concurrent transfers could each pass validation but together
+push the balance below the floor (write-skew).
 
-The validation phase emits `cas_guards: Vec<(AccountId, AssetId, Cent)>` for these accounts. They are enforced atomically inside `commit_transfer`: before mutating any state it recomputes each guarded balance and aborts with a retryable `Conflict` if it changed since validation. The saga pipeline additionally isolates the consumed postings via the reserve step (Active → PendingInactive), stamping each reserved posting with a `ReservationId` so only the reserving saga can finalize or release it.
+Under the dumb-storage model the floor is checked at **validation time** and is
+**best-effort under concurrency**: there is no atomic re-check at commit (the
+earlier `cas_guards`-inside-`commit_transfer` mechanism was removed with the
+atomic boundary). Double-spend safety still holds unconditionally — the
+reservation protocol (`reserve_postings` is a single atomic conditional update,
+so two sagas cannot both claim the same posting) prevents consuming a posting
+twice. What is best-effort is specifically the *floor* on a `CappedOverdraft`
+account when unrelated concurrent activity moves its balance between validation
+and finalize. This tradeoff is recorded in
+[doc/adr/0001-dumb-storage-saga-recovery.md](adr/0001-dumb-storage-saga-recovery.md).
 
-Other policies do not need CAS guards: `NoOverdraft` is fully UTXO-backed (you can only spend postings you own), and unconstrained policies have no floor to violate.
+`NoOverdraft` is fully UTXO-backed (you can only spend postings you own), and the
+unconstrained policies have no floor to violate.
 
 ## No Sequential Hash Chain
 
@@ -243,11 +273,11 @@ Postings follow a three-state lifecycle managed by the saga pipeline:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active: created by finalize
+    [*] --> Active: insert_postings
     Active --> PendingInactive: reserve_postings
     PendingInactive --> Active: release_postings (compensation)
-    PendingInactive --> Inactive: finalize_postings
-    Active --> Active: release_postings (no-op)
+    PendingInactive --> Inactive: deactivate_postings(reservation)
+    Active --> Inactive: deactivate_postings(None)
 ```
 
 | State | Available | In balance | Description |

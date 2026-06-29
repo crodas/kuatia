@@ -33,7 +33,19 @@ One or more movements to execute atomically. Built via `TransferBuilder`, commit
 
 ### Envelope
 
-The resolved, concrete form of a transfer: which postings to consume and which to create. Produced internally by the resolve step. Available for direct use via `commit_atomic(envelope)`.
+The resolved, concrete form of a transfer: which postings to consume and which to create. Produced by the resolve step (`commit`), or built directly and committed via `commit_envelope(envelope)`.
+
+### Dumb storage
+
+The design where every `Store` write method applies one update and returns the **number of affected rows** (or an I/O error), never interpreting that count, deciding state, enforcing idempotency, or compensating. The saga reads the count and decides: full = continue; partial = error → compensate; zero = read state and continue only if this same envelope/reservation already applied it.
+
+### Reservation protocol
+
+The concurrency-control mechanism for consumed postings: `reserve_postings` atomically flips `Active → PendingInactive` stamped with a `ReservationId`, so two sagas cannot both claim the same posting. This (not a global transaction) is what prevents double-spend.
+
+### PendingSaga / recovery
+
+A write-ahead record `{envelope, reservation}` persisted via `SagaStore` before a commit mutates anything. `Ledger::recover()` (startup) force-completes any pending saga through the idempotent primitives — roll-forward, converging from a crash at any point.
 
 ### Book
 

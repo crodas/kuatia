@@ -11,14 +11,19 @@ macro that any backend can use to validate its implementation.
 | Trait | Purpose |
 |-------|---------|
 | `AccountStore` | Account CRUD and versioning |
-| `PostingStore` | Posting reads, reserve/release/finalize lifecycle (reserve/release carry a `ReservationId`) |
-| `TransferStore` | Transfer persistence and queries |
+| `PostingStore` | Posting reads + lifecycle: `reserve`/`release`/`deactivate`/`insert` postings (reserve/release/deactivate carry a `ReservationId`) |
+| `TransferStore` | Transfer persistence (`store_transfer`) and queries |
 | `SagaStore` | Saga state for crash recovery |
-| `EventStore` | Append-only ledger event log |
+| `EventStore` | Append-only ledger event log (idempotent on a per-transfer dedup key) |
 | `BookStore` | Book (transfer policy scope) persistence |
-| `CommitStore` | `commit_transfer` — the single atomic commit boundary (postings + transfer + index + events) |
 
-`Store` is a blanket trait — any type implementing all seven sub-traits is a `Store`.
+The store is a **dumb instruction follower**: write methods apply one update and
+return the **number of affected rows** (or an I/O error). They do not interpret
+counts, decide state, enforce idempotency, or compensate — the saga in the
+`kuatia` crate does. There is no `commit_transfer`; commit is a sequence of these
+primitives, each idempotent.
+
+`Store` is a blanket trait — any type implementing the sub-traits is a `Store`.
 
 ## Conformance testing
 

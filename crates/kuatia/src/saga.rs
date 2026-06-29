@@ -1,21 +1,24 @@
 //! Legend saga step adapters for the ledger.
 //!
 //! Provides [`Step`](legend::Step) implementations so the ledger can participate
-//! in multi-resource saga workflows. Each step commits a transfer in `execute`
-//! and reverses it in `compensate`, giving you automatic rollback across
+//! in multi-resource saga workflows, with automatic LIFO compensation across
 //! resource boundaries.
 //!
-//! # Transfer pipeline saga
+//! # Envelope pipeline saga
 //!
-//! The core transfer pipeline is broken into four saga steps:
+//! A commit is three saga steps over a pre-resolved [`Envelope`] (resolution
+//! runs before the saga, in `Ledger::commit`):
 //!
-//! 1. **ResolveStep** -- resolve a `Transfer` intent into an `Envelope`
-//! 2. **ReservePostingsStep** -- CAS each consumed posting from Active to PendingInactive
-//! 3. **ValidateTransferStep** -- load accounts/balances, run `validate_and_plan()`
-//! 4. **FinalizeTransferStep** -- PendingInactive to Inactive, create new postings, store envelope
+//! 1. **ReservePostingsStep** -- `reserve_postings`: Active → PendingInactive, stamped with the saga's `ReservationId`
+//! 2. **ValidateTransferStep** -- load accounts/balances, run `validate_and_plan()`
+//! 3. **FinalizeTransferStep** -- the dumb primitives in sequence: `deactivate_postings` → `insert_postings` → `store_transfer` → `append_event`
 //!
-//! The `TransferSaga` is defined via `legend!` in `ledger.rs` and driven by
-//! `commit()`.
+//! Each step issues dumb storage instructions and **interprets the affected-row
+//! count** itself (full = continue; partial = error → compensate; zero = read
+//! state and continue only if this same envelope/reservation already applied it).
+//! See [`verify_postings`]. The `EnvelopeSaga` is defined via `legend!` in
+//! `ledger.rs` and driven by `commit_envelope()`; crash recovery re-completes a
+//! persisted saga via `Ledger::recover`.
 //!
 //! # High-level composition
 //!
@@ -30,14 +33,45 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use kuatia_core::{
-    AccountId, AssetId, Cent, Envelope, Plan, PlanInput, PostingId, Receipt, ReservationId,
-    Transfer, TransferBuilder, validate_and_plan,
+    AccountId, AssetId, Cent, Envelope, Plan, PlanInput, Posting, PostingId, PostingStatus, Receipt,
+    ReservationId, Transfer, TransferBuilder, validate_and_plan,
 };
 
 use crate::error::LedgerError;
 use crate::ledger::{Ledger, now_millis};
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
-use kuatia_storage::store::{CommitRequest, EnvelopeRecord};
+use kuatia_storage::store::{EnvelopeRecord, Store};
+
+/// Interpret a dumb primitive's affected-row `count` against the `ids` it
+/// targeted. `count == ids.len()` is success. A short count is acceptable only if
+/// the shortfall is already in the desired end-state — a prior attempt (or this
+/// saga, replayed by recovery) already applied it — verified by reading the
+/// postings and checking `ok`. Otherwise it is a genuine failure (contended or
+/// concurrently modified) and the saga compensates.
+async fn verify_postings(
+    store: &dyn Store,
+    ids: &[PostingId],
+    count: u64,
+    ok: impl Fn(&Posting) -> bool,
+    what: &str,
+) -> Result<(), SagaError> {
+    if count == ids.len() as u64 {
+        return Ok(());
+    }
+    let postings = store
+        .get_postings(ids)
+        .await
+        .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
+    if postings.len() == ids.len() && postings.iter().all(&ok) {
+        return Ok(());
+    }
+    Err(SagaError {
+        message: format!(
+            "{what}: storage applied {count}/{} rows and the end-state is not satisfied",
+            ids.len()
+        ),
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Saga error -- serializable + cloneable wrapper
@@ -113,6 +147,23 @@ impl LedgerCtx {
             plan: None,
             envelope: None,
             reservation: ReservationId::default(),
+            ledger: Some(ledger),
+        }
+    }
+
+    /// Create a context for the envelope pipeline (reserve → validate → finalize)
+    /// with a pre-resolved envelope and an explicit reservation.
+    pub fn for_envelope(
+        ledger: Arc<Ledger>,
+        envelope: Envelope,
+        reservation: ReservationId,
+    ) -> Self {
+        Self {
+            receipts: Vec::new(),
+            reserved_postings: Vec::new(),
+            plan: None,
+            envelope: Some(envelope),
+            reservation,
             ledger: Some(ledger),
         }
     }
@@ -204,16 +255,32 @@ impl Step<LedgerCtx, SagaError> for ReservePostingsStep {
 
     async fn execute(ctx: &mut LedgerCtx, _input: &ReserveInput) -> Result<StepOutcome, SagaError> {
         async {
-            let envelope = ctx.envelope.as_ref().ok_or(SagaError {
-                message: "no envelope in context -- resolve step must run first".into(),
-            })?;
-            let posting_ids: Vec<PostingId> = envelope.consumes().to_vec();
+            let posting_ids: Vec<PostingId> = ctx
+                .envelope
+                .as_ref()
+                .ok_or(SagaError {
+                    message: "no envelope in context -- resolve step must run first".into(),
+                })?
+                .consumes()
+                .to_vec();
+            let rid = ctx.reservation;
+            let ledger = ctx.ledger_arc()?;
+            let store = ledger.store();
 
-            ctx.ledger()?
-                .store()
-                .reserve_postings(&posting_ids, ctx.reservation)
+            let reserved = store
+                .reserve_postings(&posting_ids, rid)
                 .await
                 .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
+            // Storage reports the count; the saga decides. A short count is fine
+            // only if the shortfall is already reserved by us (idempotent replay).
+            verify_postings(
+                store,
+                &posting_ids,
+                reserved,
+                |p| p.status == PostingStatus::PendingInactive && p.reservation == Some(rid),
+                "reserve",
+            )
+            .await?;
             ctx.reserved_postings.extend_from_slice(&posting_ids);
             Ok(StepOutcome::Continue)
         }
@@ -320,40 +387,75 @@ impl Step<LedgerCtx, SagaError> for FinalizeTransferStep {
             let plan = ctx.plan.take().ok_or(SagaError {
                 message: "no plan in context -- validate step must run first".into(),
             })?;
-
-            let envelope = ctx.envelope.as_ref().ok_or(SagaError {
-                message: "no envelope in context -- resolve step must run first".into(),
-            })?;
-
-            let store = ctx.ledger()?.store();
-
+            let rid = ctx.reservation;
+            let ledger = ctx.ledger_arc()?;
+            let store = ledger.store();
             let receipt = Receipt {
                 transfer_id: plan.transfer_id,
             };
 
-            // Saga path: our postings are PendingInactive under `ctx.reservation`.
-            // Postings, transfer record, account index, and event commit atomically.
-            let events = [LedgerEvent {
-                seq: 0,
-                timestamp: now_millis().map_err(SagaError::from)?,
-                kind: LedgerEventKind::TransferCommitted {
-                    transfer_id: receipt.transfer_id,
-                },
-            }];
+            // Commit is a sequence of dumb, idempotent primitives. Each is its own
+            // atomic update; the saga sequences them and a crash mid-sequence is
+            // completed by idempotent roll-forward in recovery.
 
+            // 1. Deactivate the reserved consumed postings (saga path).
+            let deactivated = store
+                .deactivate_postings(&plan.postings_to_deactivate, Some(rid))
+                .await
+                .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
+            verify_postings(
+                store,
+                &plan.postings_to_deactivate,
+                deactivated,
+                |p| p.status == PostingStatus::Inactive,
+                "deactivate",
+            )
+            .await?;
+
+            // Involved accounts to index: created owners + consumed owners. The
+            // saga supplies the set so storage computes nothing.
+            let mut involved: Vec<AccountId> =
+                plan.postings_to_create.iter().map(|p| p.owner).collect();
+            if !plan.postings_to_deactivate.is_empty() {
+                let consumed = store
+                    .get_postings(&plan.postings_to_deactivate)
+                    .await
+                    .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
+                involved.extend(consumed.iter().map(|p| p.owner));
+            }
+            involved.sort();
+            involved.dedup();
+
+            // 2. Insert created postings (idempotent).
             store
-                .commit_transfer(CommitRequest {
-                    deactivate: &plan.postings_to_deactivate,
-                    create: &plan.postings_to_create,
-                    cas_guards: &plan.cas_guards,
-                    account_guards: &plan.account_guards,
-                    reservation: Some(ctx.reservation),
-                    record: EnvelopeRecord {
+                .insert_postings(&plan.postings_to_create)
+                .await
+                .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
+
+            // 3. Persist the transfer record + account index (idempotent).
+            let envelope = ctx.envelope.as_ref().ok_or(SagaError {
+                message: "no envelope in context -- resolve step must run first".into(),
+            })?;
+            store
+                .store_transfer(
+                    EnvelopeRecord {
                         envelope: envelope.clone(),
                         receipt: receipt.clone(),
                         created_at: now_millis().map_err(SagaError::from)?,
                     },
-                    events: &events,
+                    &involved,
+                )
+                .await
+                .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
+
+            // 4. Append the committed event (idempotent on the transfer id).
+            store
+                .append_event(&LedgerEvent {
+                    seq: 0,
+                    timestamp: now_millis().map_err(SagaError::from)?,
+                    kind: LedgerEventKind::TransferCommitted {
+                        transfer_id: receipt.transfer_id,
+                    },
                 })
                 .await
                 .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
@@ -371,7 +473,7 @@ impl Step<LedgerCtx, SagaError> for FinalizeTransferStep {
         _input: &FinalizeInput,
     ) -> Result<CompensationOutcome, SagaError> {
         if let Some(receipt) = ctx.receipts.pop() {
-            ctx.ledger()?.reverse(&receipt.transfer_id).await?;
+            ctx.ledger_arc()?.reverse(&receipt.transfer_id).await?;
         }
         Ok(CompensationOutcome::Completed)
     }
@@ -432,7 +534,7 @@ async fn compensate_last_receipt(ctx: &mut LedgerCtx) -> Result<CompensationOutc
     let receipt = ctx.receipts.pop().ok_or(SagaError {
         message: "no receipt to compensate".into(),
     })?;
-    ctx.ledger()?.reverse(&receipt.transfer_id).await?;
+    ctx.ledger_arc()?.reverse(&receipt.transfer_id).await?;
     Ok(CompensationOutcome::Completed)
 }
 

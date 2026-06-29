@@ -69,7 +69,7 @@ graph TD
 9. **Negative posting restriction** — negative postings forbidden only on `NoOverdraft` (allowed on overdraft/system/external)
 10. **Policy enforcement** — projected balance satisfies account's floor
 
-Output is a `Plan` containing `transfer_id`, `postings_to_deactivate`, `postings_to_create`, and `cas_guards` (Compare-And-Swap guards for concurrency safety).
+Output is a `Plan` containing `transfer_id`, `postings_to_deactivate`, and `postings_to_create`.
 
 ---
 
@@ -82,49 +82,45 @@ Async resource layer. Depends on `kuatia-core`, `tokio`, `async-trait`, `serde`,
 | Module | Purpose |
 |--------|---------|
 | `kuatia` | `Ledger` — primary API (non-generic, uses `Arc<dyn Store>`), saga commit pipeline, intent layer |
-| `store` | `Store` composite trait + sub-traits (`AccountStore`, `PostingStore`, `TransferStore`, `SagaStore`, `EventStore`, `BookStore`, `CommitStore`) |
+| `store` | `Store` composite trait + sub-traits (`AccountStore`, `PostingStore`, `TransferStore`, `SagaStore`, `EventStore`, `BookStore`) |
 | `error` | `StoreError`, `LedgerError` — unified error hierarchy |
 | `mem_store` | `InMemoryStore` — in-memory `Store` implementation for tests |
 | `saga` | Pipeline steps (reserve, validate, finalize) + high-level legend step adapters |
 
 ### Ledger API
 
-#### Saga Commit (default for intent layer)
+#### Commit (the envelope saga)
 
-Driven by a `TransferSaga` defined via `legend!` — four steps with automatic retry and LIFO compensation:
+`commit(transfer)` resolves the intent into an envelope (read-only) then runs the
+`EnvelopeSaga` (defined via `legend!`) — three steps with automatic retry and
+LIFO compensation. Finalize calls the dumb primitives one by one and interprets
+each affected-row count:
 
 ```mermaid
 graph LR
-    A[resolve] -->|Envelope| B[reserve_postings]
-    B -->|batch Active→PendingInactive| C[validate_and_plan]
-    C -->|Plan| D[commit_transfer atomically]
-    D --> E[Receipt]
+    A[resolve] -->|Envelope| W[save PendingSaga]
+    W --> B[reserve_postings]
+    B -->|Active→PendingInactive| C[validate_and_plan]
+    C -->|Plan| D[deactivate → insert → store_transfer → append_event]
+    D --> E[Receipt + delete PendingSaga]
     style E fill:#e8f5e9
 ```
 
-Note: `commit` requires `Arc<Ledger>` (takes `self: &Arc<Self>`).
+Note: `commit`/`commit_envelope`/`reverse`/`recover` require `Arc<Ledger>`.
 
-#### Raw Three-Phase Commit
+#### Crash recovery
 
-```mermaid
-graph LR
-    A["load()"] -->|LoadedState| B["plan()"]
-    B -->|Plan| C["apply()"]
-    C --> D[Receipt]
-    style A fill:#e1f5fe
-    style B fill:#fff3e0
-    style C fill:#e8f5e9
-```
-
-`commit_atomic(transfer)` runs all three in one shot. Used by `reverse()` and available for direct callers.
+`recover()` re-completes any `PendingSaga` left by a crash, pushing the envelope
+through the idempotent primitives (roll-forward). Call it on startup.
 
 #### Convenience
 
 | Method | Description |
 |--------|-------------|
-| `commit(transfer)` | Saga pipeline: resolve → reserve → validate → finalize with retry and compensation (requires `Arc<Ledger>`) |
-| `commit_atomic(transfer)` | Raw atomic pipeline: load → plan → apply (used by `reverse()`) |
-| `reverse(transfer_id)` | Creates compensating transfer that undoes the original |
+| `commit(transfer)` | Resolve intent → `commit_envelope` (requires `Arc<Ledger>`) |
+| `commit_envelope(envelope)` | The one commit path: write-ahead → reserve → validate → finalize (for pre-built/FX envelopes) |
+| `reverse(transfer_id)` | Builds a compensating envelope and runs `commit_envelope` |
+| `recover()` | Force-completes pending sagas after a crash (call on startup) |
 
 #### Intent Layer
 
@@ -162,7 +158,9 @@ Transfers are built via `TransferBuilder` and committed with `ledger.commit(tran
 
 ### Store Trait
 
-The `Store` trait is a composite of seven focused sub-traits:
+The `Store` trait is a composite of focused sub-traits. Every write method is a
+dumb instruction returning the number of affected rows (`u64`); the saga
+interprets the count.
 
 ```mermaid
 graph TB
@@ -172,36 +170,43 @@ graph TB
     Store --> SagaStore
     Store --> EventStore
     Store --> BookStore
-    Store --> CommitStore
 ```
 
 - **`AccountStore`**: `get_account`, `get_accounts`, `create_account`, `append_account_version`, `get_account_history`, `list_accounts`
-- **`PostingStore`**: `get_postings`, `get_postings_by_account(account, asset?, status?)`, `query_postings(query)`, `reserve_postings(ids, reservation)`, `release_postings(ids, reservation)`, `finalize_postings`
-- **`TransferStore`**: `get_transfer`, `store_transfer`, `get_transfers_for_account`, `query_transfers`
-- **`EventStore`**: `append_event`, `get_events_since`
-- **`SagaStore`**: `save_saga`, `list_pending_sagas`, `delete_saga`
+- **`PostingStore`**: `get_postings`, `get_postings_by_account(account, asset?, status?)`, `query_postings(query)`, and the dumb write primitives `reserve_postings(ids, reservation) -> u64`, `release_postings(ids, reservation) -> u64`, `deactivate_postings(ids, reservation?) -> u64`, `insert_postings(postings) -> u64`
+- **`TransferStore`**: `get_transfer`, `store_transfer(record, involved) -> u64`, `get_transfers_for_account`, `query_transfers`
+- **`EventStore`**: `append_event` (idempotent on a per-transfer dedup key), `get_events_since`
+- **`SagaStore`**: `save_saga`, `list_pending_sagas`, `delete_saga` — the write-ahead store the saga and `recover()` use
 - **`BookStore`**: `create_book`, `get_book`, `list_books`
-- **`CommitStore`**: `commit_transfer(req)` — the single atomic commit boundary. It applies posting deactivations/creations, the transfer record, the both-sided account index, and events in one critical section, enforcing `CappedOverdraft` CAS guards and reservation ownership. `reserve_postings`/`release_postings`/`finalize_postings` remain as lower-level primitives; `commit_transfer` is the production commit path.
+
+There is no `CommitStore`/`commit_transfer`: a commit is the saga calling these
+primitives in sequence, each idempotent, with crash-safety from write-ahead
+recovery rather than a single transaction.
 
 #### Batch posting operations
 
-`reserve_postings` and `release_postings` operate on batches with atomic semantics:
+`reserve_postings`/`release_postings`/`deactivate_postings` apply each id's
+conditional update and return how many rows changed (the saga decides what a
+short count means):
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active: created by finalize
+    [*] --> Active: insert_postings
     Active --> PendingInactive: reserve_postings
     PendingInactive --> Active: release_postings
-    PendingInactive --> Inactive: finalize_postings
-    Active --> Active: release_postings (no-op)
-    note right of Inactive: void — release_postings fails
+    PendingInactive --> Inactive: deactivate_postings(reservation)
+    Active --> Inactive: deactivate_postings(None)
 ```
 
-| Operation | Active | PendingInactive | Inactive |
-|-----------|--------|-----------------|----------|
-| `reserve_postings` | → PendingInactive | **fail** | **fail** |
-| `release_postings` | no-op | → Active | **fail** (void) |
-| `finalize_postings` | → Inactive | → Inactive | — |
+Each cell is the count a primitive returns (1 = flipped, 0 = no-op / not
+applicable). The saga interprets a 0:
+
+| Operation | Active | PendingInactive (this rid) | Inactive |
+|-----------|--------|----------------------------|----------|
+| `reserve_postings(rid)` | → PendingInactive (1) | 0 | 0 |
+| `release_postings(rid)` | 0 | → Active (1) | 0 |
+| `deactivate_postings(Some rid)` | 0 | → Inactive (1) | 0 |
+| `deactivate_postings(None)` | → Inactive (1) | 0 | 0 |
 
 If any posting in the batch fails validation, the entire batch is rejected and no state changes.
 
@@ -228,24 +233,23 @@ LedgerError
 StoreError
 ├── NotFound(String)
 ├── AlreadyExists(String)
-├── VersionConflict { account, expected, actual }
-├── Internal(String)
-├── PostingNotActive(PostingId)   // reserve_postings: posting not Active
-├── PostingInactive(PostingId)    // release_postings: posting is void
-├── Conflict { account, asset }   // commit_transfer: CAS guard balance changed (retryable)
-└── ReservationMismatch(PostingId) // posting reserved by a different saga
+├── VersionConflict { account, expected, actual }  // append_account_version: stale version
+└── Internal(String)
 ```
+
+The store has no semantic write-outcome errors (no "posting not active",
+"reservation mismatch", "cas conflict") — writes return affected-row counts and
+the saga derives meaning from them.
 
 ### Saga Steps
 
-#### Pipeline steps (used internally by `commit`)
+#### Envelope pipeline steps (used internally by `commit_envelope`; resolution runs before the saga)
 
 | Step | Execute | Compensate | Retry |
 |------|---------|------------|-------|
-| `ResolveStep` | Convert Transfer intent into Envelope | No-op | None |
-| `ReservePostingsStep` | Batch reserve `Active → PendingInactive` | Batch release back to `Active` | 3 |
+| `ReservePostingsStep` | `reserve_postings` `Active → PendingInactive`, interpret count | Release back to `Active` | 3 |
 | `ValidateTransferStep` | Load state, `validate_and_plan()` | No-op | None |
-| `FinalizeTransferStep` | Finalize postings, store transfer, emit event | `reverse(transfer_id)` | 3 |
+| `FinalizeTransferStep` | `deactivate_postings` → `insert_postings` → `store_transfer` → `append_event` | `reverse(transfer_id)` | 3 |
 
 #### High-level steps (for custom saga composition with `legend!`)
 

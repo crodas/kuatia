@@ -590,6 +590,7 @@ dependencies = [
  "kuatia-types",
  "legend",
  "serde",
+ "serde_json",
  "sqlx",
  "tokio",
  "tracing",

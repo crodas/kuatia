@@ -43,12 +43,6 @@ pub struct Plan {
     pub postings_to_deactivate: Vec<PostingId>,
     /// New postings to persist.
     pub postings_to_create: Vec<Posting>,
-    /// CAS guards for CappedOverdraft accounts: (account, asset, expected_balance).
-    pub cas_guards: Vec<(AccountId, AssetId, Cent)>,
-    /// Account version guards: (account, expected_version). Each pinned account
-    /// snapshot is re-checked atomically at commit so a concurrent
-    /// freeze/unfreeze/close (which bump `version`) aborts the transfer.
-    pub account_guards: Vec<(AccountId, u64)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -284,9 +278,6 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
     }
 
     // 5b. Snapshot pinning: each account_snapshot must match current state.
-    //     Emit a version guard per pinned account so the commit boundary can
-    //     re-check atomically against concurrent lifecycle mutations.
-    let mut account_guards: Vec<(AccountId, u64)> = Vec::new();
     for snap in envelope.account_snapshots() {
         let account = input
             .accounts
@@ -300,7 +291,6 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
                 actual,
             });
         }
-        account_guards.push((snap.account, account.version));
     }
 
     // 5c. Book policy: gate which assets and accounts may participate. Enforced
@@ -414,8 +404,6 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
         *entry = entry.checked_add(np.value)?;
     }
 
-    let mut cas_guards = Vec::new();
-
     for ((account_id, asset_id), delta) in &deltas {
         let current_balance = input
             .balances
@@ -445,8 +433,6 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
                         projected,
                     });
                 }
-                // Emit CAS guard for write-skew prevention
-                cas_guards.push((*account_id, *asset_id, current_balance));
             }
             AccountPolicy::UncappedOverdraft
             | AccountPolicy::SystemAccount
@@ -482,8 +468,6 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
         transfer_id: tid,
         postings_to_deactivate,
         postings_to_create,
-        cas_guards,
-        account_guards,
     })
 }
 
@@ -832,10 +816,9 @@ mod tests {
             book: None,
         };
 
+        // A CappedOverdraft spend within the floor validates and produces a plan.
         let plan = validate_and_plan(input).unwrap();
-        // Should have a CAS guard for the capped account
-        assert_eq!(plan.cas_guards.len(), 1);
-        assert_eq!(plan.cas_guards[0].0, AccountId::new(1));
+        assert!(!plan.postings_to_create.is_empty());
     }
 
     #[test]
@@ -940,8 +923,9 @@ mod tests {
             book: None,
         };
 
+        // UncappedOverdraft permits the negative projection; the plan validates.
         let plan = validate_and_plan(input).unwrap();
-        assert!(plan.cas_guards.is_empty());
+        assert!(!plan.postings_to_create.is_empty());
     }
 
     #[test]

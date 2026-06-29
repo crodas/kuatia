@@ -48,12 +48,27 @@ pub struct LedgerEvent {
     pub kind: LedgerEventKind,
 }
 
+/// The idempotency key for an event, if it has a natural one. Replayable events
+/// (a committed transfer, re-driven by saga recovery) dedup on their transfer
+/// id; events with no natural identity (account lifecycle) return `None` and may
+/// recur.
+pub fn event_dedup_key(kind: &LedgerEventKind) -> Option<EnvelopeId> {
+    match kind {
+        LedgerEventKind::TransferCommitted { transfer_id } => Some(*transfer_id),
+        LedgerEventKind::AccountCreated { .. }
+        | LedgerEventKind::AccountFrozen { .. }
+        | LedgerEventKind::AccountUnfrozen { .. }
+        | LedgerEventKind::AccountClosed { .. } => None,
+    }
+}
+
 /// Persistent event log for ledger events.
 #[async_trait]
 pub trait EventStore: Send + Sync {
-    /// Append an event and return its assigned sequence number.
-    ///
-    /// The `seq` field on the input event is ignored -- the store assigns it.
+    /// Append an event and return its sequence number. Idempotent on the event's
+    /// [`event_dedup_key`]: appending an event whose key already exists does not
+    /// insert a duplicate and returns the existing seq. The `seq` field on the
+    /// input is ignored -- the store assigns it.
     async fn append_event(&self, event: &LedgerEvent) -> Result<u64, StoreError>;
 
     /// Return events with sequence numbers greater than `after_seq`, up to `limit`.

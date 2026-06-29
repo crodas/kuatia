@@ -8,15 +8,14 @@ use tokio::sync::RwLock;
 
 use kuatia_types::autoid::AutoId;
 use kuatia_types::{
-    Account, AccountId, AssetId, Book, BookId, Cent, EnvelopeId, Posting, PostingId, PostingStatus,
+    Account, AccountId, AssetId, Book, BookId, EnvelopeId, Posting, PostingId, PostingStatus,
     ReservationId,
 };
 
 use crate::error::StoreError;
 use crate::events::{EventStore, LedgerEvent};
 use crate::store::{
-    AccountStore, BookStore, CommitRequest, CommitStore, EnvelopeRecord, PostingStore, SagaStore,
-    TransferStore,
+    AccountStore, BookStore, EnvelopeRecord, PostingStore, SagaStore, TransferStore,
 };
 
 /// In-memory [`Store`](crate::store::Store) implementation backed by `RwLock<HashMap>`.
@@ -168,56 +167,82 @@ impl PostingStore for InMemoryStore {
         &self,
         ids: &[PostingId],
         reservation: ReservationId,
-    ) -> Result<(), StoreError> {
+    ) -> Result<u64, StoreError> {
         let mut postings = self.postings.write().await;
+        let mut reserved: u64 = 0;
         for id in ids {
-            let posting = postings
-                .get(id)
-                .ok_or_else(|| StoreError::NotFound(format!("posting {id:?}")))?;
-            if posting.status != PostingStatus::Active {
-                return Err(StoreError::PostingNotActive(*id));
+            let Some(posting) = postings.get_mut(id) else {
+                continue; // dumb: a missing row just doesn't count
+            };
+            if posting.status == PostingStatus::Active {
+                posting.status = PostingStatus::PendingInactive;
+                posting.reservation = Some(reservation);
+                reserved += 1;
             }
         }
-        for id in ids {
-            let posting = postings
-                .get_mut(id)
-                .ok_or_else(|| StoreError::NotFound(format!("posting {id:?}")))?;
-            posting.status = PostingStatus::PendingInactive;
-            posting.reservation = Some(reservation);
-        }
-        Ok(())
+        Ok(reserved)
     }
 
     async fn release_postings(
         &self,
         ids: &[PostingId],
         reservation: ReservationId,
-    ) -> Result<(), StoreError> {
+    ) -> Result<u64, StoreError> {
         let mut postings = self.postings.write().await;
+        let mut released: u64 = 0;
         for id in ids {
-            let posting = postings
-                .get(id)
-                .ok_or_else(|| StoreError::NotFound(format!("posting {id:?}")))?;
-            match posting.status {
-                PostingStatus::Inactive => return Err(StoreError::PostingInactive(*id)),
-                PostingStatus::PendingInactive if posting.reservation != Some(reservation) => {
-                    return Err(StoreError::ReservationMismatch(*id));
-                }
-                _ => {}
-            }
-        }
-        for id in ids {
-            let posting = postings
-                .get_mut(id)
-                .ok_or_else(|| StoreError::NotFound(format!("posting {id:?}")))?;
-            if posting.status == PostingStatus::PendingInactive {
+            let Some(posting) = postings.get_mut(id) else {
+                continue;
+            };
+            if posting.status == PostingStatus::PendingInactive
+                && posting.reservation == Some(reservation)
+            {
                 posting.status = PostingStatus::Active;
                 posting.reservation = None;
+                released += 1;
             }
         }
-        Ok(())
+        Ok(released)
     }
 
+    async fn deactivate_postings(
+        &self,
+        ids: &[PostingId],
+        reservation: Option<ReservationId>,
+    ) -> Result<u64, StoreError> {
+        let mut postings = self.postings.write().await;
+        let mut changed: u64 = 0;
+        for id in ids {
+            let Some(posting) = postings.get_mut(id) else {
+                continue; // dumb: a missing row just doesn't count
+            };
+            let matches = match reservation {
+                None => posting.status == PostingStatus::Active,
+                Some(rid) => {
+                    posting.status == PostingStatus::PendingInactive
+                        && posting.reservation == Some(rid)
+                }
+            };
+            if matches {
+                posting.status = PostingStatus::Inactive;
+                posting.reservation = None;
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn insert_postings(&self, postings: &[Posting]) -> Result<u64, StoreError> {
+        let mut store = self.postings.write().await;
+        let mut inserted: u64 = 0;
+        for posting in postings {
+            if !store.contains_key(&posting.id) {
+                store.insert(posting.id, posting.clone());
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -231,12 +256,29 @@ impl TransferStore for InMemoryStore {
         Ok(transfers.get(id).cloned())
     }
 
+    async fn store_transfer(
+        &self,
+        record: EnvelopeRecord,
+        _involved: &[AccountId],
+    ) -> Result<u64, StoreError> {
+        // `_involved` is ignored here: `get_transfers_for_account` derives the
+        // involved accounts from the stored envelope (creates owners + consumed
+        // posting owners), which matches the set the caller passes. The SQL
+        // backend instead persists `involved` into its `transfer_accounts` index.
+        let mut transfers = self.transfers.write().await;
+        if transfers.contains_key(&record.receipt.transfer_id) {
+            return Ok(0);
+        }
+        transfers.insert(record.receipt.transfer_id, record);
+        Ok(1)
+    }
+
     async fn get_transfers_for_account(
         &self,
         account: &AccountId,
     ) -> Result<Vec<EnvelopeRecord>, StoreError> {
-        // Lock order postings → transfers must match `commit_transfer` to avoid
-        // an AB–BA deadlock.
+        // Acquire postings → transfers in a consistent order to avoid an AB–BA
+        // deadlock with any reader that takes both.
         let postings = self.postings.read().await;
         let transfers = self.transfers.read().await;
         let mut result: Vec<EnvelopeRecord> = transfers
@@ -291,14 +333,22 @@ impl SagaStore for InMemoryStore {
 #[async_trait]
 impl EventStore for InMemoryStore {
     async fn append_event(&self, event: &LedgerEvent) -> Result<u64, StoreError> {
-        let seq = self.autoid.next() as u64;
         let mut events = self.events.write().await;
-        let stored = LedgerEvent {
+        // Idempotent on the dedup key: a replayed transfer event returns the
+        // existing seq instead of inserting a duplicate.
+        if let Some(key) = crate::events::event_dedup_key(&event.kind)
+            && let Some(existing) = events
+                .iter()
+                .find(|e| crate::events::event_dedup_key(&e.kind) == Some(key))
+        {
+            return Ok(existing.seq);
+        }
+        let seq = self.autoid.next() as u64;
+        events.push(LedgerEvent {
             seq,
             timestamp: event.timestamp,
             kind: event.kind.clone(),
-        };
-        events.push(stored);
+        });
         Ok(seq)
     }
 
@@ -345,116 +395,3 @@ impl BookStore for InMemoryStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CommitStore
-// ---------------------------------------------------------------------------
-
-#[async_trait]
-impl CommitStore for InMemoryStore {
-    async fn commit_transfer(&self, req: CommitRequest<'_>) -> Result<(), StoreError> {
-        // Lock order accounts → postings → transfers → events; every reader that
-        // takes more than one of these must follow the same order. Holding the
-        // accounts read lock for the whole commit keeps the version guard (step
-        // 2b) atomic against a concurrent lifecycle mutation.
-        let accounts = self.accounts.read().await;
-        let mut postings = self.postings.write().await;
-        let mut transfers = self.transfers.write().await;
-        let mut events = self.events.write().await;
-
-        let tid = req.record.receipt.transfer_id;
-
-        // 1. Idempotency: a prior attempt already committed this transfer.
-        if transfers.contains_key(&tid) {
-            return Ok(());
-        }
-
-        // 2. CAS guards — recompute each balance (Σ non-Inactive postings) before
-        //    any mutation, matching how validation snapshotted it.
-        for (account, asset, expected) in req.cas_guards {
-            let balance = Cent::checked_sum(
-                postings
-                    .values()
-                    .filter(|p| {
-                        p.owner == *account
-                            && p.asset == *asset
-                            && p.status != PostingStatus::Inactive
-                    })
-                    .map(|p| p.value),
-            )
-            .map_err(|_| StoreError::Internal("balance overflow during cas".into()))?;
-            if balance != *expected {
-                return Err(StoreError::Conflict {
-                    account: *account,
-                    asset: *asset,
-                });
-            }
-        }
-
-        // 2b. Account version guards — a concurrent freeze/unfreeze/close bumps
-        //     the version, invalidating the snapshot pinned at validation.
-        for (account, expected) in req.account_guards {
-            let actual = accounts
-                .get(account)
-                .and_then(|versions| versions.last())
-                .map(|a| a.version)
-                .ok_or(StoreError::NotFound(format!("account {account:?}")))?;
-            if actual != *expected {
-                return Err(StoreError::VersionConflict {
-                    account: *account,
-                    expected: *expected,
-                    actual,
-                });
-            }
-        }
-
-        // 3. Authorize every consumed posting against the reservation.
-        for pid in req.deactivate {
-            let posting = postings
-                .get(pid)
-                .ok_or(StoreError::ReservationMismatch(*pid))?;
-            match req.reservation {
-                None => {
-                    if posting.status != PostingStatus::Active {
-                        return Err(StoreError::ReservationMismatch(*pid));
-                    }
-                }
-                Some(rid) => {
-                    if posting.status != PostingStatus::PendingInactive
-                        || posting.reservation != Some(rid)
-                    {
-                        return Err(StoreError::ReservationMismatch(*pid));
-                    }
-                }
-            }
-        }
-
-        // 4. Deactivate consumed postings.
-        for pid in req.deactivate {
-            let posting = postings
-                .get_mut(pid)
-                .ok_or(StoreError::ReservationMismatch(*pid))?;
-            posting.status = PostingStatus::Inactive;
-            posting.reservation = None;
-        }
-
-        // 5. Insert created postings.
-        for posting in req.create {
-            postings.insert(posting.id, posting.clone());
-        }
-
-        // 6. Persist the transfer record.
-        transfers.insert(tid, req.record);
-
-        // 7. Append events in-transaction, assigning sequence numbers.
-        for event in req.events {
-            let seq = self.autoid.next() as u64;
-            events.push(LedgerEvent {
-                seq,
-                timestamp: event.timestamp,
-                kind: event.kind.clone(),
-            });
-        }
-
-        Ok(())
-    }
-}

@@ -25,17 +25,31 @@ let receipt = ledger.commit(transfer).await?;
 | `.withdraw(from, asset, amount, external)` | Send value to an external destination |
 | `.movement(from, to, asset, amount)` | Raw movement for custom operations |
 
-### Saga commit
+### Commit
 
-`commit(transfer)` runs the four-step pipeline with automatic compensation:
-1. **Resolve** — convert Transfer intent into concrete Envelope
-2. **Reserve** — batch CAS: Active → PendingInactive
-3. **Validate** — pure `validate_and_plan()`
-4. **Finalize** — one atomic `commit_transfer`: deactivate consumed postings, create new ones, persist the transfer record and account index, and emit the event — all in a single transaction
+Every commit is the **envelope saga** (reserve → validate → finalize), driven by
+`legend` with automatic retry and LIFO compensation:
 
-### Atomic commit
+- `commit(transfer)` — resolves the intent into a concrete envelope (read-only),
+  then runs `commit_envelope`.
+- `commit_envelope(envelope)` — the one commit path. Persists a write-ahead
+  `PendingSaga` record, then:
+  1. **Reserve** — `reserve_postings`: Active → PendingInactive, stamped with this saga's `ReservationId`
+  2. **Validate** — pure `validate_and_plan()`
+  3. **Finalize** — the dumb, idempotent primitives in sequence: `deactivate_postings` → `insert_postings` → `store_transfer` → `append_event`
+- `reverse(id)` — builds a reversal envelope and runs the same path.
 
-`commit_atomic(envelope)` — single-pass load → plan → apply. Used by `reverse()`.
+The store reports an **affected-row count** for each primitive; the saga
+interprets it (full = continue, partial = error → compensate, zero = read state
+and continue only if this same envelope already applied it). There is no
+monolithic `commit_transfer` and no separate "atomic" path.
+
+### Crash recovery
+
+`recover()` — call on startup. It force-completes any `PendingSaga` left by a
+crash, pushing the envelope through the idempotent primitives so a commit
+interrupted at any point (pre-reserve, reserved, or mid-finalize) converges to
+the committed state. Roll-forward, not rollback.
 
 ### Account lifecycle
 

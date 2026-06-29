@@ -252,8 +252,8 @@ async fn idempotent_commit() {
         ])
         .build();
 
-    let r1 = ledger.commit_atomic(envelope.clone()).await.unwrap();
-    let r2 = ledger.commit_atomic(envelope).await.unwrap();
+    let r1 = ledger.commit_envelope(envelope.clone()).await.unwrap();
+    let r2 = ledger.commit_envelope(envelope).await.unwrap();
 
     assert_eq!(r1.transfer_id, r2.transfer_id);
     // Balance should only be 100, not 200 (second commit was a no-op)
@@ -437,7 +437,7 @@ async fn fx_trade_via_market_account() {
         ])
         .build();
 
-    ledger.commit_atomic(envelope).await.unwrap();
+    ledger.commit_envelope(envelope).await.unwrap();
 
     // Verify
     assert_eq!(
@@ -715,7 +715,7 @@ async fn stale_snapshot_rejected() {
         .account_snapshots(vec![stale_snapshot])
         .build();
 
-    let result = ledger.commit_atomic(envelope).await;
+    let result = ledger.commit_envelope(envelope).await;
     assert!(result.is_err());
 }
 

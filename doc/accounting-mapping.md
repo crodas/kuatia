@@ -86,7 +86,7 @@ These differ in **grain** — one record vs. the collection of all records.
   - **`Envelope`** is the *resolved* form produced by `resolve()`:
     `{ consumes: Vec<PostingId>, creates: Vec<NewPosting>, account_snapshots,
     book, … }`. It names the concrete postings to spend and create.
-  - Committing one (`commit` / `commit_atomic`) returns a **`Receipt {
+  - Committing one (`commit` / `commit_envelope`) returns a **`Receipt {
     transfer_id }`** identifying the committed envelope — the `EnvelopeId`, which
     is content-addressed (the double-SHA-256 of the canonical envelope bytes).
 - **Transfer log = the accounting journal.** The append-only, ordered sequence of

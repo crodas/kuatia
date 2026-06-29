@@ -22,28 +22,36 @@ pub(crate) fn now_millis() -> Result<i64, LedgerError> {
         .as_millis() as i64)
 }
 use crate::saga::{
-    FinalizeInput, FinalizeTransferStep, LedgerCtx, ReserveInput, ReservePostingsStep,
-    ResolveInput, ResolveStep, SagaError, ValidateInput, ValidateTransferStep,
+    FinalizeInput, FinalizeTransferStep, LedgerCtx, ReserveInput, ReservePostingsStep, SagaError,
+    ValidateInput, ValidateTransferStep,
 };
 use kuatia_storage::error::StoreError;
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
-use kuatia_storage::store::{CommitRequest, EnvelopeRecord, Store};
+use kuatia_storage::store::{EnvelopeRecord, Store};
 
 #[allow(missing_docs)]
-mod transfer_saga {
+mod envelope_saga {
     use super::*;
     legend! {
-        TransferSaga<LedgerCtx, SagaError> {
-            resolve: ResolveStep,
+        EnvelopeSaga<LedgerCtx, SagaError> {
             reserve: ReservePostingsStep,
             validate: ValidateTransferStep,
             finalize: FinalizeTransferStep,
         }
     }
 }
-use transfer_saga::*;
+use envelope_saga::*;
 
-/// Async ledger resource composing the four-phase commit pipeline.
+/// Write-ahead record for an in-flight commit, persisted via `SagaStore` before
+/// the saga mutates anything and removed once it reaches a terminal state. On
+/// startup [`Ledger::recover`] re-drives any that survive a crash.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingSaga {
+    envelope: Envelope,
+    reservation: kuatia_core::ReservationId,
+}
+
+/// Async ledger resource composing the commit pipeline.
 pub struct Ledger {
     store: Arc<dyn Store>,
 }
@@ -132,47 +140,6 @@ impl Ledger {
             book: loaded.book.as_ref(),
         };
         Ok(validate_and_plan(input)?)
-    }
-
-    /// Phase 3: apply the plan to storage and return a receipt.
-    #[instrument(skip(self, envelope, plan), name = "ledger.apply")]
-    pub async fn apply(
-        &self,
-        envelope: &Envelope,
-        plan: &kuatia_core::Plan,
-    ) -> Result<Receipt, LedgerError> {
-        let receipt = Receipt {
-            transfer_id: plan.transfer_id,
-        };
-
-        // Raw path: consumed postings are Active (never reserved), so pass
-        // `reservation: None`. Postings, transfer record, account index, and
-        // event commit atomically.
-        let events = [LedgerEvent {
-            seq: 0,
-            timestamp: now_millis()?,
-            kind: LedgerEventKind::TransferCommitted {
-                transfer_id: receipt.transfer_id,
-            },
-        }];
-
-        self.store
-            .commit_transfer(CommitRequest {
-                deactivate: &plan.postings_to_deactivate,
-                create: &plan.postings_to_create,
-                cas_guards: &plan.cas_guards,
-                account_guards: &plan.account_guards,
-                reservation: None,
-                record: EnvelopeRecord {
-                    envelope: envelope.clone(),
-                    receipt: receipt.clone(),
-                    created_at: now_millis()?,
-                },
-                events: &events,
-            })
-            .await?;
-
-        Ok(receipt)
     }
 
     // -----------------------------------------------------------------------
@@ -283,12 +250,31 @@ impl Ledger {
     }
 
     // -----------------------------------------------------------------------
-    // Atomic commit (raw path -- used by reverse() and internal callers)
+    // Commit: every commit is the envelope saga (reserve -> validate -> finalize)
     // -----------------------------------------------------------------------
 
-    /// Load, validate, and apply an envelope in one shot (no saga).
-    #[instrument(skip(self, envelope), name = "ledger.commit_atomic")]
-    pub async fn commit_atomic(&self, mut envelope: Envelope) -> Result<Receipt, LedgerError> {
+    /// Commit a [`Transfer`] intent. Resolves it into a concrete envelope, then
+    /// drives the envelope saga. Resolution is read-only, so a crash before the
+    /// saga's write-ahead record leaves no partial state.
+    #[instrument(skip(self, transfer), fields(book = transfer.book.0), name = "ledger.commit")]
+    pub async fn commit(self: &Arc<Self>, transfer: Transfer) -> Result<Receipt, LedgerError> {
+        let envelope = self.resolve(&transfer).await?;
+        self.commit_envelope(envelope).await
+    }
+
+    /// Commit a pre-resolved [`Envelope`] through the saga pipeline (reserve ->
+    /// validate -> finalize). This is the single commit path; `commit()` and
+    /// `reverse()` both funnel through it.
+    ///
+    /// Before running, the saga (envelope + reservation) is persisted as a
+    /// pending record so a crash mid-commit is completed by [`recover`]. The
+    /// record is deleted once the saga reaches a terminal state. The commit is
+    /// idempotent on the content-addressed transfer id.
+    #[instrument(skip(self, envelope), name = "ledger.commit_envelope")]
+    pub async fn commit_envelope(
+        self: &Arc<Self>,
+        mut envelope: Envelope,
+    ) -> Result<Receipt, LedgerError> {
         if envelope.account_snapshots().is_empty() {
             let mut ids: Vec<AccountId> = envelope.creates().iter().map(|p| p.owner).collect();
             ids.sort();
@@ -296,67 +282,163 @@ impl Ledger {
             envelope.set_account_snapshots(self.resolve_snapshots(&ids).await?);
         }
 
+        // Idempotency: an already-committed transfer returns its receipt.
         let tid = envelope_id(&envelope);
         if let Some(record) = self.store.get_transfer(&tid).await? {
             return Ok(record.receipt);
         }
 
-        let loaded = self.load(&envelope).await?;
-        let plan = self.plan(&envelope, &loaded)?;
-        self.apply(&envelope, &plan).await
+        // Write-ahead: persist {envelope, reservation} so recovery can re-drive.
+        let reservation = kuatia_core::ReservationId::default();
+        let saga_id = reservation.0;
+        let blob = serde_json::to_vec(&PendingSaga {
+            envelope: envelope.clone(),
+            reservation,
+        })
+        .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
+        self.store.save_saga(&saga_id, blob).await?;
+
+        let result = self.drive_envelope_saga(envelope, reservation).await;
+
+        // Terminal: drop the pending record whether we committed or compensated.
+        self.store.delete_saga(&saga_id).await?;
+        result
     }
 
-    // -----------------------------------------------------------------------
-    // Saga commit: resolve -> reserve -> validate -> finalize (via legend)
-    // -----------------------------------------------------------------------
-
-    /// Commit a transfer intent using the saga pipeline driven by legend.
-    ///
-    /// Steps: resolve movements into envelope -> reserve consumed postings ->
-    /// validate -> finalize.
-    /// On failure, legend compensates completed steps in reverse order.
-    #[instrument(skip(self, transfer), fields(book = transfer.book.0), name = "ledger.commit")]
-    pub async fn commit(self: &Arc<Self>, transfer: Transfer) -> Result<Receipt, LedgerError> {
-        let saga = TransferSaga::new(TransferSagaInputs {
-            resolve: ResolveInput {
-                transfer: transfer.clone(),
-            },
+    /// Build and run the envelope saga to a terminal outcome, returning the
+    /// resulting receipt.
+    async fn drive_envelope_saga(
+        self: &Arc<Self>,
+        envelope: Envelope,
+        reservation: kuatia_core::ReservationId,
+    ) -> Result<Receipt, LedgerError> {
+        let saga = EnvelopeSaga::new(EnvelopeSagaInputs {
             reserve: ReserveInput,
             validate: ValidateInput,
             finalize: FinalizeInput,
         });
-
-        let ctx = LedgerCtx::new(Arc::clone(self));
+        let ctx = LedgerCtx::for_envelope(Arc::clone(self), envelope, reservation);
         let execution = saga.build(ctx);
 
         match execution.start().await {
             ExecutionResult::Completed(e) => {
                 let ctx = e.into_context();
                 ctx.receipts.last().cloned().ok_or_else(|| {
-                    LedgerError::Store(kuatia_storage::error::StoreError::Internal(
+                    LedgerError::Store(StoreError::Internal(
                         "saga completed but no receipt".into(),
                     ))
                 })
             }
-            ExecutionResult::Failed(_, err) => Err(LedgerError::Store(
-                kuatia_storage::error::StoreError::Internal(err.message),
-            )),
+            ExecutionResult::Failed(_, err) => {
+                Err(LedgerError::Store(StoreError::Internal(err.message)))
+            }
             ExecutionResult::CompensationFailed {
                 original_error,
                 compensation_error,
                 ..
             } => Err(LedgerError::CompensationFailed {
-                original: Box::new(LedgerError::Store(
-                    kuatia_storage::error::StoreError::Internal(original_error.message),
-                )),
-                compensation: Box::new(LedgerError::Store(
-                    kuatia_storage::error::StoreError::Internal(compensation_error.message),
-                )),
+                original: Box::new(LedgerError::Store(StoreError::Internal(
+                    original_error.message,
+                ))),
+                compensation: Box::new(LedgerError::Store(StoreError::Internal(
+                    compensation_error.message,
+                ))),
             }),
-            ExecutionResult::Paused(_) => Err(LedgerError::Store(
-                kuatia_storage::error::StoreError::Internal("saga paused unexpectedly".into()),
-            )),
+            ExecutionResult::Paused(_) => Err(LedgerError::Store(StoreError::Internal(
+                "saga paused unexpectedly".into(),
+            ))),
         }
+    }
+
+    /// Re-drive every pending saga to completion. Call on startup to recover
+    /// commits interrupted by a crash, returning how many were processed.
+    ///
+    /// Recovery does **not** re-run reserve/validate — those reject already-
+    /// consumed postings, and the envelope was already validated when first
+    /// committed. Instead it force-completes the envelope through the idempotent
+    /// primitives with the original reservation, so a crash at any point
+    /// (pre-reserve, reserved, or mid-finalize) converges to the committed state.
+    #[instrument(skip(self), name = "ledger.recover")]
+    pub async fn recover(self: &Arc<Self>) -> Result<usize, LedgerError> {
+        let pending = self.store.list_pending_sagas().await?;
+        let count = pending.len();
+        for (saga_id, blob) in pending {
+            let PendingSaga {
+                envelope,
+                reservation,
+            } = serde_json::from_slice(&blob)
+                .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
+            self.complete_envelope(&envelope, reservation).await?;
+            self.store.delete_saga(&saga_id).await?;
+        }
+        Ok(count)
+    }
+
+    /// Idempotently push `envelope`'s postings and record to their committed
+    /// state. Safe to call from any partial point: each primitive no-ops what is
+    /// already done. Used by [`recover`].
+    async fn complete_envelope(
+        &self,
+        envelope: &Envelope,
+        reservation: kuatia_core::ReservationId,
+    ) -> Result<(), LedgerError> {
+        let tid = envelope_id(envelope);
+        if self.store.get_transfer(&tid).await?.is_some() {
+            return Ok(()); // already committed
+        }
+
+        let consumes = envelope.consumes();
+        // Reserve then deactivate: this drives Active → PendingInactive → Inactive,
+        // and each call no-ops anything already past that state.
+        self.store.reserve_postings(consumes, reservation).await?;
+        self.store
+            .deactivate_postings(consumes, Some(reservation))
+            .await?;
+
+        let created: Vec<Posting> = envelope
+            .creates()
+            .iter()
+            .enumerate()
+            .map(|(i, np)| {
+                Posting::new(
+                    PostingId {
+                        transfer: tid,
+                        index: i as u16,
+                    },
+                    np.owner,
+                    np.asset,
+                    np.value,
+                )
+            })
+            .collect();
+        self.store.insert_postings(&created).await?;
+
+        let mut involved: Vec<AccountId> = created.iter().map(|p| p.owner).collect();
+        if !consumes.is_empty() {
+            let consumed = self.store.get_postings(consumes).await?;
+            involved.extend(consumed.iter().map(|p| p.owner));
+        }
+        involved.sort();
+        involved.dedup();
+
+        self.store
+            .store_transfer(
+                EnvelopeRecord {
+                    envelope: envelope.clone(),
+                    receipt: Receipt { transfer_id: tid },
+                    created_at: now_millis()?,
+                },
+                &involved,
+            )
+            .await?;
+        self.store
+            .append_event(&LedgerEvent {
+                seq: 0,
+                timestamp: now_millis()?,
+                kind: LedgerEventKind::TransferCommitted { transfer_id: tid },
+            })
+            .await?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -365,7 +447,7 @@ impl Ledger {
 
     /// Create and commit a reversal envelope for the given envelope id.
     #[instrument(skip(self), name = "ledger.reverse")]
-    pub async fn reverse(&self, id: &EnvelopeId) -> Result<Receipt, LedgerError> {
+    pub async fn reverse(self: &Arc<Self>, id: &EnvelopeId) -> Result<Receipt, LedgerError> {
         let record = self
             .store
             .get_transfer(id)
@@ -407,7 +489,7 @@ impl Ledger {
             .metadata(original.metadata().clone())
             .build();
 
-        self.commit_atomic(reverse_envelope).await
+        self.commit_envelope(reverse_envelope).await
     }
 
     // -----------------------------------------------------------------------
@@ -653,4 +735,127 @@ pub struct LoadedState {
     pub balances: HashMap<(AccountId, AssetId), Cent>,
     /// The book gating this transfer, if one is loaded (`None` = unrestricted default).
     pub book: Option<Book>,
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use kuatia_core::{Account, AccountFlags, TransferBuilder, UserData};
+    use kuatia_storage::mem_store::InMemoryStore;
+    use std::collections::BTreeMap;
+
+    fn acct(id: i64, policy: AccountPolicy) -> Account {
+        Account {
+            id: AccountId::new(id),
+            version: 1,
+            policy,
+            flags: AccountFlags::empty(),
+            book: kuatia_core::BookId(0),
+            user_data: UserData::default(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    /// A commit interrupted right after its write-ahead record (before any step)
+    /// is completed by `recover()`: the postings move and the record is cleared.
+    #[tokio::test]
+    async fn recover_redrives_pending_saga() {
+        let ledger = Arc::new(Ledger::new(InMemoryStore::new()));
+        for (id, p) in [
+            (1, AccountPolicy::NoOverdraft),
+            (2, AccountPolicy::NoOverdraft),
+            (99, AccountPolicy::ExternalAccount),
+        ] {
+            ledger.store().create_account(acct(id, p)).await.unwrap();
+        }
+        // Fund account 1.
+        let deposit = TransferBuilder::new()
+            .deposit(AccountId::new(1), AssetId::new(1), Cent::from(100), AccountId::new(99))
+            .unwrap()
+            .build();
+        ledger.commit(deposit).await.unwrap();
+
+        // Resolve a pay envelope but persist it as a pending saga WITHOUT running
+        // it — simulating a crash right after the write-ahead record.
+        let pay = TransferBuilder::new()
+            .pay(AccountId::new(1), AccountId::new(2), AssetId::new(1), Cent::from(40))
+            .build();
+        let envelope = ledger.resolve(&pay).await.unwrap();
+        let reservation = kuatia_core::ReservationId::default();
+        let blob = serde_json::to_vec(&PendingSaga {
+            envelope,
+            reservation,
+        })
+        .unwrap();
+        ledger.store().save_saga(&reservation.0, blob).await.unwrap();
+
+        // Recover re-drives it to completion.
+        assert_eq!(ledger.recover().await.unwrap(), 1);
+        assert_eq!(
+            ledger.balance(&AccountId::new(2), &AssetId::new(1)).await.unwrap(),
+            Cent::from(40)
+        );
+        assert_eq!(
+            ledger.balance(&AccountId::new(1), &AssetId::new(1)).await.unwrap(),
+            Cent::from(60)
+        );
+        assert!(ledger.store().list_pending_sagas().await.unwrap().is_empty());
+    }
+
+    /// A commit that crashed **mid-finalize** — consumed posting already flipped
+    /// to Inactive but the transfer record not yet written — is still completed by
+    /// `recover()` (reserve/validate are skipped; the primitives no-op the done work).
+    #[tokio::test]
+    async fn recover_completes_partial_finalize() {
+        let ledger = Arc::new(Ledger::new(InMemoryStore::new()));
+        for (id, p) in [
+            (1, AccountPolicy::NoOverdraft),
+            (2, AccountPolicy::NoOverdraft),
+            (99, AccountPolicy::ExternalAccount),
+        ] {
+            ledger.store().create_account(acct(id, p)).await.unwrap();
+        }
+        let deposit = TransferBuilder::new()
+            .deposit(AccountId::new(1), AssetId::new(1), Cent::from(100), AccountId::new(99))
+            .unwrap()
+            .build();
+        ledger.commit(deposit).await.unwrap();
+
+        // Resolve a pay envelope and manually run the commit halfway: reserve the
+        // consumed posting and deactivate it (now Inactive), then "crash" — the
+        // transfer record and created postings were never written.
+        let pay = TransferBuilder::new()
+            .pay(AccountId::new(1), AccountId::new(2), AssetId::new(1), Cent::from(40))
+            .build();
+        let envelope = ledger.resolve(&pay).await.unwrap();
+        let reservation = kuatia_core::ReservationId::default();
+        let consumes = envelope.consumes().to_vec();
+        ledger.store().reserve_postings(&consumes, reservation).await.unwrap();
+        let n = ledger
+            .store()
+            .deactivate_postings(&consumes, Some(reservation))
+            .await
+            .unwrap();
+        assert_eq!(n, 1); // consumed posting is now Inactive
+
+        let blob = serde_json::to_vec(&PendingSaga {
+            envelope,
+            reservation,
+        })
+        .unwrap();
+        ledger.store().save_saga(&reservation.0, blob).await.unwrap();
+
+        // Recovery finishes the commit despite reserve/validate being unable to
+        // re-run over the already-consumed posting.
+        assert_eq!(ledger.recover().await.unwrap(), 1);
+        assert_eq!(
+            ledger.balance(&AccountId::new(2), &AssetId::new(1)).await.unwrap(),
+            Cent::from(40)
+        );
+        assert_eq!(
+            ledger.balance(&AccountId::new(1), &AssetId::new(1)).await.unwrap(),
+            Cent::from(60)
+        );
+        assert!(ledger.store().list_pending_sagas().await.unwrap().is_empty());
+    }
 }
