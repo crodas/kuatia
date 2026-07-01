@@ -17,11 +17,15 @@ kuatia-storage-sql = { features = ["sqlite"] }   # or "postgres"
 | `sqlite` (default) | SQLite via sqlx | Conformance tests pass |
 | `postgres` | PostgreSQL via sqlx | Portable DDL/queries; needs a running instance to test |
 
-The backend is detected at migration time and the matching DDL is applied from
-`src/migrations/{sqlite,postgres}/` (SQLite uses `BLOB`, PostgreSQL uses
-`BYTEA`). Applied migrations are tracked in a `_migrations` table, so
-`migrate()` is idempotent. Upserts use portable `ON CONFLICT … DO UPDATE`, and
-all ids are generated in Rust (no `AUTOINCREMENT`/`SERIAL`).
+A single portable schema in `src/migrations/001_init.sql` serves both backends.
+Applied migrations are tracked in a `_migrations` table, so `migrate()` is
+idempotent. Upserts use portable `ON CONFLICT … DO UPDATE`, and all ids are
+generated in Rust (no `AUTOINCREMENT`/`SERIAL`).
+
+Every column is a text type: no opaque binary is stored. Content-addressed ids
+(and the opaque saga blob) are kept as lower-case hex `TEXT`, and structured
+payloads as their JSON `TEXT` serialization, so any row is readable in a plain
+SQL client for auditing. The JSON is never queried into.
 
 ## Usage
 
