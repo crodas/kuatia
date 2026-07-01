@@ -24,6 +24,10 @@ serde_json.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 paste.workspace = true
+kuatia-types.workspace = true
+kuatia-storage.workspace = true
+sqlx = { workspace = true, features = ["macros"] }
+serde_json.workspace = true
 
 [features]
 default = ["sqlite"]
