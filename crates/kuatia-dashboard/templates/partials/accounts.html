@@ -1,0 +1,35 @@
+<table class="grid">
+  <thead>
+    <tr>
+      <th>Account</th>
+      <th>Policy</th>
+      <th class="right">Balances</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for a in accounts %}
+    <tr onclick="window.location='/accounts/{{ a.id }}'">
+      <td>
+        <div class="acct-name">{{ a.name }}</div>
+        <div class="acct-id">
+          #{{ a.id }}
+          {% if a.frozen %}<span class="flag frozen">frozen</span>{% endif %}
+          {% if a.closed %}<span class="flag closed">closed</span>{% endif %}
+        </div>
+      </td>
+      <td><span class="policy {{ a.policy_kind }}">{{ a.policy_kind }}</span></td>
+      <td class="right">
+        {% if a.balances %}
+          {% for b in a.balances %}
+          <div>
+            <span class="money {% if b.money.negative %}neg{% else %}pos{% endif %}">{{ b.money.text }}</span>
+          </div>
+          {% endfor %}
+        {% else %}
+          <span class="muted">&mdash;</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>

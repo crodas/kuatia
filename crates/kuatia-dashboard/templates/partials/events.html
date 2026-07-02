@@ -1,0 +1,12 @@
+<div class="feed">
+  {% for e in events %}
+  <div class="event-row">
+    <span class="event-kind {{ e.kind }}">{{ e.kind }}</span>
+    <span class="event-target">
+      {% if e.account %}account #{{ e.account }}{% endif %}
+      {% if e.transfer_short %}<code class="hash">{{ e.transfer_short }}</code>{% endif %}
+    </span>
+    <span class="muted event-time">{{ e.time }}</span>
+  </div>
+  {% endfor %}
+</div>

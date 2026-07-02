@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Kuatia Ledger</title>
+    <link rel="stylesheet" href="/static/dashboard.css" />
+    <script src="/static/htmx.min.js"></script>
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <h1><a href="/">Kuatia Ledger</a></h1>
+        <span class="live"><span class="dot"></span> live</span>
+      </header>
+      <nav class="nav">
+        <a href="/" class="{% if nav == 'overview' %}active{% endif %}">Overview</a>
+        <a href="/accounts" class="{% if nav == 'accounts' %}active{% endif %}">Accounts</a>
+        <a href="/transfers" class="{% if nav == 'transfers' %}active{% endif %}">Transfers</a>
+        <a href="/events" class="{% if nav == 'events' %}active{% endif %}">Events</a>
+      </nav>
+      <main>{% block content %}{% endblock content %}</main>
+    </div>
+  </body>
+</html>

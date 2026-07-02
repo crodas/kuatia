@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block content %}
+<div id="live" hx-get="/ui/overview" hx-trigger="every 3s" hx-swap="innerHTML">
+  {% include "partials/overview.html" %}
+</div>
+{% endblock content %}
