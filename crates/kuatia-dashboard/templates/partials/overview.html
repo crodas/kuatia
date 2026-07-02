@@ -1,0 +1,28 @@
+<div class="overview">
+  <div class="card">
+    <div class="card-label">Accounts</div>
+    <div class="card-value">{{ accounts_count }}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Transfers</div>
+    <div class="card-value">{{ transfers_count }}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Assets</div>
+    <div class="card-value">{{ assets_count }}</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Total issued</div>
+    <div class="issued-list">
+      {% if issued %}
+        {% for i in issued %}
+          <div class="issued-row">
+            <span class="money {% if i.money.negative %}neg{% else %}pos{% endif %}">{{ i.money.text }}</span>
+          </div>
+        {% endfor %}
+      {% else %}
+        <span class="muted">nothing issued</span>
+      {% endif %}
+    </div>
+  </div>
+</div>

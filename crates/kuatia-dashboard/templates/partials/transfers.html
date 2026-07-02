@@ -1,0 +1,25 @@
+<div class="feed">
+  {% for t in transfers %}
+  <div class="feed-item">
+    <div class="feed-head">
+      <code class="hash" title="{{ t.full_id }}">{{ t.short_id }}</code>
+      <span class="muted">{{ t.time }}</span>
+    </div>
+    <div class="legs">
+      {% for leg in t.legs %}
+      <div class="leg {% if leg.is_change %}change{% endif %}">
+        <span class="leg-dir">
+          {% if leg.is_change %}
+            change &rarr; <b>{{ leg.to_name }}</b>
+          {% else %}
+            <b>{{ leg.from_name }}</b> &rarr; <b>{{ leg.to_name }}</b>
+          {% endif %}
+        </span>
+        <span class="money {% if leg.money.negative %}neg{% else %}pos{% endif %}">{{ leg.money.text }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    <div class="feed-foot muted">consumes {{ t.consumes }} posting(s)</div>
+  </div>
+  {% endfor %}
+</div>

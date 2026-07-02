@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+<p><a class="back" href="/accounts">&larr; Accounts</a></p>
+<div class="panel">
+  <h2>{{ account.name }} <span class="acct-id">#{{ account.id }}</span></h2>
+  <div id="live" hx-get="/ui/accounts/{{ account.id }}" hx-trigger="every 3s" hx-swap="innerHTML">
+    {% include "partials/account.html" %}
+  </div>
+</div>
+{% endblock content %}

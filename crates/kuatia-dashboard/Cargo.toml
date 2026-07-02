@@ -1,0 +1,30 @@
+[package]
+name = "kuatia-dashboard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+description = "Server-rendered dashboard and REST API for exploring a Kuatia ledger"
+
+[[bin]]
+name = "kuatia-dashboard"
+path = "src/main.rs"
+
+[dependencies]
+kuatia = { path = "../kuatia", version = "0.1.0" }
+kuatia-core = { workspace = true }
+kuatia-storage = { workspace = true }
+kuatia-storage-sql = { workspace = true, features = ["postgres"] }
+
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["sqlite", "postgres"] }
+
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tera = "1"
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
