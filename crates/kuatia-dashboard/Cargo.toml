@@ -1,6 +1,6 @@
 [package]
 name = "kuatia-dashboard"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -12,7 +12,7 @@ name = "kuatia-dashboard"
 path = "src/main.rs"
 
 [dependencies]
-kuatia = { path = "../kuatia", version = "0.1.0" }
+kuatia = { path = "../kuatia", version = "0.2.0" }
 kuatia-core = { workspace = true }
 kuatia-storage = { workspace = true }
 kuatia-storage-sql = { workspace = true, features = ["postgres"] }
