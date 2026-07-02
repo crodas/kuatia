@@ -1,0 +1,362 @@
+:root {
+  --bg: #0f1720;
+  --panel: #17212b;
+  --panel-2: #1e2a37;
+  --line: #2a3a49;
+  --text: #e6edf3;
+  --muted: #8ba0b3;
+  --accent: #4c9be8;
+  --pos: #57c98a;
+  --neg: #e8736b;
+  --chip: #24333f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 4rem;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.header h1 {
+  font-size: 1.4rem;
+  margin: 0;
+  letter-spacing: 0.02em;
+}
+
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.live .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--pos);
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(87, 201, 138, 0.5); }
+  70% { box-shadow: 0 0 0 8px rgba(87, 201, 138, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(87, 201, 138, 0); }
+}
+
+/* Nav */
+.nav {
+  display: flex;
+  gap: 0.4rem;
+  margin-bottom: 1.5rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.nav a {
+  padding: 0.5rem 0.9rem;
+  color: var(--muted);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+.nav a:hover {
+  color: var(--text);
+}
+
+.nav a.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.back {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.back:hover {
+  color: var(--text);
+}
+
+/* Overview cards */
+.overview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.75rem;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+}
+
+.card-label {
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.card-value {
+  font-size: 1.8rem;
+  font-weight: 600;
+  margin-top: 0.2rem;
+}
+
+.issued-list {
+  margin-top: 0.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+/* Panels */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+}
+
+.panel h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.05rem;
+}
+
+.panel h2 .acct-id {
+  font-weight: 400;
+}
+
+/* Tables */
+table.grid {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+table.grid th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--line);
+}
+
+table.grid td {
+  padding: 0.55rem 0.5rem;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+table.grid.small td,
+table.grid.small th {
+  padding: 0.35rem 0.4rem;
+  font-size: 0.85rem;
+}
+
+.right {
+  text-align: right;
+}
+
+table.grid tbody tr {
+  cursor: pointer;
+}
+
+table.grid tbody tr:hover {
+  background: var(--panel-2);
+}
+
+.acct-name {
+  font-weight: 600;
+}
+
+.acct-id {
+  color: var(--muted);
+  font-size: 0.78rem;
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+/* Chips */
+.policy,
+.flag,
+.status,
+.event-kind {
+  display: inline-block;
+  font-size: 0.72rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: var(--chip);
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.policy.NoOverdraft { color: #9fb4c6; }
+.policy.CappedOverdraft { color: #e0b25a; }
+.policy.UncappedOverdraft { color: #e8736b; }
+.policy.SystemAccount { color: #4c9be8; }
+.policy.ExternalAccount { color: #b98be0; }
+
+.flag.frozen { background: #2b3f57; color: #7fb3ff; }
+.flag.closed { background: #4a2a2a; color: #e8736b; }
+
+.status.Active { color: var(--pos); }
+.status.PendingInactive { color: #e0b25a; }
+.status.Inactive { color: var(--muted); }
+
+/* Money */
+.money {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.money.pos { color: var(--pos); }
+.money.neg { color: var(--neg); }
+
+/* Feeds */
+.feed {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.feed-item {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 0.7rem;
+}
+
+.feed-item.compact {
+  padding: 0.45rem 0.55rem;
+}
+
+.feed-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.4rem;
+  font-size: 0.8rem;
+}
+
+.legs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.leg {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+.leg.change {
+  opacity: 0.6;
+  font-style: italic;
+}
+
+.leg-dir b {
+  font-weight: 600;
+}
+
+.feed-foot {
+  margin-top: 0.4rem;
+  font-size: 0.75rem;
+}
+
+.hash {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.8rem;
+  color: var(--accent);
+}
+
+/* Event rows */
+.event-row {
+  display: grid;
+  grid-template-columns: 150px 1fr auto;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.35rem 0.2rem;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.85rem;
+}
+
+.event-kind.TransferCommitted { color: var(--pos); }
+.event-kind.AccountCreated { color: var(--accent); }
+.event-kind.AccountFrozen,
+.event-kind.AccountClosed { color: var(--neg); }
+
+.event-time {
+  font-size: 0.75rem;
+}
+
+/* Account detail */
+.detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.drawer h3,
+.panel h3 {
+  margin: 1.4rem 0 0.5rem;
+  font-size: 0.95rem;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.25rem;
+}
+
+.balance-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.balance-list li {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.3rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.asset-code {
+  color: var(--muted);
+}
+
+/* Utilities */
+.muted {
+  color: var(--muted);
+}

@@ -1,0 +1,65 @@
+<div class="detail-meta">
+  <span class="policy {{ account.policy_kind }}">{{ account.policy_kind }}</span>
+  {% if account.floor %}
+    <span class="muted">floor <span class="money neg">{{ account.floor.text }}</span></span>
+  {% endif %}
+  <span class="muted">version {{ account.version }}</span>
+  {% if account.frozen %}<span class="flag frozen">frozen</span>{% endif %}
+  {% if account.closed %}<span class="flag closed">closed</span>{% endif %}
+</div>
+
+<h3>Balances</h3>
+{% if account.balances %}
+<ul class="balance-list">
+  {% for b in account.balances %}
+  <li>
+    <span class="asset-code">{{ b.code }}</span>
+    <span class="money {% if b.money.negative %}neg{% else %}pos{% endif %}">{{ b.money.text }}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted">No balances.</p>
+{% endif %}
+
+<h3>Postings ({{ postings | length }})</h3>
+<table class="grid small">
+  <thead>
+    <tr>
+      <th>Posting</th>
+      <th>Status</th>
+      <th class="right">Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for p in postings %}
+    <tr>
+      <td><code class="hash" title="{{ p.short_id }}">{{ p.short_id }}</code></td>
+      <td><span class="status {{ p.status }}">{{ p.status }}</span></td>
+      <td class="right">
+        <span class="money {% if p.money.negative %}neg{% else %}pos{% endif %}">{{ p.money.text }}</span>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h3>Transfers ({{ transfers | length }})</h3>
+<div class="feed">
+  {% for t in transfers %}
+  <div class="feed-item compact">
+    <div class="feed-head">
+      <code class="hash" title="{{ t.full_id }}">{{ t.short_id }}</code>
+      <span class="muted">{{ t.time }}</span>
+    </div>
+    <div class="legs">
+      {% for leg in t.legs %}
+      <div class="leg {% if leg.is_change %}change{% endif %}">
+        <span class="leg-dir">{{ leg.to_name }}</span>
+        <span class="money {% if leg.money.negative %}neg{% else %}pos{% endif %}">{{ leg.money.text }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+</div>

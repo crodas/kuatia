@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kuatia-money", "crates/kuatia-types", "crates/kuatia-core", "crates/kuatia-storage", "crates/kuatia-storage-sql", "crates/kuatia"]
+members = ["crates/kuatia-money", "crates/kuatia-types", "crates/kuatia-core", "crates/kuatia-storage", "crates/kuatia-storage-sql", "crates/kuatia", "crates/kuatia-dashboard"]
 
 [workspace.package]
 version = "0.1.0"
