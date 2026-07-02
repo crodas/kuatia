@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "kuatia"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "kuatia-core",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "kuatia-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kuatia-types",
  "serde",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "kuatia-dashboard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "clap",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "kuatia-money"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "kuatia-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "kuatia-types",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "kuatia-storage-sql"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "kuatia-storage",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "kuatia-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitflags",
  "kuatia-money",
