@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/kuatia-money", "crates/kuatia-types", "crates/kuatia-core", "crates/kuatia-storage", "crates/kuatia-storage-sql", "crates/kuatia", "crates/kuatia-dashboard"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -14,11 +14,11 @@ categories = ["finance", "database-implementations"]
 
 [workspace.dependencies]
 # Internal crates
-kuatia-money = { path = "crates/kuatia-money", version = "0.1.0" }
-kuatia-types = { path = "crates/kuatia-types", version = "0.1.0" }
-kuatia-core = { path = "crates/kuatia-core", version = "0.1.0" }
-kuatia-storage = { path = "crates/kuatia-storage", version = "0.1.0" }
-kuatia-storage-sql = { path = "crates/kuatia-storage-sql", version = "0.1.0" }
+kuatia-money = { path = "crates/kuatia-money", version = "0.2.0" }
+kuatia-types = { path = "crates/kuatia-types", version = "0.2.0" }
+kuatia-core = { path = "crates/kuatia-core", version = "0.2.0" }
+kuatia-storage = { path = "crates/kuatia-storage", version = "0.2.0" }
+kuatia-storage-sql = { path = "crates/kuatia-storage-sql", version = "0.2.0" }
 
 # External crates
 serde = { version = "1", features = ["derive"] }

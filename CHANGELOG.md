@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-01
+
+### Added
+
+- `kuatia-dashboard`: a server-rendered dashboard and REST API for observing a
+  Kuatia ledger over HTTP. Browse accounts, postings, transfers, and the event
+  log; inspect per-account balances computed in Rust.
+
+### Changed
+
+- The SQL backend stores binary identifiers as hex text and structured columns
+  as JSON text instead of opaque blobs, so a ledger can be audited directly
+  with SQL tooling. The SQLite and PostgreSQL schemas were unified into a
+  single `001_init.sql`.
+
 ## [0.1.0] - 2026-06-30
 
 Initial release.
@@ -41,4 +56,5 @@ Initial release.
 - `kuatia-storage-sql` — SQLite/PostgreSQL backend.
 - `kuatia` — async `Ledger` resource and saga commit pipeline.
 
+[0.2.0]: https://github.com/crodas/kuatia/releases/tag/v0.2.0
 [0.1.0]: https://github.com/crodas/kuatia/releases/tag/v0.1.0
