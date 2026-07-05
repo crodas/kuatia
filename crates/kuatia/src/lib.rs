@@ -5,6 +5,7 @@
 //! commit pipeline (load → plan → apply) behind a convenient async API.
 
 pub mod error;
+pub mod inflight;
 pub mod ledger;
 pub mod saga;
 
@@ -22,6 +23,9 @@ pub mod prelude {
     pub use kuatia_core::*;
 
     pub use crate::error::LedgerError;
+    pub use crate::inflight::{
+        Authorization, InflightLeg, InflightLegStatus, InflightState, InflightStatus,
+    };
     pub use crate::ledger::Ledger;
     pub use kuatia_storage::mem_store::InMemoryStore;
     pub use kuatia_storage::store::Store;

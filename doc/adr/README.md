@@ -23,6 +23,7 @@ to reverse a decision. Instead, a new ADR supersedes it.
 | [0011](0011-swappable-money-backing.md) | Swappable integer backing for money, default i64 | accepted | `Cent` moves to a `kuatia-money` crate over a `CentBacking` trait; the i64↔i128 width is a cargo feature, hidden from the API, stored as text. Refines 0009. |
 | [0012](0012-subaccounts.md) | Subaccount dimension on account identity | accepted | Account identity gains a subaccount dimension (used for per-destination inflight holding subaccounts). |
 | [0013](0013-journaling-model.md) | Journaling model: transfer as journal entry | accepted | A committed `Transfer`/`Envelope` is a (compound) journal entry; the transfer log is the accounting journal; `Book` is a policy scope, not the journal. Frames 0001/0005/0010 in accounting terms. |
+| [0014](0014-inflight-holds-via-holding-accounts.md) | Inflight holds via per-destination holding accounts | accepted | A hold is a subaccount of its destination; committing routes funds through the holding subaccount so pending value stays visible and reconcilable until settle or cancel. |
 
 ## Recommended future ADRs
 
