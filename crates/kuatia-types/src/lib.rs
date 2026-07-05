@@ -31,6 +31,8 @@ pub trait ToBytes {
 /// Bumped to 2 when `Cent` moved to a fixed 16-byte canonical encoding (ADR-0011).
 /// Bumped to 3 when `AccountId` gained a `subaccount` leg folded into its
 /// canonical bytes (ADR-0012).
+/// Bumped to 4 when the vestigial `UserData` fields were removed from the
+/// `Envelope` and `Account` preimages.
 pub const CANONICAL_VERSION: u8 = 4;
 
 /// Append a `u16` in big-endian to `buf`.
@@ -807,7 +809,10 @@ bitflags::bitflags! {
         const FROZEN = 1 << 0;
         /// Terminal — no further activity.
         const CLOSED = 1 << 1;
-        // Bits 2–7: reserved for future system flags.
+        /// Holding account for an inflight (authorize/confirm/void) transaction.
+        /// Parks funds between authorize and settlement; closed once drained.
+        const INFLIGHT = 1 << 2;
+        // Bits 3–7: reserved for future system flags.
         // Bits 8–31: user-defined.
         /// User-defined flag 0.
         const USER_0 = 1 << 8;

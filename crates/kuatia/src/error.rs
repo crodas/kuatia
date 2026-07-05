@@ -4,7 +4,8 @@
 //! and from storage, so callers get a single error type from every API.
 
 use kuatia_core::{
-    AccountId, BookId, EnvelopeId, OverflowError, PostingId, SelectionError, ValidationError,
+    AccountId, AssetId, BookId, EnvelopeId, OverflowError, PostingId, SelectionError,
+    ValidationError,
 };
 use kuatia_storage::error::StoreError;
 
@@ -29,6 +30,23 @@ pub enum LedgerError {
     AccountAlreadyClosed(AccountId),
     /// A transfer named a book that does not exist.
     BookNotFound(BookId),
+    /// The referenced inflight transaction does not exist (no authorize record).
+    InflightNotFound(EnvelopeId),
+    /// The referenced transfer is not an inflight authorize, or its metadata is
+    /// malformed.
+    NotInflightTransaction(EnvelopeId),
+    /// The destination already has an open inflight hold; only one is allowed at
+    /// a time per account.
+    InflightAlreadyOpen(AccountId),
+    /// The inflight transaction has no leg matching this destination and asset.
+    InflightLegNotFound {
+        /// The destination account with no matching leg.
+        destination: AccountId,
+        /// The asset with no matching leg.
+        asset: AssetId,
+    },
+    /// An inflight movement must move between two distinct accounts.
+    InflightSelfMovement(AccountId),
     /// Monetary arithmetic overflow.
     Overflow,
     /// A saga step failed and its compensation also failed.
@@ -52,6 +70,20 @@ impl std::fmt::Display for LedgerError {
             Self::AccountNotEmpty(id) => write!(f, "account not empty: {id:?}"),
             Self::AccountAlreadyClosed(id) => write!(f, "account already closed: {id:?}"),
             Self::BookNotFound(id) => write!(f, "book not found: {id:?}"),
+            Self::InflightNotFound(id) => write!(f, "inflight transaction not found: {id:?}"),
+            Self::NotInflightTransaction(id) => {
+                write!(f, "not an inflight authorize transaction: {id:?}")
+            }
+            Self::InflightAlreadyOpen(id) => {
+                write!(f, "account already has an open inflight hold: {id:?}")
+            }
+            Self::InflightLegNotFound { destination, asset } => write!(
+                f,
+                "inflight leg not found for destination {destination:?} asset {asset:?}"
+            ),
+            Self::InflightSelfMovement(id) => {
+                write!(f, "inflight movement must have distinct from/to: {id:?}")
+            }
             Self::Overflow => write!(f, "monetary amount overflow"),
             Self::CompensationFailed {
                 original,
