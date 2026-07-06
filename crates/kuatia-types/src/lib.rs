@@ -10,6 +10,7 @@ pub mod autoid;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // ToBytes trait
@@ -28,7 +29,9 @@ pub trait ToBytes {
 
 /// Version byte prepended to canonical serializations for forward compatibility.
 /// Bumped to 2 when `Cent` moved to a fixed 16-byte canonical encoding (ADR-0011).
-pub const CANONICAL_VERSION: u8 = 2;
+/// Bumped to 3 when `AccountId` gained a `subaccount` leg folded into its
+/// canonical bytes (ADR-0012).
+pub const CANONICAL_VERSION: u8 = 3;
 
 /// Append a `u16` in big-endian to `buf`.
 pub fn write_u16(buf: &mut Vec<u8>, v: u16) {
@@ -60,8 +63,19 @@ pub fn write_u128(buf: &mut Vec<u8>, v: u128) {
 // ---------------------------------------------------------------------------
 
 /// Stable account identity. Used in all public APIs.
+///
+/// An account is a base `id` plus a `subaccount`. `sub = 0` is the main account
+/// (the default when subaccounts are not used); a non-zero `sub` is a
+/// subaccount of the same base id. `sub` is an opaque id (an `i64`, like the
+/// base id), so the whole range is usable. Each `(id, sub)` is a full account
+/// record with its own policy and lifecycle. See ADR-0012.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct AccountId(pub i64);
+pub struct AccountId {
+    /// Base account id.
+    pub id: i64,
+    /// Subaccount id; `0` is the main account.
+    pub sub: i64,
+}
 
 /// Pairs an [`AccountId`] with a snapshot hash — the double-SHA256 of the
 /// account's state at a point in time. Stored on [`Transfer`] to record which
@@ -115,7 +129,25 @@ impl ToBytes for Cent {
 
 impl fmt::Debug for AccountId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "AccountId({})", self.0)
+        if self.sub == 0 {
+            write!(f, "AccountId({})", self.id)
+        } else {
+            write!(f, "AccountId({}.{})", self.id, self.sub)
+        }
+    }
+}
+
+impl fmt::Display for AccountId {
+    /// IBAN-style machine format: two ISO 7064 mod-97 check digits, then a
+    /// 26-character base-36 body. There is no country code. The `(id, sub)` pair
+    /// is run through a keyed 128-bit Feistel permutation (see [`set_id_seed`])
+    /// before encoding, so the body does not reveal the raw ids. Round-trips via
+    /// [`FromStr`](std::str::FromStr); [`to_grouped`](AccountId::to_grouped) adds
+    /// the presentation spacing.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (l, r) = feistel(self.id as u64, self.sub as u64, id_seed());
+        let body = format!("{}{}", base36_u64(l), base36_u64(r));
+        write!(f, "{:02}{body}", check_digits(&body))
     }
 }
 
@@ -145,6 +177,125 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// IBAN-style string view for AccountId (ADR-0012)
+// ---------------------------------------------------------------------------
+
+/// Encode a `u64` as exactly 13 base-36 digits (`0-9A-Z`), zero-padded on the
+/// left. 13 digits is the widest a `u64` needs (`36^13 > u64::MAX`), so this
+/// never truncates.
+fn base36_u64(mut v: u64) -> String {
+    const D: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut out = [b'0'; 13];
+    let mut i = out.len();
+    while v > 0 && i > 0 {
+        i -= 1;
+        out[i] = D[(v % 36) as usize];
+        v /= 36;
+    }
+    out.iter().map(|&b| b as char).collect()
+}
+
+/// Expand an IBAN string to its numeric form for the checksum: digits stay,
+/// letters `A-Z` become `10..35`.
+fn iban_expand(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.bytes() {
+        if c.is_ascii_digit() {
+            out.push(c as char);
+        } else {
+            let v = (c - b'A') as u32 + 10;
+            out.push_str(&v.to_string());
+        }
+    }
+    out
+}
+
+/// ISO 7064 mod-97-10 over a decimal string, computed iteratively so the input
+/// length is unbounded.
+fn mod97(digits: &str) -> u32 {
+    let mut rem = 0u32;
+    for b in digits.bytes() {
+        rem = (rem * 10 + (b - b'0') as u32) % 97;
+    }
+    rem
+}
+
+/// The two mod-97 check digits for a base-36 body, IBAN-style but with no
+/// country code: `98 - (expand(body ++ "00") mod 97)`.
+fn check_digits(body: &str) -> u32 {
+    98 - mod97(&iban_expand(&format!("{body}00")))
+}
+
+// ---------------------------------------------------------------------------
+// Account-code obfuscation (ADR-0012)
+//
+// The account code's body is a base-36 rendering of the two i64 legs. Without
+// mixing, small ids render as long runs of zeros that reveal their value and
+// sequence. To hide that from outsiders, the (id, sub) pair is run through a
+// keyed 128-bit Feistel permutation before encoding, and inverted on parse.
+// This is obfuscation, not security: anyone with the seed can decode it, so it
+// is not a substitute for authorization. The seed has a default and can be set
+// once at startup via `set_id_seed`; changing it changes every code, so it must
+// be stable across a deployment.
+// ---------------------------------------------------------------------------
+
+/// Default seed for the account-code obfuscation permutation. Override at
+/// startup with [`set_id_seed`], before any code is issued or parsed.
+pub const DEFAULT_ID_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Process-global seed keying the account-code permutation.
+static ID_SEED: AtomicU64 = AtomicU64::new(DEFAULT_ID_SEED);
+
+/// Set the process-global seed that keys the account-code obfuscation. Call once
+/// at startup: every [`AccountId`] string form depends on it, so changing it
+/// after codes are issued invalidates the previously issued ones.
+pub fn set_id_seed(seed: u64) {
+    ID_SEED.store(seed, Ordering::Relaxed);
+}
+
+/// The current process-global account-code seed.
+pub fn id_seed() -> u64 {
+    ID_SEED.load(Ordering::Relaxed)
+}
+
+/// Number of Feistel rounds. Four rounds of a strong round function give a
+/// strong pseudo-random permutation (Luby-Rackoff), which is ample for
+/// obfuscation.
+const FEISTEL_ROUNDS: usize = 4;
+
+/// SplitMix64 finalizer: a strong 64-bit avalanche mixer.
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Per-round subkey derived from the seed and round index.
+fn round_key(seed: u64, round: usize) -> u64 {
+    mix64(seed ^ (round as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+/// Keyed 128-bit Feistel permutation over the two halves `(l, r)`.
+fn feistel(mut l: u64, mut r: u64, seed: u64) -> (u64, u64) {
+    for round in 0..FEISTEL_ROUNDS {
+        let next = l ^ mix64(r ^ round_key(seed, round));
+        l = r;
+        r = next;
+    }
+    (l, r)
+}
+
+/// Inverse of [`feistel`] under the same seed.
+fn feistel_inv(mut l: u64, mut r: u64, seed: u64) -> (u64, u64) {
+    for round in (0..FEISTEL_ROUNDS).rev() {
+        let prev = r ^ mix64(l ^ round_key(seed, round));
+        r = l;
+        l = prev;
+    }
+    (l, r)
+}
+
+// ---------------------------------------------------------------------------
 // Identifier constructors
 // ---------------------------------------------------------------------------
 
@@ -153,20 +304,113 @@ impl Default for AccountId {
         // Process-global generator: a per-thread one could mint the same id on
         // two threads within a millisecond, yielding duplicate account ids.
         static GEN: crate::autoid::AutoId = crate::autoid::AutoId::new();
-        Self(GEN.next())
+        Self {
+            id: GEN.next(),
+            sub: 0,
+        }
     }
 }
 
 impl AccountId {
-    /// Create an `AccountId` from an `i64`.
+    /// Create the main account (`sub = 0`) for a base `id`.
     pub const fn new(id: i64) -> Self {
-        Self(id)
+        Self { id, sub: 0 }
+    }
+
+    /// Create a specific subaccount of a base `id`.
+    pub const fn with_sub(id: i64, sub: i64) -> Self {
+        Self { id, sub }
+    }
+
+    /// Return the main account of this id (`sub` set to `0`).
+    pub const fn base(&self) -> Self {
+        Self {
+            id: self.id,
+            sub: 0,
+        }
+    }
+
+    /// Whether this is the main account (`sub == 0`).
+    pub const fn is_main(&self) -> bool {
+        self.sub == 0
+    }
+
+    /// IBAN-style presentation format: the machine [`Display`](fmt::Display)
+    /// form grouped into blocks of four with a single space
+    /// (e.g. `9200 0000 0000 0050 0000 0000 07`).
+    pub fn to_grouped(&self) -> String {
+        let machine = self.to_string();
+        let mut out = String::with_capacity(machine.len() + machine.len() / 4);
+        for (i, c) in machine.chars().enumerate() {
+            if i > 0 && i % 4 == 0 {
+                out.push(' ');
+            }
+            out.push(c);
+        }
+        out
     }
 }
 
 impl From<AccountSnapshotId> for AccountId {
     fn from(snap: AccountSnapshotId) -> Self {
         snap.account
+    }
+}
+
+/// Returned when a string is not a valid [`AccountId`] code: wrong structure,
+/// non-base-36 body, or a failed mod-97 checksum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseAccountIdError;
+
+impl fmt::Display for ParseAccountIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid AccountId: not a checksum-valid account code")
+    }
+}
+
+impl std::error::Error for ParseAccountIdError {}
+
+impl std::str::FromStr for AccountId {
+    type Err = ParseAccountIdError;
+
+    /// Parse an IBAN-style account code back into the two i64 legs. Any spaces
+    /// (grouped display format) and dashes (URL-safe separator) are ignored and
+    /// the input is upper-cased first, so `5000...`, `5000 0000 ...`, and
+    /// `5000-0000-...` all parse to the same id. The value must reduce to two
+    /// check digits followed by a 26-character base-36 body, and the ISO 7064
+    /// mod-97 checksum must pass — so a mistyped or otherwise invalid id is
+    /// rejected here rather than reaching the store. Each 13-char half is read as
+    /// a `u64` bit pattern and reinterpreted as `i64`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let cleaned: String = s
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-')
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        // 2 check digits + 26-char base-36 body.
+        if cleaned.len() != 28 {
+            return Err(ParseAccountIdError);
+        }
+        let check = &cleaned[0..2];
+        let body = &cleaned[2..28];
+        let is_base36 = |b: u8| b.is_ascii_digit() || b.is_ascii_uppercase();
+        if !check.bytes().all(|b| b.is_ascii_digit()) || !body.bytes().all(is_base36) {
+            return Err(ParseAccountIdError);
+        }
+        // Checksum-valid iff the expanded (body ++ check) reduces to 1 under
+        // mod-97.
+        if mod97(&iban_expand(&format!("{body}{check}"))) != 1 {
+            return Err(ParseAccountIdError);
+        }
+        // Decode the two halves, then invert the Feistel permutation to recover
+        // the raw legs.
+        let l = u64::from_str_radix(&body[0..13], 36).map_err(|_| ParseAccountIdError)?;
+        let r = u64::from_str_radix(&body[13..26], 36).map_err(|_| ParseAccountIdError)?;
+        let (id, sub) = feistel_inv(l, r, id_seed());
+        Ok(Self {
+            id: id as i64,
+            sub: sub as i64,
+        })
     }
 }
 
@@ -737,6 +981,25 @@ impl TransferBuilder {
         self.movement(from, to, asset, amount)
     }
 
+    /// Add a movement between two specific subaccounts. Identical to
+    /// [`movement`](Self::movement) — `from`/`to` already carry a subaccount —
+    /// but names the subaccount intent at the call site (ADR-0012).
+    pub fn movement_ref(
+        self,
+        from: AccountId,
+        to: AccountId,
+        asset: AssetId,
+        amount: Cent,
+    ) -> Self {
+        self.movement(from, to, asset, amount)
+    }
+
+    /// Add a pay movement between two specific subaccounts. See
+    /// [`movement_ref`](Self::movement_ref).
+    pub fn pay_ref(self, from: AccountId, to: AccountId, asset: AssetId, amount: Cent) -> Self {
+        self.movement(from, to, asset, amount)
+    }
+
     /// Add a deposit: creates an offset posting on the external account and
     /// credits the target account.  Pushes two movements whose net debit on the
     /// external account is zero.
@@ -794,14 +1057,19 @@ impl TransferBuilder {
 
 impl ToBytes for AccountId {
     fn to_bytes(&self) -> Vec<u8> {
-        self.0.to_be_bytes().to_vec()
+        // Base id then subaccount, both big-endian, so the subaccount is folded
+        // into every content hash (envelope ids, posting ids, snapshots).
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&self.id.to_be_bytes());
+        buf.extend_from_slice(&self.sub.to_be_bytes());
+        buf
     }
 }
 
 impl ToBytes for AccountSnapshotId {
     fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(40);
-        buf.extend_from_slice(&self.account.0.to_be_bytes());
+        let mut buf = Vec::with_capacity(48);
+        buf.extend_from_slice(&self.account.to_bytes());
         buf.extend_from_slice(&self.snapshot_id);
         buf
     }
@@ -963,5 +1231,142 @@ impl ToBytes for Account {
 impl ToBytes for Receipt {
     fn to_bytes(&self) -> Vec<u8> {
         self.transfer_id.0.to_vec()
+    }
+}
+
+#[cfg(test)]
+mod account_id_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn code_structure() {
+        let s = AccountId::with_sub(5, 7).to_string();
+        // 2 check digits + 26-char base-36 body. No country code.
+        assert_eq!(s.len(), 28);
+        assert!(s[0..2].bytes().all(|b| b.is_ascii_digit()));
+        // The body is Feistel-permuted, so it does NOT expose the raw legs the
+        // way an unmixed base-36 rendering (all zeros then "5"/"7") would.
+        assert_ne!(&s[2..], "00000000000050000000000007");
+    }
+
+    #[test]
+    fn code_round_trips() {
+        for acc in [
+            AccountId::new(0),
+            AccountId::new(100),
+            AccountId::with_sub(5, 7),
+            // High-bit subaccount: exercises the u64-bit-pattern reinterpretation.
+            AccountId::with_sub(1, -1),
+            AccountId::with_sub(i64::MAX, i64::MIN),
+        ] {
+            let s = acc.to_string();
+            assert_eq!(AccountId::from_str(&s).unwrap(), acc, "round-trip {s}");
+        }
+    }
+
+    #[test]
+    fn parses_a_fixed_vector() {
+        // A hardcoded, checksum-valid code (under DEFAULT_ID_SEED) pins the
+        // exact encoding, permutation, and checksum, so an accidental change to
+        // any of them is caught by a failing parse.
+        let code = "123PER2Q81K52QL1HA26CYE1IZH5";
+        let expected = AccountId::with_sub(987654321, 12345);
+        assert_eq!(AccountId::from_str(code).unwrap(), expected);
+        // The grouped (spaced, lower-cased) form parses to the same value.
+        assert_eq!(
+            AccountId::from_str("123p er2q 81k5 2ql1 ha26 cye1 izh5").unwrap(),
+            expected
+        );
+        // Display reproduces the exact machine form.
+        assert_eq!(expected.to_string(), code);
+    }
+
+    #[test]
+    fn feistel_is_invertible_across_seeds() {
+        for &seed in &[0u64, 1, DEFAULT_ID_SEED, u64::MAX] {
+            for &(l, r) in &[(0u64, 0u64), (5, 7), (u64::MAX, 1), (42, u64::MAX)] {
+                let (el, er) = feistel(l, r, seed);
+                assert_eq!(feistel_inv(el, er, seed), (l, r), "seed={seed} l={l} r={r}");
+            }
+        }
+    }
+
+    #[test]
+    fn obfuscation_hides_structure() {
+        // The default seed is in force.
+        assert_eq!(id_seed(), DEFAULT_ID_SEED);
+        // Sequential base ids do not produce visibly related codes (avalanche).
+        let a = AccountId::new(100).to_string();
+        let b = AccountId::new(101).to_string();
+        let shared = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+        assert!(shared < 4, "codes share too long a prefix: {a} vs {b}");
+        // A base account and its subaccount are likewise not obviously related.
+        let main = AccountId::new(100).to_string();
+        let sub = AccountId::with_sub(100, 1).to_string();
+        assert_ne!(main, sub);
+    }
+
+    #[test]
+    fn grouped_format_groups_by_four_and_re_parses() {
+        let acc = AccountId::with_sub(5, 7);
+        let grouped = acc.to_grouped();
+        assert!(grouped.contains(' '));
+        assert!(grouped.split(' ').all(|g| g.len() <= 4));
+        // Grouped format (with spaces) and lower case both parse back.
+        assert_eq!(AccountId::from_str(&grouped).unwrap(), acc);
+        assert_eq!(AccountId::from_str(&grouped.to_lowercase()).unwrap(), acc);
+    }
+
+    #[test]
+    fn parses_with_spaces_or_dashes_for_url_safety() {
+        let acc = AccountId::with_sub(987654321, 12345);
+        let machine = acc.to_string(); // 28 chars, no separators (URL-safe)
+        // The same code grouped with spaces (display) or dashes (URL-safe
+        // separator) parses back to the same id, as does a mixed/irregular form.
+        let spaced = acc.to_grouped();
+        let dashed = spaced.replace(' ', "-");
+        let mixed = format!("{}-{} {}", &machine[0..4], &machine[4..20], &machine[20..]);
+        for s in [&machine, &spaced, &dashed, &mixed] {
+            assert_eq!(AccountId::from_str(s).unwrap(), acc, "parse {s}");
+        }
+    }
+
+    #[test]
+    fn from_str_rejects_bad_checksum_and_junk() {
+        let good = AccountId::with_sub(5, 7).to_string();
+        assert!(AccountId::from_str(&good).is_ok());
+
+        // A helper to overwrite one character while keeping the length.
+        let with_char_at = |i: usize, c: char| {
+            let mut v: Vec<char> = good.chars().collect();
+            v[i] = c;
+            v.into_iter().collect::<String>()
+        };
+
+        // Flip the last body digit: still base-36 and right length, but the
+        // checksum no longer matches, so it is rejected.
+        let last = good.len() - 1;
+        let flipped = with_char_at(last, if good.ends_with('8') { '9' } else { '8' });
+        assert!(AccountId::from_str(&flipped).is_err(), "bad checksum");
+
+        // Structurally malformed inputs are all rejected.
+        assert!(AccountId::from_str("").is_err(), "empty");
+        assert!(AccountId::from_str("not-a-code").is_err(), "junk");
+        assert!(AccountId::from_str(&good[..27]).is_err(), "too short");
+        assert!(
+            AccountId::from_str(&format!("{good}0")).is_err(),
+            "too long"
+        );
+        // A check digit that is not a digit.
+        assert!(
+            AccountId::from_str(&with_char_at(0, 'A')).is_err(),
+            "alpha check"
+        );
+        // A non-base-36 character in the body (survives space/dash stripping).
+        assert!(
+            AccountId::from_str(&with_char_at(5, '*')).is_err(),
+            "non-base36 body"
+        );
     }
 }

@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read them back (latest version of each).
     println!("accounts:");
     let mut accounts = ledger.list_accounts().await?;
-    accounts.sort_by_key(|a| a.id.0);
+    accounts.sort_by_key(|a| (a.id.id, a.id.sub));
     for a in &accounts {
         println!("  {:?}  policy={:?}  v{}", a.id, a.policy, a.version);
     }

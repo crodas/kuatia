@@ -8,11 +8,12 @@
   </thead>
   <tbody>
     {% for a in accounts %}
-    <tr onclick="window.location='/accounts/{{ a.id }}'">
+    <tr onclick="window.location='{{ a.link }}'">
       <td>
         <div class="acct-name">{{ a.name }}</div>
         <div class="acct-id">
-          #{{ a.id }}
+          {{ a.display_id }}
+          {% if a.sub %}<span class="flag sub">subaccount</span>{% endif %}
           {% if a.frozen %}<span class="flag frozen">frozen</span>{% endif %}
           {% if a.closed %}<span class="flag closed">closed</span>{% endif %}
         </div>

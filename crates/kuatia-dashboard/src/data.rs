@@ -41,6 +41,10 @@ pub struct BalanceDto {
 #[derive(Serialize)]
 pub struct AccountDto {
     pub id: AccountId,
+    /// IBAN-style account code (machine format, checksum-valid) for the full id.
+    pub code: String,
+    /// Subaccount id (`0` is the main account). Mirrors `id.sub` for templates.
+    pub sub: i64,
     pub label: Option<&'static str>,
     pub version: u64,
     pub policy: PolicyDto,
@@ -108,6 +112,10 @@ pub struct OverviewDto {
 #[derive(Serialize)]
 pub struct AccountDetailDto {
     pub account: AccountDto,
+    /// The non-closed subaccounts sharing this account's base id (the viewed
+    /// account included), so a base account and its subaccounts are navigable
+    /// together while never summed.
+    pub subaccounts: Vec<AccountDto>,
     pub postings: Vec<PostingDto>,
     pub transfers: Vec<TransferDto>,
 }
@@ -163,6 +171,8 @@ async fn account_dto(state: &AppState, account: &Account) -> Result<AccountDto, 
     }
     Ok(AccountDto {
         id: account.id,
+        code: account.id.to_string(),
+        sub: account.id.sub,
         label: account_label(account.id),
         version: account.version,
         policy: policy_dto(&account.policy),
@@ -260,7 +270,7 @@ pub async fn overview(state: &AppState) -> Result<OverviewDto, ApiError> {
 /// Every account (sorted by id) with its balances.
 pub async fn accounts(state: &AppState) -> Result<Vec<AccountDto>, ApiError> {
     let mut accounts = state.ledger.list_accounts().await?;
-    accounts.sort_by_key(|a| a.id.0);
+    accounts.sort_by_key(|a| (a.id.id, a.id.sub));
     let mut out = Vec::with_capacity(accounts.len());
     for account in &accounts {
         out.push(account_dto(state, account).await?);
@@ -296,8 +306,17 @@ pub async fn account_detail(state: &AppState, id: AccountId) -> Result<AccountDe
         .map(transfer_dto)
         .collect();
 
+    // The base account and its non-closed subaccounts, so the detail page can
+    // list every partition with its own (segregated) balances.
+    let mut subaccounts = Vec::new();
+    for sub_id in state.ledger.list_subaccounts(&id).await? {
+        let sub_account = state.ledger.get_account(&sub_id).await?;
+        subaccounts.push(account_dto(state, &sub_account).await?);
+    }
+
     Ok(AccountDetailDto {
         account: account_dto(state, &account).await?,
+        subaccounts,
         postings,
         transfers,
     })
@@ -343,6 +362,15 @@ impl ApiError {
     /// Build a 500 from any displayable error (used by the HTML render path).
     pub fn from_display(err: impl std::fmt::Display) -> Self {
         Self::internal(err.to_string())
+    }
+
+    /// Build a 400 from a displayable error (used for a malformed account id in
+    /// the URL).
+    pub fn bad_request(err: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: err.to_string(),
+        }
     }
 }
 

@@ -63,6 +63,16 @@ struct PendingSaga {
     phase: SagaPhase,
 }
 
+/// A single subaccount's balance for one asset. Balances are always reported
+/// per subaccount and never summed across them (ADR-0012).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SubAccountBalance {
+    /// The subaccount this balance belongs to.
+    pub account: AccountId,
+    /// The balance of `account` for the queried asset.
+    pub value: Cent,
+}
+
 /// Async ledger resource composing the commit pipeline.
 pub struct Ledger {
     store: Arc<dyn Store>,
@@ -189,7 +199,12 @@ impl Ledger {
             }
             let available = self
                 .store
-                .get_postings_by_account(account, Some(asset), Some(PostingStatus::Active))
+                .get_postings_by_account(
+                    account.id,
+                    Some(account.sub),
+                    Some(asset),
+                    Some(PostingStatus::Active),
+                )
                 .await?;
             let total_positive = Cent::checked_sum(
                 available
@@ -653,7 +668,7 @@ impl Ledger {
     ) -> Result<Cent, LedgerError> {
         let postings = self
             .store
-            .get_postings_by_account(account, Some(asset), None)
+            .get_postings_by_account(account.id, Some(account.sub), Some(asset), None)
             .await?;
         Ok(Cent::checked_sum(
             postings
@@ -741,7 +756,7 @@ impl Ledger {
         // (or none) permit a close.
         let blocking = self
             .store
-            .get_postings_by_account(id, None, None)
+            .get_postings_by_account(id.id, Some(id.sub), None, None)
             .await?
             .into_iter()
             .any(|p| p.status != PostingStatus::Inactive);
@@ -763,10 +778,62 @@ impl Ledger {
         Ok(())
     }
 
-    /// Query the current balance of an account for a given asset.
+    /// Query the current balance of one subaccount for a given asset. This reads
+    /// exactly the `account` passed (base id and subaccount) and never rolls up
+    /// other subaccounts.
     #[instrument(skip(self), name = "ledger.balance")]
     pub async fn balance(&self, account: &AccountId, asset: &AssetId) -> Result<Cent, LedgerError> {
         self.compute_balance(account, asset).await
+    }
+
+    /// Report the per-subaccount balances of a base account for one asset.
+    ///
+    /// One entry per non-closed subaccount. `sub == None` spans every
+    /// subaccount of `account`'s base id; `Some(s)` restricts to that one.
+    /// Balances are never summed across subaccounts (ADR-0012).
+    #[instrument(skip(self), name = "ledger.balances")]
+    pub async fn balances(
+        &self,
+        account: &AccountId,
+        asset: &AssetId,
+        sub: Option<i64>,
+    ) -> Result<Vec<SubAccountBalance>, LedgerError> {
+        let mut result = Vec::new();
+        for subaccount in self.list_subaccounts(account).await? {
+            if let Some(s) = sub
+                && subaccount.sub != s
+            {
+                continue;
+            }
+            let value = self.compute_balance(&subaccount, asset).await?;
+            result.push(SubAccountBalance {
+                account: subaccount,
+                value,
+            });
+        }
+        Ok(result)
+    }
+
+    /// List the non-closed subaccounts of a base account.
+    ///
+    /// This scans every account row and filters in memory, so it pays for
+    /// subaccounts that were created and later closed (ADR-0012).
+    #[instrument(skip(self), name = "ledger.list_subaccounts")]
+    pub async fn list_subaccounts(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<AccountId>, LedgerError> {
+        let base = account.id;
+        let mut subs: Vec<AccountId> = self
+            .store
+            .list_accounts()
+            .await?
+            .into_iter()
+            .filter(|a| a.id.id == base && !a.is_closed())
+            .map(|a| a.id)
+            .collect();
+        subs.sort();
+        Ok(subs)
     }
 
     // -----------------------------------------------------------------------
@@ -786,12 +853,15 @@ impl Ledger {
             .map_err(|_| LedgerError::AccountNotFound(*id))
     }
 
-    /// Return all transfers involving the given account.
+    /// Return all transfers involving the given account (exact subaccount).
     pub async fn history(
         &self,
         account: &AccountId,
     ) -> Result<Vec<crate::store::EnvelopeRecord>, LedgerError> {
-        Ok(self.store.get_transfers_for_account(account).await?)
+        Ok(self
+            .store
+            .get_transfers_for_account(account.id, Some(account.sub))
+            .await?)
     }
 
     /// Query transfers with filtering and pagination.
@@ -809,7 +879,7 @@ impl Ledger {
     ) -> Result<Vec<kuatia_core::Posting>, LedgerError> {
         Ok(self
             .store
-            .get_postings_by_account(account, None, None)
+            .get_postings_by_account(account.id, Some(account.sub), None, None)
             .await?)
     }
 
@@ -1154,11 +1224,7 @@ mod recovery_tests {
         );
         let active = ledger
             .store()
-            .get_postings_by_account(
-                &AccountId::new(1),
-                Some(&AssetId::new(1)),
-                Some(PostingStatus::Active),
-            )
+            .get_postings_by_account(1, None, Some(&AssetId::new(1)), Some(PostingStatus::Active))
             .await
             .unwrap();
         assert_eq!(active.len(), 1); // back to Active
