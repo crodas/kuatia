@@ -80,12 +80,12 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(overview_page))
         .route("/accounts", get(accounts_page))
-        .route("/accounts/{id}", get(account_page))
+        .route("/accounts/{uuid}", get(account_page))
         .route("/transfers", get(transfers_page))
         .route("/events", get(events_page))
         .route("/ui/overview", get(overview_partial))
         .route("/ui/accounts", get(accounts_partial))
-        .route("/ui/accounts/{id}", get(account_partial))
+        .route("/ui/accounts/{uuid}", get(account_partial))
         .route("/ui/transfers", get(transfers_partial))
         .route("/ui/events", get(events_partial))
         .route("/static/dashboard.css", get(css))
@@ -111,7 +111,15 @@ struct BalanceView {
 
 #[derive(Serialize)]
 struct AccountView {
+    /// Base account id (used only for the route; the display uses `display_id`).
     id: i64,
+    sub: i64,
+    /// `"5"` for a main account, `"5.7"` for subaccount 7 of base 5.
+    display_id: String,
+    /// Full-page detail link (`/accounts/5` or `/accounts/5/7`).
+    link: String,
+    /// htmx partial link (`/ui/accounts/5` or `/ui/accounts/5/7`).
+    ui_link: String,
     name: String,
     version: u64,
     policy_kind: &'static str,
@@ -149,7 +157,8 @@ struct TransferView {
 struct EventView {
     seq: u64,
     kind: &'static str,
-    account: Option<i64>,
+    /// Account display id (`"5"` or `"5.7"`), if the event names an account.
+    account: Option<String>,
     transfer_short: Option<String>,
     time: String,
 }
@@ -262,14 +271,31 @@ fn floor_style(assets: &[AssetMeta]) -> (u8, &str) {
 // View builders — DTO -> view model.
 // ---------------------------------------------------------------------------
 
+/// Display an account id as its IBAN-style code in grouped (spaced) format.
+fn acct_display(id: kuatia_core::AccountId) -> String {
+    id.to_grouped()
+}
+
+/// The detail route path for an account, keyed by the machine-format code:
+/// `/accounts/<code>`.
+fn acct_link(id: kuatia_core::AccountId) -> String {
+    format!("/accounts/{id}")
+}
+
 fn account_view(dto: &AccountDto, assets: &[AssetMeta]) -> AccountView {
     let (floor_dec, floor_sym) = floor_style(assets);
+    let display_id = acct_display(dto.id);
+    let link = acct_link(dto.id);
     AccountView {
-        id: dto.id.0,
+        id: dto.id.id,
+        sub: dto.sub,
+        ui_link: format!("/ui{link}"),
+        link,
         name: dto
             .label
             .map(String::from)
-            .unwrap_or_else(|| format!("#{}", dto.id.0)),
+            .unwrap_or_else(|| display_id.clone()),
+        display_id,
         version: dto.version,
         policy_kind: dto.policy.kind,
         floor: dto.policy.floor.map(|f| fmt(f, floor_dec, floor_sym)),
@@ -301,11 +327,11 @@ fn transfer_view(dto: &TransferDto, assets: &[AssetMeta]) -> TransferView {
                 to_name: leg
                     .label
                     .map(String::from)
-                    .unwrap_or_else(|| format!("#{}", leg.owner.0)),
+                    .unwrap_or_else(|| acct_display(leg.owner)),
                 from_name: leg.payer.map(|p| {
                     leg.payer_label
                         .map(String::from)
-                        .unwrap_or_else(|| format!("#{}", p.0))
+                        .unwrap_or_else(|| acct_display(p))
                 }),
                 is_change: leg.payer.is_none(),
                 money: fmt_asset(leg.value, asset_of(assets, leg.asset)),
@@ -326,7 +352,7 @@ fn event_view(dto: &EventDto) -> EventView {
     EventView {
         seq: dto.seq,
         kind: dto.kind,
-        account: dto.account.map(|a| a.0),
+        account: dto.account.map(acct_display),
         transfer_short: dto.transfer.as_deref().map(short_hex),
         time: fmt_millis(dto.timestamp),
     }
@@ -371,11 +397,18 @@ async fn accounts_ctx(state: &AppState) -> Result<Context, ApiError> {
     Ok(ctx)
 }
 
-async fn account_ctx(state: &AppState, id: i64) -> Result<Context, ApiError> {
-    let dto = data::account_detail(state, kuatia_core::AccountId::new(id)).await?;
+async fn account_ctx(state: &AppState, id: kuatia_core::AccountId) -> Result<Context, ApiError> {
+    let dto = data::account_detail(state, id).await?;
     let mut ctx = Context::new();
     ctx.insert("nav", "accounts");
     ctx.insert("account", &account_view(&dto.account, &state.assets));
+    ctx.insert(
+        "subaccounts",
+        &dto.subaccounts
+            .iter()
+            .map(|a| account_view(a, &state.assets))
+            .collect::<Vec<_>>(),
+    );
     ctx.insert(
         "postings",
         &dto.postings
@@ -451,22 +484,24 @@ async fn accounts_partial(State(state): State<AppState>) -> Result<Html<String>,
 
 async fn account_page(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(uuid): Path<String>,
 ) -> Result<Html<String>, ApiError> {
+    let account = uuid.parse().map_err(ApiError::bad_request)?;
     render(
         &state,
         "pages/account.html",
-        &account_ctx(&state, id).await?,
+        &account_ctx(&state, account).await?,
     )
 }
 async fn account_partial(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(uuid): Path<String>,
 ) -> Result<Html<String>, ApiError> {
+    let account = uuid.parse().map_err(ApiError::bad_request)?;
     render(
         &state,
         "partials/account.html",
-        &account_ctx(&state, id).await?,
+        &account_ctx(&state, account).await?,
     )
 }
 

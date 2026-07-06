@@ -25,7 +25,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assets", get(assets))
         .route("/overview", get(overview))
         .route("/accounts", get(accounts))
-        .route("/accounts/{id}", get(account_detail))
+        .route("/accounts/{uuid}", get(account_detail))
         .route("/transfers", get(transfers))
         .route("/events", get(events))
         .with_state(state)
@@ -45,11 +45,10 @@ async fn accounts(State(state): State<AppState>) -> Result<Json<Vec<AccountDto>>
 
 async fn account_detail(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(uuid): Path<String>,
 ) -> Result<Json<AccountDetailDto>, ApiError> {
-    Ok(Json(
-        crate::data::account_detail(&state, AccountId::new(id)).await?,
-    ))
+    let id: AccountId = uuid.parse().map_err(ApiError::bad_request)?;
+    Ok(Json(crate::data::account_detail(&state, id).await?))
 }
 
 #[derive(Deserialize)]

@@ -230,6 +230,7 @@ table.grid tbody tr:hover {
 
 .flag.frozen { background: #2b3f57; color: #7fb3ff; }
 .flag.closed { background: #4a2a2a; color: #e8736b; }
+.flag.sub { background: #2f3a2b; color: #a6cf7f; }
 
 .status.Active { color: var(--pos); }
 .status.PendingInactive { color: #e0b25a; }

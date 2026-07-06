@@ -50,6 +50,12 @@ struct Cli {
     /// an already-populated database.
     #[arg(long, env = "KUATIA_DASHBOARD_SEED", default_value_t = false)]
     seed: bool,
+
+    /// Seed keying the account-code obfuscation. Must be stable across a
+    /// deployment: changing it changes every rendered account code. Defaults to
+    /// the built-in `DEFAULT_ID_SEED`.
+    #[arg(long, env = "KUATIA_ID_SEED")]
+    id_seed: Option<u64>,
 }
 
 #[tokio::main]
@@ -62,6 +68,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+
+    // Set the account-code obfuscation seed before any code is rendered.
+    if let Some(seed) = cli.id_seed {
+        kuatia_core::set_id_seed(seed);
+    }
 
     let ledger = seed::connect(&cli.db).await?;
     tracing::info!("connected to ledger at {}", cli.db);

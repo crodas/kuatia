@@ -31,6 +31,29 @@ the sum of non-inactive postings for a given (account, asset) pair.
 Accounts have a **policy** (balance floor rule), **flags** (lifecycle +
 user-defined), and a **book** assignment.
 
+An account is identified by `AccountId { id: i64, sub: i64 }`: a base `id` plus a
+**subaccount**. `sub = 0` is the main account; a non-zero `sub` is a subaccount
+of the same base id, and each `(id, sub)` is a full account record with its own
+policy and lifecycle. Balances are reported per subaccount and never summed
+across them. See the Subaccount entry and
+[adr/0012-subaccounts.md](adr/0012-subaccounts.md).
+
+### Subaccount
+
+A partition of one owner's holdings under a shared base id. `AccountId::with_sub(id,
+sub)` names one; `AccountId::base()` returns the main account of an id. A base
+account does not roll up its subaccounts, so several independent balances live
+under one owner, each individually addressable, drained, and closed. Aggregate
+reads take a base `id` plus an optional subaccount filter; exact entity
+operations take the full `AccountId`.
+
+`AccountId` also has an IBAN-style string view via `Display` / `FromStr`: two
+mod-97 check digits + a base-36 body of the two legs (no country code), e.g.
+`9200000000000050000000000007` for `{ id: 5, sub: 7 }` (grouped:
+`9200 0000 0000 0050 0000 0000 07`). Parsing validates the checksum, rejecting
+mistyped ids. It is a presentation/routing form (the dashboard URLs); storage
+keeps the two `i64` legs.
+
 ### Asset
 
 An identifier (`AssetId(u32)`) representing a unit of value: a currency, a
