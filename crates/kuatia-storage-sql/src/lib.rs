@@ -11,6 +11,7 @@
 //! ```
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use async_trait::async_trait;
 use sqlx::{Any, Pool, Row};
@@ -20,10 +21,22 @@ use kuatia_storage::events::{EventStore, LedgerEvent};
 use kuatia_storage::store::*;
 use kuatia_types::*;
 
+// Cached backend kind for `SqlStore::backend`.
+const BACKEND_UNKNOWN: u8 = 0;
+const BACKEND_POSTGRES: u8 = 1;
+const BACKEND_SQLITE: u8 = 2;
+
+/// Row-locking clause appended to a `SELECT` on backends that support it
+/// (PostgreSQL). SQLite has no `FOR UPDATE` and serializes writers itself, so it
+/// gets an empty clause.
+const FOR_UPDATE: &str = " FOR UPDATE";
+
 /// SQL-backed [`Store`] implementation.
 pub struct SqlStore {
     pool: Pool<Any>,
     autoid: kuatia_types::autoid::AutoId,
+    /// Detected backend kind (lazily probed): one of `BACKEND_*`.
+    backend: AtomicU8,
 }
 
 impl SqlStore {
@@ -32,7 +45,41 @@ impl SqlStore {
         Self {
             pool,
             autoid: kuatia_types::autoid::AutoId::new(),
+            backend: AtomicU8::new(BACKEND_UNKNOWN),
         }
+    }
+
+    /// Whether the backend is PostgreSQL. Probed once and cached: `SELECT
+    /// sqlite_version()` succeeds only on SQLite, so a failure means Postgres.
+    async fn is_postgres(&self) -> Result<bool, StoreError> {
+        match self.backend.load(Ordering::Relaxed) {
+            BACKEND_POSTGRES => return Ok(true),
+            BACKEND_SQLITE => return Ok(false),
+            _ => {}
+        }
+        let is_sqlite = sqlx::query("SELECT sqlite_version()")
+            .fetch_optional(&self.pool)
+            .await
+            .is_ok();
+        self.backend.store(
+            if is_sqlite {
+                BACKEND_SQLITE
+            } else {
+                BACKEND_POSTGRES
+            },
+            Ordering::Relaxed,
+        );
+        Ok(!is_sqlite)
+    }
+
+    /// The row-locking clause for the current backend: [`FOR_UPDATE`] on
+    /// Postgres, empty on SQLite.
+    async fn lock_clause(&self) -> Result<&'static str, StoreError> {
+        Ok(if self.is_postgres().await? {
+            FOR_UPDATE
+        } else {
+            ""
+        })
     }
 
     /// Run database migrations. Idempotent: a `_migrations` ledger records what
@@ -47,7 +94,13 @@ impl SqlStore {
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
 
-        let migrations: &[(&str, &str)] = &[("001_init", include_str!("migrations/001_init.sql"))];
+        let migrations: &[(&str, &str)] = &[
+            ("001_init", include_str!("migrations/001_init.sql")),
+            (
+                "002_subaccounts",
+                include_str!("migrations/002_subaccounts.sql"),
+            ),
+        ];
 
         for (name, sql) in migrations {
             let applied = sqlx::query("SELECT 1 FROM _migrations WHERE name = $1")
@@ -160,6 +213,9 @@ fn row_to_account(row: &sqlx::any::AnyRow) -> Result<Account, StoreError> {
     let id: i64 = row
         .try_get("id")
         .map_err(|e| StoreError::Internal(e.to_string()))?;
+    let subaccount: i64 = row
+        .try_get("subaccount")
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
     let version: i64 = row
         .try_get("version")
         .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -180,7 +236,7 @@ fn row_to_account(row: &sqlx::any::AnyRow) -> Result<Account, StoreError> {
         .map_err(|e| StoreError::Internal(e.to_string()))?;
 
     Ok(Account {
-        id: AccountId::new(id),
+        id: AccountId::with_sub(id, subaccount),
         version: version as u64,
         policy: deserialize_policy(&policy_str)?,
         flags: AccountFlags::from_bits_truncate(flags_bits as u32),
@@ -199,6 +255,9 @@ fn row_to_posting(row: &sqlx::any::AnyRow) -> Result<Posting, StoreError> {
         .map_err(|e| StoreError::Internal(e.to_string()))?;
     let owner: i64 = row
         .try_get("owner")
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+    let subaccount: i64 = row
+        .try_get("subaccount")
         .map_err(|e| StoreError::Internal(e.to_string()))?;
     let asset: i32 = row
         .try_get("asset")
@@ -219,7 +278,7 @@ fn row_to_posting(row: &sqlx::any::AnyRow) -> Result<Posting, StoreError> {
             transfer: envelope_id_from_hex(&transfer_id)?,
             index: idx as u16,
         },
-        owner: AccountId::new(owner),
+        owner: AccountId::with_sub(owner, subaccount),
         asset: AssetId::new(asset as u32),
         value,
         status: status_from_i16(status)?,
@@ -234,12 +293,15 @@ fn row_to_posting(row: &sqlx::any::AnyRow) -> Result<Posting, StoreError> {
 #[async_trait]
 impl AccountStore for SqlStore {
     async fn get_account(&self, id: &AccountId) -> Result<Account, StoreError> {
-        let row = sqlx::query("SELECT * FROM accounts WHERE id = $1 ORDER BY version DESC LIMIT 1")
-            .bind(id.0)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?
-            .ok_or_else(|| StoreError::NotFound(format!("account {id:?}")))?;
+        let row = sqlx::query(
+            "SELECT * FROM accounts WHERE id = $1 AND subaccount = $2 ORDER BY version DESC LIMIT 1",
+        )
+        .bind(id.id)
+        .bind(id.sub)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?
+        .ok_or_else(|| StoreError::NotFound(format!("account {id:?}")))?;
         row_to_account(&row)
     }
 
@@ -252,42 +314,82 @@ impl AccountStore for SqlStore {
     }
 
     async fn create_account(&self, account: Account) -> Result<(), StoreError> {
-        let exists = sqlx::query("SELECT 1 FROM accounts WHERE id = $1 LIMIT 1")
-            .bind(account.id.0)
-            .fetch_optional(&self.pool)
+        // Pessimistic locking: inside one transaction, lock any existing row for
+        // this account with `SELECT ... FOR UPDATE` so a concurrent creator
+        // waits, then insert. `ON CONFLICT DO NOTHING` is the portable backstop
+        // (SQLite has no `FOR UPDATE`, and it turns a concurrent double-insert
+        // into a clean affected-row count instead of a unique violation).
+        let lock = self.lock_clause().await?;
+        let mut tx = self
+            .pool
+            .begin()
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
-        if exists.is_some() {
+
+        let existing = sqlx::query(&format!(
+            "SELECT 1 FROM accounts WHERE id = $1 AND subaccount = $2 LIMIT 1{lock}"
+        ))
+        .bind(account.id.id)
+        .bind(account.id.sub)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        if existing.is_some() {
             return Err(StoreError::AlreadyExists(format!(
                 "account {:?}",
                 account.id
             )));
         }
 
-        sqlx::query(
-            "INSERT INTO accounts (id, version, policy, flags, book, user_data, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7)"
+        let res = sqlx::query(
+            "INSERT INTO accounts (id, subaccount, version, policy, flags, book, user_data, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id, subaccount, version) DO NOTHING"
         )
-            .bind(account.id.0)
+            .bind(account.id.id)
+            .bind(account.id.sub)
             .bind(account.version as i64)
             .bind(serialize_policy(&account.policy)?)
             .bind(account.flags.bits() as i32)
             .bind(account.book.0)
             .bind(serialize_json(&account.user_data)?)
             .bind(serialize_json(&account.metadata)?)
-            .execute(&self.pool)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::AlreadyExists(format!(
+                "account {:?}",
+                account.id
+            )));
+        }
+
+        tx.commit()
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         Ok(())
     }
 
     async fn append_account_version(&self, account: Account) -> Result<(), StoreError> {
-        let current =
-            sqlx::query("SELECT version FROM accounts WHERE id = $1 ORDER BY version DESC LIMIT 1")
-                .bind(account.id.0)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| StoreError::Internal(e.to_string()))?
-                .ok_or_else(|| StoreError::NotFound(format!("account {:?}", account.id)))?;
+        // Pessimistic locking: inside one transaction, lock the account's latest
+        // version row with `SELECT ... FOR UPDATE` so a concurrent appender waits
+        // here until we commit, then check the version and insert. `ON CONFLICT`
+        // is the portable backstop (SQLite has no `FOR UPDATE`, and it covers the
+        // append phantom-insert a row lock does not).
+        let lock = self.lock_clause().await?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        let current = sqlx::query(&format!(
+            "SELECT version FROM accounts WHERE id = $1 AND subaccount = $2 ORDER BY version DESC LIMIT 1{lock}"
+        ))
+        .bind(account.id.id)
+        .bind(account.id.sub)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?
+        .ok_or_else(|| StoreError::NotFound(format!("account {:?}", account.id)))?;
 
         let current_version: i64 = current
             .try_get("version")
@@ -304,28 +406,43 @@ impl AccountStore for SqlStore {
             });
         }
 
-        sqlx::query(
-            "INSERT INTO accounts (id, version, policy, flags, book, user_data, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7)"
+        let res = sqlx::query(
+            "INSERT INTO accounts (id, subaccount, version, policy, flags, book, user_data, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id, subaccount, version) DO NOTHING"
         )
-            .bind(account.id.0)
+            .bind(account.id.id)
+            .bind(account.id.sub)
             .bind(account.version as i64)
             .bind(serialize_policy(&account.policy)?)
             .bind(account.flags.bits() as i32)
             .bind(account.book.0)
             .bind(serialize_json(&account.user_data)?)
             .bind(serialize_json(&account.metadata)?)
-            .execute(&self.pool)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::VersionConflict {
+                account: account.id,
+                expected: expected as u64,
+                actual: account.version,
+            });
+        }
+
+        tx.commit()
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         Ok(())
     }
 
     async fn get_account_history(&self, id: &AccountId) -> Result<Vec<Account>, StoreError> {
-        let rows = sqlx::query("SELECT * FROM accounts WHERE id = $1 ORDER BY version ASC")
-            .bind(id.0)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let rows = sqlx::query(
+            "SELECT * FROM accounts WHERE id = $1 AND subaccount = $2 ORDER BY version ASC",
+        )
+        .bind(id.id)
+        .bind(id.sub)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
         if rows.is_empty() {
             return Err(StoreError::NotFound(format!("account {id:?}")));
         }
@@ -333,7 +450,7 @@ impl AccountStore for SqlStore {
     }
 
     async fn list_accounts(&self) -> Result<Vec<Account>, StoreError> {
-        let rows = sqlx::query("SELECT * FROM accounts ORDER BY id, version DESC")
+        let rows = sqlx::query("SELECT * FROM accounts ORDER BY id, subaccount, version DESC")
             .fetch_all(&self.pool)
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -367,44 +484,43 @@ impl PostingStore for SqlStore {
 
     async fn get_postings_by_account(
         &self,
-        account: &AccountId,
+        id: i64,
+        sub: Option<i64>,
         asset: Option<&AssetId>,
         status: Option<PostingStatus>,
     ) -> Result<Vec<Posting>, StoreError> {
-        let rows = match (asset, status) {
-            (Some(a), Some(s)) => {
-                sqlx::query(
-                    "SELECT * FROM postings WHERE owner = $1 AND asset = $2 AND status = $3",
-                )
-                .bind(account.0)
-                .bind(a.0 as i32)
-                .bind(status_to_i16(s))
-                .fetch_all(&self.pool)
-                .await
-            }
-            (Some(a), None) => {
-                sqlx::query("SELECT * FROM postings WHERE owner = $1 AND asset = $2")
-                    .bind(account.0)
-                    .bind(a.0 as i32)
-                    .fetch_all(&self.pool)
-                    .await
-            }
-            (None, Some(s)) => {
-                sqlx::query("SELECT * FROM postings WHERE owner = $1 AND status = $2")
-                    .bind(account.0)
-                    .bind(status_to_i16(s))
-                    .fetch_all(&self.pool)
-                    .await
-            }
-            (None, None) => {
-                sqlx::query("SELECT * FROM postings WHERE owner = $1")
-                    .bind(account.0)
-                    .fetch_all(&self.pool)
-                    .await
-            }
+        // Build the predicate dynamically: `sub == None` spans every subaccount
+        // of `id`, `Some(s)` restricts to one. The subaccount is compared only
+        // for equality, never as a magnitude.
+        let mut sql = String::from("SELECT * FROM postings WHERE owner = $1");
+        let mut placeholder = 2u32;
+        if sub.is_some() {
+            sql.push_str(&format!(" AND subaccount = ${placeholder}"));
+            placeholder += 1;
         }
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        if asset.is_some() {
+            sql.push_str(&format!(" AND asset = ${placeholder}"));
+            placeholder += 1;
+        }
+        if status.is_some() {
+            sql.push_str(&format!(" AND status = ${placeholder}"));
+        }
 
+        let mut q = sqlx::query(&sql).bind(id);
+        if let Some(s) = sub {
+            q = q.bind(s);
+        }
+        if let Some(a) = asset {
+            q = q.bind(a.0 as i32);
+        }
+        if let Some(s) = status {
+            q = q.bind(status_to_i16(s));
+        }
+
+        let rows = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
         rows.iter().map(row_to_posting).collect()
     }
 
@@ -412,6 +528,10 @@ impl PostingStore for SqlStore {
         let (where_clause, count_clause) = {
             let mut w = String::from("WHERE owner = $1");
             let mut idx = 2u32;
+            if query.sub.is_some() {
+                w.push_str(&format!(" AND subaccount = ${idx}"));
+                idx += 1;
+            }
             if query.asset.is_some() {
                 w.push_str(&format!(" AND asset = ${idx}"));
                 idx += 1;
@@ -427,7 +547,10 @@ impl PostingStore for SqlStore {
         };
 
         // Build count query
-        let mut count_q = sqlx::query(&count_clause).bind(query.account.0);
+        let mut count_q = sqlx::query(&count_clause).bind(query.account);
+        if let Some(s) = query.sub {
+            count_q = count_q.bind(s);
+        }
         if let Some(ref a) = query.asset {
             count_q = count_q.bind(a.0 as i32);
         }
@@ -443,7 +566,10 @@ impl PostingStore for SqlStore {
             .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         // Build data query
-        let mut data_q = sqlx::query(&where_clause).bind(query.account.0);
+        let mut data_q = sqlx::query(&where_clause).bind(query.account);
+        if let Some(s) = query.sub {
+            data_q = data_q.bind(s);
+        }
         if let Some(ref a) = query.asset {
             data_q = data_q.bind(a.0 as i32);
         }
@@ -583,11 +709,12 @@ impl PostingStore for SqlStore {
         let mut inserted: u64 = 0;
         for posting in postings {
             let res = sqlx::query(
-                "INSERT INTO postings (transfer_id, idx, owner, asset, value, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (transfer_id, idx) DO NOTHING"
+                "INSERT INTO postings (transfer_id, idx, owner, subaccount, asset, value, status) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (transfer_id, idx) DO NOTHING"
             )
                 .bind(envelope_id_to_hex(&posting.id.transfer))
                 .bind(posting.id.index as i16)
-                .bind(posting.owner.0)
+                .bind(posting.owner.id)
+                .bind(posting.owner.sub)
                 .bind(posting.asset.0 as i32)
                 .bind(posting.value.to_string())
                 .bind(status_to_i16(posting.status))
@@ -667,9 +794,10 @@ impl TransferStore for SqlStore {
         // Index every involved account (caller supplies the set; storage does no
         // computation). Idempotent so a replay is harmless.
         for account in involved {
-            sqlx::query("INSERT INTO transfer_accounts (transfer_id, account_id) VALUES ($1, $2) ON CONFLICT (transfer_id, account_id) DO NOTHING")
+            sqlx::query("INSERT INTO transfer_accounts (transfer_id, account_id, subaccount) VALUES ($1, $2, $3) ON CONFLICT (transfer_id, account_id, subaccount) DO NOTHING")
                 .bind(&tid_hex)
-                .bind(account.0)
+                .bind(account.id)
+                .bind(account.sub)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -683,12 +811,24 @@ impl TransferStore for SqlStore {
 
     async fn get_transfers_for_account(
         &self,
-        account: &AccountId,
+        id: i64,
+        sub: Option<i64>,
     ) -> Result<Vec<EnvelopeRecord>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT t.id, t.transfer, t.receipt, t.created_at FROM transfers t INNER JOIN transfer_accounts ta ON t.id = ta.transfer_id WHERE ta.account_id = $1 ORDER BY t.created_at"
-        )
-            .bind(account.0)
+        // `sub == None` spans every subaccount of `id`; `Some(s)` restricts to
+        // one. The subaccount is matched only for equality.
+        let mut sql = String::from(
+            "SELECT t.id, t.transfer, t.receipt, t.created_at FROM transfers t INNER JOIN transfer_accounts ta ON t.id = ta.transfer_id WHERE ta.account_id = $1",
+        );
+        if sub.is_some() {
+            sql.push_str(" AND ta.subaccount = $2");
+        }
+        sql.push_str(" ORDER BY t.created_at");
+
+        let mut q = sqlx::query(&sql).bind(id);
+        if let Some(s) = sub {
+            q = q.bind(s);
+        }
+        let rows = q
             .fetch_all(&self.pool)
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -718,8 +858,8 @@ impl TransferStore for SqlStore {
         query: &TransferQuery,
     ) -> Result<Page<EnvelopeRecord>, StoreError> {
         // Load base records, using the account join when available.
-        let base_records = if let Some(ref account) = query.account {
-            self.get_transfers_for_account(account).await?
+        let base_records = if let Some(account) = query.account {
+            self.get_transfers_for_account(account, query.sub).await?
         } else {
             let rows = sqlx::query(
                 "SELECT transfer, receipt, created_at FROM transfers ORDER BY created_at",
@@ -917,21 +1057,40 @@ impl EventStore for SqlStore {
 #[async_trait]
 impl BookStore for SqlStore {
     async fn create_book(&self, book: Book) -> Result<(), StoreError> {
-        let exists = sqlx::query("SELECT 1 FROM books WHERE id = $1 LIMIT 1")
-            .bind(book.id.0)
-            .fetch_optional(&self.pool)
+        // Pessimistic locking, same shape as create_account: lock any existing
+        // book row with `SELECT ... FOR UPDATE` inside the transaction, then
+        // insert with `ON CONFLICT DO NOTHING` as the portable backstop.
+        let lock = self.lock_clause().await?;
+        let data = serialize_json(&book)?;
+        let mut tx = self
+            .pool
+            .begin()
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
-        if exists.is_some() {
+
+        let existing = sqlx::query(&format!("SELECT 1 FROM books WHERE id = $1 LIMIT 1{lock}"))
+            .bind(book.id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        if existing.is_some() {
             return Err(StoreError::AlreadyExists(format!("book {:?}", book.id)));
         }
 
-        let data = serialize_json(&book)?;
-        sqlx::query("INSERT INTO books (id, name, data) VALUES ($1, $2, $3)")
-            .bind(book.id.0)
-            .bind(&book.name)
-            .bind(&data)
-            .execute(&self.pool)
+        let res = sqlx::query(
+            "INSERT INTO books (id, name, data) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(book.id.0)
+        .bind(&book.name)
+        .bind(&data)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::AlreadyExists(format!("book {:?}", book.id)));
+        }
+
+        tx.commit()
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         Ok(())

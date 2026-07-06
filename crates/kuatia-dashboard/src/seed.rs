@@ -14,6 +14,9 @@ use crate::assets::{BTC, EUR, USD};
 pub const TREASURY: AccountId = AccountId::new(1);
 pub const EXTERNAL: AccountId = AccountId::new(99);
 pub const ALICE: AccountId = AccountId::new(100);
+/// A subaccount of Alice: an earmarked savings bucket under the same base id,
+/// with its own balance that is never summed into Alice's main account.
+pub const ALICE_SAVINGS: AccountId = AccountId::with_sub(100, 1);
 pub const BOB: AccountId = AccountId::new(101);
 pub const CAROL: AccountId = AccountId::new(102);
 pub const MERCHANT: AccountId = AccountId::new(103);
@@ -25,6 +28,7 @@ pub fn account_label(id: AccountId) -> Option<&'static str> {
         TREASURY => "Treasury",
         EXTERNAL => "External",
         ALICE => "Alice",
+        ALICE_SAVINGS => "Alice / Savings",
         BOB => "Bob",
         CAROL => "Carol",
         MERCHANT => "Merchant",
@@ -85,6 +89,7 @@ pub async fn populate(ledger: &Arc<Ledger>) -> Result<(), Box<dyn std::error::Er
     create(ledger, TREASURY, AccountPolicy::SystemAccount).await?;
     create(ledger, EXTERNAL, AccountPolicy::ExternalAccount).await?;
     create(ledger, ALICE, AccountPolicy::NoOverdraft).await?;
+    create(ledger, ALICE_SAVINGS, AccountPolicy::NoOverdraft).await?;
     create(ledger, BOB, AccountPolicy::NoOverdraft).await?;
     // Carol may overdraw down to -$500.00.
     create(
@@ -110,6 +115,10 @@ pub async fn populate(ledger: &Arc<Ledger>) -> Result<(), Box<dyn std::error::Er
 
     // Carol spends past her balance, into the capped overdraft.
     pay(ledger, CAROL, MERCHANT, USD, fiat.parse("250.00")?).await?;
+
+    // Alice earmarks part of her balance into her savings subaccount. The two
+    // balances stay segregated under the same base id.
+    pay(ledger, ALICE, ALICE_SAVINGS, USD, fiat.parse("300.00")?).await?;
 
     // Atomic multi-asset trade: Alice buys EUR from Bob with USD.
     let trade = TransferBuilder::new()

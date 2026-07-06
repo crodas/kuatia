@@ -34,8 +34,10 @@ pub struct EnvelopeRecord {
 /// Pagination and filtering parameters for posting queries.
 #[derive(Debug, Clone)]
 pub struct PostingQuery {
-    /// Filter to postings owned by this account.
-    pub account: AccountId,
+    /// Filter to postings owned by this base account.
+    pub account: i64,
+    /// Restrict to one subaccount; `None` spans every subaccount of `account`.
+    pub sub: Option<i64>,
     /// Filter by asset.
     pub asset: Option<AssetId>,
     /// Filter by posting status.
@@ -49,8 +51,10 @@ pub struct PostingQuery {
 /// Pagination and filtering parameters for transfer queries.
 #[derive(Debug, Clone, Default)]
 pub struct TransferQuery {
-    /// Filter to transfers involving this account.
-    pub account: Option<AccountId>,
+    /// Filter to transfers involving this base account.
+    pub account: Option<i64>,
+    /// Restrict to one subaccount; `None` spans every subaccount of `account`.
+    pub sub: Option<i64>,
     /// Inclusive lower bound (unix millis).
     pub from_ts: Option<i64>,
     /// Exclusive upper bound (unix millis).
@@ -98,10 +102,13 @@ pub trait AccountStore: Send + Sync {
 pub trait PostingStore: Send + Sync {
     /// Fetch postings by their ids.
     async fn get_postings(&self, ids: &[PostingId]) -> Result<Vec<Posting>, StoreError>;
-    /// Return postings owned by an account, optionally filtered by asset and/or status.
+    /// Return postings owned by a base account, optionally filtered by
+    /// subaccount, asset, and/or status. `sub == None` spans every subaccount
+    /// of `id`; `sub == Some(s)` restricts to that one subaccount.
     async fn get_postings_by_account(
         &self,
-        account: &AccountId,
+        id: i64,
+        sub: Option<i64>,
         asset: Option<&AssetId>,
         status: Option<PostingStatus>,
     ) -> Result<Vec<Posting>, StoreError>;
@@ -147,7 +154,7 @@ pub trait PostingStore: Send + Sync {
     /// Query postings with filtering and pagination.
     async fn query_postings(&self, query: &PostingQuery) -> Result<Page<Posting>, StoreError> {
         let all = self
-            .get_postings_by_account(&query.account, query.asset.as_ref(), query.status)
+            .get_postings_by_account(query.account, query.sub, query.asset.as_ref(), query.status)
             .await?;
         let total = all.len() as u64;
         let offset = query.offset.unwrap_or(0) as usize;
@@ -172,10 +179,12 @@ pub trait TransferStore: Send + Sync {
         record: EnvelopeRecord,
         involved: &[AccountId],
     ) -> Result<u64, StoreError>;
-    /// Return all transfers involving the given account.
+    /// Return all transfers involving the given base account. `sub == None`
+    /// spans every subaccount of `id`; `sub == Some(s)` restricts to one.
     async fn get_transfers_for_account(
         &self,
-        account: &AccountId,
+        id: i64,
+        sub: Option<i64>,
     ) -> Result<Vec<EnvelopeRecord>, StoreError>;
 
     /// Query transfers with filtering and pagination.
@@ -184,8 +193,8 @@ pub trait TransferStore: Send + Sync {
         query: &TransferQuery,
     ) -> Result<Page<EnvelopeRecord>, StoreError> {
         // Default in-memory implementation
-        let all = if let Some(ref account) = query.account {
-            self.get_transfers_for_account(account).await?
+        let all = if let Some(account) = query.account {
+            self.get_transfers_for_account(account, query.sub).await?
         } else {
             return Err(StoreError::Internal(
                 "query_transfers requires account filter in default implementation".into(),

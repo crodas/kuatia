@@ -22,6 +22,38 @@
 <p class="muted">No balances.</p>
 {% endif %}
 
+{% if subaccounts | length > 1 %}
+<h3>Subaccounts ({{ subaccounts | length }})</h3>
+<table class="grid small">
+  <thead>
+    <tr>
+      <th>Subaccount</th>
+      <th>Policy</th>
+      <th class="right">Balances</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for s in subaccounts %}
+    <tr onclick="window.location='{{ s.link }}'">
+      <td>
+        <div class="acct-id">{{ s.display_id }}{% if s.sub == 0 %} <span class="muted">(main)</span>{% endif %}</div>
+      </td>
+      <td><span class="policy {{ s.policy_kind }}">{{ s.policy_kind }}</span></td>
+      <td class="right">
+        {% if s.balances %}
+          {% for b in s.balances %}
+          <div><span class="money {% if b.money.negative %}neg{% else %}pos{% endif %}">{{ b.money.text }}</span></div>
+          {% endfor %}
+        {% else %}
+          <span class="muted">&mdash;</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
 <h3>Postings ({{ postings | length }})</h3>
 <table class="grid small">
   <thead>

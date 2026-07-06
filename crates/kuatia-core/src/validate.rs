@@ -321,7 +321,9 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
         if !no_account_restriction {
             for aid in &all_account_ids {
                 let account = &input.accounts[aid];
-                let listed = policy.allowed_accounts.contains(aid);
+                // Book membership is scoped by base account: a book that lists a
+                // base account admits all of that account's subaccounts.
+                let listed = policy.allowed_accounts.contains(&aid.base());
                 let flag_match = !policy.allowed_flags.is_empty()
                     && account.flags.intersects(policy.allowed_flags);
                 if !(listed || flag_match) {
@@ -1014,6 +1016,116 @@ mod tests {
         assert_eq!(plan.postings_to_create.len(), 2);
         // account1 projected: 100 - 100 + 40 = 40 >= 0 ✓
         // account2 projected: 0 + 60 = 60 >= 0 ✓
+    }
+
+    fn make_subaccount(id: i64, sub: i64, policy: AccountPolicy) -> Account {
+        Account {
+            id: AccountId::with_sub(id, sub),
+            version: 1,
+            policy,
+            flags: AccountFlags::empty(),
+            book: BookId(0),
+            user_data: UserData::default(),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn subaccount_carries_own_policy() {
+        // Base (1,0) is NoOverdraft but subaccount (1,7) is UncappedOverdraft.
+        // A negative posting on the subaccount is allowed because the check keys
+        // on the full owner and uses the subaccount's own policy.
+        let sub = AccountId::with_sub(1, 7);
+        let envelope = Envelope {
+            consumes: vec![],
+            creates: vec![
+                NewPosting {
+                    owner: AccountId::new(2),
+                    asset: AssetId::new(1),
+                    value: Cent::from(100),
+                    payer: Some(sub),
+                },
+                NewPosting {
+                    owner: sub,
+                    asset: AssetId::new(1),
+                    value: Cent::from(-100),
+                    payer: None,
+                },
+            ],
+            book: BookId(0),
+            user_data: UserData::default(),
+            account_snapshots: vec![],
+            metadata: BTreeMap::new(),
+        };
+        let accounts = accounts_map(vec![
+            make_account(1, AccountPolicy::NoOverdraft),
+            make_subaccount(1, 7, AccountPolicy::UncappedOverdraft),
+            make_account(2, AccountPolicy::NoOverdraft),
+        ]);
+        let balances = HashMap::new();
+        let input = PlanInput {
+            envelope: &envelope,
+            consumed_postings: &[],
+            accounts: &accounts,
+            balances: &balances,
+            book: None,
+        };
+
+        let plan = validate_and_plan(input).unwrap();
+        assert_eq!(plan.postings_to_create.len(), 2);
+    }
+
+    #[test]
+    fn subaccount_floor_is_segregated_from_base() {
+        // Base (1,0) holds 100, but NoOverdraft subaccount (1,7) holds nothing.
+        // The base's balance must not rescue the subaccount: a negative posting
+        // on the subaccount is rejected on its own policy.
+        let sub = AccountId::with_sub(1, 7);
+        let envelope = Envelope {
+            consumes: vec![],
+            creates: vec![
+                NewPosting {
+                    owner: AccountId::new(2),
+                    asset: AssetId::new(1),
+                    value: Cent::from(100),
+                    payer: Some(sub),
+                },
+                NewPosting {
+                    owner: sub,
+                    asset: AssetId::new(1),
+                    value: Cent::from(-100),
+                    payer: None,
+                },
+            ],
+            book: BookId(0),
+            user_data: UserData::default(),
+            account_snapshots: vec![],
+            metadata: BTreeMap::new(),
+        };
+        let accounts = accounts_map(vec![
+            make_account(1, AccountPolicy::NoOverdraft),
+            make_subaccount(1, 7, AccountPolicy::NoOverdraft),
+            make_account(2, AccountPolicy::NoOverdraft),
+        ]);
+        let mut balances = HashMap::new();
+        balances.insert((AccountId::new(1), AssetId::new(1)), Cent::from(100));
+
+        let input = PlanInput {
+            envelope: &envelope,
+            consumed_postings: &[],
+            accounts: &accounts,
+            balances: &balances,
+            book: None,
+        };
+
+        assert_eq!(
+            validate_and_plan(input).unwrap_err(),
+            ValidationError::NegativePostingOnNonSystemAccount {
+                account: sub,
+                asset: AssetId::new(1),
+                value: Cent::from(-100),
+            },
+        );
     }
 
     #[test]

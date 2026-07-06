@@ -147,7 +147,8 @@ impl PostingStore for InMemoryStore {
 
     async fn get_postings_by_account(
         &self,
-        account: &AccountId,
+        id: i64,
+        sub: Option<i64>,
         asset: Option<&AssetId>,
         status: Option<PostingStatus>,
     ) -> Result<Vec<Posting>, StoreError> {
@@ -155,7 +156,8 @@ impl PostingStore for InMemoryStore {
         Ok(postings
             .values()
             .filter(|p| {
-                p.owner == *account
+                p.owner.id == id
+                    && sub.is_none_or(|s| p.owner.sub == s)
                     && asset.is_none_or(|a| p.asset == *a)
                     && status.is_none_or(|s| p.status == s)
             })
@@ -275,12 +277,14 @@ impl TransferStore for InMemoryStore {
 
     async fn get_transfers_for_account(
         &self,
-        account: &AccountId,
+        id: i64,
+        sub: Option<i64>,
     ) -> Result<Vec<EnvelopeRecord>, StoreError> {
         // Acquire postings → transfers in a consistent order to avoid an AB–BA
         // deadlock with any reader that takes both.
         let postings = self.postings.read().await;
         let transfers = self.transfers.read().await;
+        let matches = |owner: &AccountId| owner.id == id && sub.is_none_or(|s| owner.sub == s);
         let mut result: Vec<EnvelopeRecord> = transfers
             .values()
             .filter(|record| {
@@ -288,12 +292,12 @@ impl TransferStore for InMemoryStore {
                     .envelope
                     .creates()
                     .iter()
-                    .any(|np| np.owner == *account)
+                    .any(|np| matches(&np.owner))
                     || record
                         .envelope
                         .consumes()
                         .iter()
-                        .any(|pid| postings.get(pid).is_some_and(|p| p.owner == *account))
+                        .any(|pid| postings.get(pid).is_some_and(|p| matches(&p.owner)))
             })
             .cloned()
             .collect();

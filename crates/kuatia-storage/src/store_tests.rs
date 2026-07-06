@@ -49,6 +49,25 @@ fn make_posting(
     )
 }
 
+fn make_posting_sub(
+    transfer_hash: [u8; 32],
+    index: u16,
+    owner: i64,
+    sub: i64,
+    asset: u32,
+    value: i64,
+) -> Posting {
+    Posting::new(
+        PostingId {
+            transfer: EnvelopeId(transfer_hash),
+            index,
+        },
+        AccountId::with_sub(owner, sub),
+        AssetId::new(asset),
+        Cent::from(value),
+    )
+}
+
 fn make_envelope_with_book(book: BookId) -> (Envelope, EnvelopeId) {
     let t = EnvelopeBuilder::new()
         .creates(vec![
@@ -214,6 +233,34 @@ pub async fn append_version_conflict(store: &(impl Store + 'static)) {
     assert!(matches!(err, StoreError::VersionConflict { .. }));
 }
 
+/// Re-appending an already-taken version is rejected and leaves the history
+/// intact: no gap, no duplicate. Exercises the version guard and the insert
+/// backstop of the locking append.
+pub async fn append_duplicate_version_rejected(store: &(impl Store + 'static)) {
+    let acc = make_account(1, AccountPolicy::NoOverdraft);
+    store.create_account(acc.clone()).await.unwrap();
+
+    let mut v2 = acc.clone();
+    v2.version = 2;
+    v2.flags = AccountFlags::FROZEN;
+    store.append_account_version(v2).await.unwrap();
+
+    // A second append that also targets version 2 (now the current max) must be
+    // rejected rather than duplicating or overwriting it.
+    let mut v2_again = acc.clone();
+    v2_again.version = 2;
+    v2_again.flags = AccountFlags::CLOSED;
+    let err = store.append_account_version(v2_again).await.unwrap_err();
+    assert!(matches!(err, StoreError::VersionConflict { .. }));
+
+    // Exactly one row at version 2, and it is the first (frozen) write.
+    let history = store.get_account_history(&AccountId::new(1)).await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1].version, 2);
+    assert!(history[1].is_frozen());
+    assert!(!history[1].is_closed());
+}
+
 /// Account history returns all versions.
 pub async fn get_account_history(store: &(impl Store + 'static)) {
     let acc = make_account(1, AccountPolicy::NoOverdraft);
@@ -275,23 +322,70 @@ pub async fn get_postings_by_account_filters(store: &(impl Store + 'static)) {
     seed_active(store, 200, &[p1, p2, p3]).await;
 
     let all = store
-        .get_postings_by_account(&AccountId::new(1), None, None)
+        .get_postings_by_account(1, None, None, None)
         .await
         .unwrap();
     assert_eq!(all.len(), 2);
 
     let filtered = store
-        .get_postings_by_account(&AccountId::new(1), Some(&AssetId::new(1)), None)
+        .get_postings_by_account(1, None, Some(&AssetId::new(1)), None)
         .await
         .unwrap();
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].value, Cent::from(100));
 
     let active = store
-        .get_postings_by_account(&AccountId::new(1), None, Some(PostingStatus::Active))
+        .get_postings_by_account(1, None, None, Some(PostingStatus::Active))
         .await
         .unwrap();
     assert_eq!(active.len(), 2);
+}
+
+/// Postings are segregated by subaccount: reading a base id spans every
+/// subaccount, a subaccount filter restricts to one, and no read ever sums
+/// across subaccounts.
+pub async fn get_postings_by_subaccount(store: &(impl Store + 'static)) {
+    // Base account 1 holds three postings across two subaccounts of asset 1.
+    let main = make_posting_sub([7; 32], 0, 1, 0, 1, 100);
+    let sub7a = make_posting_sub([7; 32], 1, 1, 7, 1, 200);
+    let sub7b = make_posting_sub([7; 32], 2, 1, 7, 1, 50);
+    seed_active(store, 0, &[main, sub7a, sub7b]).await;
+
+    // sub = None spans every subaccount of base id 1.
+    let all = store
+        .get_postings_by_account(1, None, Some(&AssetId::new(1)), None)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 3);
+
+    // sub = Some(0) is the main account only.
+    let main_only = store
+        .get_postings_by_account(1, Some(0), Some(&AssetId::new(1)), None)
+        .await
+        .unwrap();
+    assert_eq!(main_only.len(), 1);
+    assert_eq!(main_only[0].value, Cent::from(100));
+    assert_eq!(main_only[0].owner, AccountId::new(1));
+
+    // sub = Some(7) is that subaccount only; its two postings are never folded
+    // into the main account's figure.
+    let sub_only = store
+        .get_postings_by_account(1, Some(7), Some(&AssetId::new(1)), None)
+        .await
+        .unwrap();
+    assert_eq!(sub_only.len(), 2);
+    assert!(
+        sub_only
+            .iter()
+            .all(|p| p.owner == AccountId::with_sub(1, 7))
+    );
+
+    // A subaccount that was never used returns nothing.
+    let empty = store
+        .get_postings_by_account(1, Some(9), None, None)
+        .await
+        .unwrap();
+    assert!(empty.is_empty());
 }
 
 /// Query postings with pagination.
@@ -305,7 +399,8 @@ pub async fn query_postings_pagination(store: &(impl Store + 'static)) {
     // Page 1: first 2
     let page1 = store
         .query_postings(&PostingQuery {
-            account: AccountId::new(1),
+            account: 1,
+            sub: None,
             asset: None,
             status: None,
             limit: Some(2),
@@ -319,7 +414,8 @@ pub async fn query_postings_pagination(store: &(impl Store + 'static)) {
     // Page 2: next 2
     let page2 = store
         .query_postings(&PostingQuery {
-            account: AccountId::new(1),
+            account: 1,
+            sub: None,
             asset: None,
             status: None,
             limit: Some(2),
@@ -333,7 +429,8 @@ pub async fn query_postings_pagination(store: &(impl Store + 'static)) {
     // Page 3: last 1
     let page3 = store
         .query_postings(&PostingQuery {
-            account: AccountId::new(1),
+            account: 1,
+            sub: None,
             asset: None,
             status: None,
             limit: Some(2),
@@ -347,7 +444,8 @@ pub async fn query_postings_pagination(store: &(impl Store + 'static)) {
     // With asset filter
     let filtered = store
         .query_postings(&PostingQuery {
-            account: AccountId::new(1),
+            account: 1,
+            sub: None,
             asset: Some(AssetId::new(1)),
             status: None,
             limit: Some(10),
@@ -604,7 +702,7 @@ pub async fn store_transfer_counts(store: &(impl Store + 'static)) {
     assert!(store.get_transfer(&tid).await.unwrap().is_some());
     assert_eq!(
         store
-            .get_transfers_for_account(&AccountId::new(1))
+            .get_transfers_for_account(1, None)
             .await
             .unwrap()
             .len(),
@@ -702,16 +800,10 @@ pub async fn get_transfers_for_account(store: &(impl Store + 'static)) {
     let (envelope, tid) = make_envelope();
     commit_envelope(store, envelope, tid, 1000).await;
 
-    let records = store
-        .get_transfers_for_account(&AccountId::new(1))
-        .await
-        .unwrap();
+    let records = store.get_transfers_for_account(1, None).await.unwrap();
     assert_eq!(records.len(), 1);
 
-    let empty = store
-        .get_transfers_for_account(&AccountId::new(999))
-        .await
-        .unwrap();
+    let empty = store.get_transfers_for_account(999, None).await.unwrap();
     assert!(empty.is_empty());
 }
 
@@ -738,7 +830,8 @@ pub async fn query_transfers_by_date_range(store: &(impl Store + 'static)) {
 
     let page = store
         .query_transfers(&TransferQuery {
-            account: Some(AccountId::new(1)),
+            account: Some(1),
+            sub: None,
             from_ts: Some(1500),
             ..Default::default()
         })
@@ -761,7 +854,8 @@ pub async fn query_transfers_pagination(store: &(impl Store + 'static)) {
 
     let page = store
         .query_transfers(&TransferQuery {
-            account: Some(AccountId::new(1)),
+            account: Some(1),
+            sub: None,
             limit: Some(2),
             offset: Some(0),
             ..Default::default()
@@ -773,7 +867,8 @@ pub async fn query_transfers_pagination(store: &(impl Store + 'static)) {
 
     let page2 = store
         .query_transfers(&TransferQuery {
-            account: Some(AccountId::new(1)),
+            account: Some(1),
+            sub: None,
             limit: Some(2),
             offset: Some(2),
             ..Default::default()
@@ -794,7 +889,8 @@ pub async fn query_transfers_by_book(store: &(impl Store + 'static)) {
 
     let page = store
         .query_transfers(&TransferQuery {
-            account: Some(AccountId::new(1)),
+            account: Some(1),
+            sub: None,
             book: Some(BookId(5)),
             ..Default::default()
         })
@@ -950,12 +1046,14 @@ macro_rules! store_tests {
             get_accounts_batch,
             append_account_version,
             append_version_conflict,
+            append_duplicate_version_rejected,
             get_account_history,
             list_accounts,
             // PostingStore
             commit_creates_postings,
             get_postings_missing_fails,
             get_postings_by_account_filters,
+            get_postings_by_subaccount,
             query_postings_pagination,
             reserve_postings_batch,
             reserve_skips_non_active,

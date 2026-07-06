@@ -13,13 +13,52 @@ the ledger balance.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | `AccountId(i64)` | Stable identity, assigned at creation |
+| `id` | `AccountId { id: i64, sub: i64 }` | Stable identity: a base id plus a subaccount (`sub = 0` is the main account) |
 | `version` | `u64` | Starts at 1, increments on every mutation |
 | `policy` | `AccountPolicy` | Balance floor rule (see below) |
 | `flags` | `AccountFlags` | Lifecycle flags (`FROZEN`, `CLOSED`) + user-defined (`USER_0` to `USER_7`) |
 | `book` | `BookId` | Book this account belongs to |
 | `user_data` | `UserData` | Fixed 28 bytes: `u128 + u64 + u32` for external refs |
 | `metadata` | `Metadata` | `BTreeMap<String, Vec<u8>>` for free-form data |
+
+## Subaccounts
+
+An `AccountId` is a base `id` plus a `sub`. `sub = 0` is the account's main
+account; a non-zero `sub` is a subaccount of the same base id. Each `(id, sub)`
+is a full account record with its own policy, flags, book, version, and
+lifecycle, created, versioned, frozen, and closed exactly like any other
+account. A subaccount can be `NoOverdraft` while its base account is not, or the
+reverse, because every check keys on the full `AccountId`.
+
+Subaccounts partition one owner's holdings into several individually addressable
+balances (sub-ledgers, earmarks, reservations) without minting unrelated
+top-level accounts. Helpers on `AccountId`: `new(id)` (main account),
+`with_sub(id, sub)`, `base()` (the main account of an id), and `is_main()`.
+
+`AccountId` also has an IBAN-style string form (`Display` / `FromStr`): two ISO
+7064 mod-97 check digits, then a 26-character base-36 body carrying the base id
+and the subaccount (13 characters each; no country code).
+The `(id, sub)` pair is run through a keyed 128-bit Feistel permutation before
+encoding (and inverted on parse), so a code does not reveal the raw ids; the key
+is a global seed with a default, configurable via `set_id_seed`. Parsing
+validates the checksum, so a mistyped identifier is rejected. This is
+obfuscation, not security (the seed decodes it), and a presentation/routing form
+only; storage keeps the two `i64` legs.
+
+Balances are always reported per subaccount and are never summed across them:
+
+- `balance(&AccountId, &AssetId)` reads exactly one subaccount.
+- `balances(&AccountId, &AssetId, sub)` returns one entry per non-closed
+  subaccount (`sub = None` spans all, `Some(s)` filters to one).
+- `list_subaccounts(&AccountId)` lists the non-closed subaccounts of a base id.
+
+A base account does **not** roll up its subaccounts: there is deliberately no
+API that sums across them. Aggregate reads take a base `id: i64` plus an
+optional subaccount filter (`get_postings_by_account`,
+`get_transfers_for_account`); exact entity operations take the full
+`&AccountId`. Book membership is scoped by base account: a book that lists a base
+account admits all of that account's subaccounts. See
+[adr/0012-subaccounts.md](adr/0012-subaccounts.md).
 
 ## Policies
 

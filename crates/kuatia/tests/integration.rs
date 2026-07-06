@@ -410,12 +410,12 @@ async fn fx_trade_via_market_account() {
     // Build the atomic envelope manually since it spans two assets
     let a1_usd_postings = ledger
         .store()
-        .get_postings_by_account(&account(1), Some(&usd()), Some(PostingStatus::Active))
+        .get_postings_by_account(1, None, Some(&usd()), Some(PostingStatus::Active))
         .await
         .unwrap();
     let fx_eur_postings = ledger
         .store()
-        .get_postings_by_account(&account(50), Some(&eur()), Some(PostingStatus::Active))
+        .get_postings_by_account(50, None, Some(&eur()), Some(PostingStatus::Active))
         .await
         .unwrap();
 
@@ -539,7 +539,7 @@ async fn close_rejects_reserved_postings() {
     // Reserve the account's only posting (a transfer in flight): Active → PendingInactive.
     let postings = ledger
         .store()
-        .get_postings_by_account(&account(1), Some(&usd()), Some(PostingStatus::Active))
+        .get_postings_by_account(1, None, Some(&usd()), Some(PostingStatus::Active))
         .await
         .unwrap();
     ledger
@@ -778,7 +778,7 @@ async fn capped_overdraft_creates_negative_posting() {
     // A negative posting now backs the overdraft.
     let postings = ledger
         .store()
-        .get_postings_by_account(&account(10), Some(&usd()), Some(PostingStatus::Active))
+        .get_postings_by_account(10, None, Some(&usd()), Some(PostingStatus::Active))
         .await
         .unwrap();
     assert!(postings.iter().any(|p| p.value == Cent::from(-50)));
@@ -905,4 +905,94 @@ async fn identical_transfers_share_envelope_id() {
         .build();
     assert_eq!(a.book, b.book, "default book must be deterministic");
     assert_eq!(a.book, DEFAULT_BOOK);
+}
+
+// ---------------------------------------------------------------------------
+// Subaccounts (ADR-0012)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn subaccount_balances_are_segregated() {
+    let ledger = setup_ledger().await;
+    let sub = AccountId::with_sub(1, 7);
+    // A subaccount is a full account record with its own policy.
+    ledger
+        .store()
+        .create_account(Account::new(sub, AccountPolicy::NoOverdraft))
+        .await
+        .unwrap();
+
+    // Fund the main account (1, 0) and the subaccount (1, 7) independently.
+    deposit(&ledger, account(1), usd(), Cent::from(100), external()).await;
+    deposit(&ledger, sub, usd(), Cent::from(40), external()).await;
+
+    // balance() reads exactly one subaccount and never rolls up the other.
+    assert_eq!(
+        ledger.balance(&account(1), &usd()).await.unwrap(),
+        Cent::from(100)
+    );
+    assert_eq!(ledger.balance(&sub, &usd()).await.unwrap(), Cent::from(40));
+
+    // list_subaccounts spans the base id's subaccounts, sorted.
+    let subs = ledger.list_subaccounts(&account(1)).await.unwrap();
+    assert_eq!(subs, vec![account(1), sub]);
+
+    // balances() reports one entry per subaccount, never summed.
+    let all = ledger.balances(&account(1), &usd(), None).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(
+        all.iter().find(|b| b.account == account(1)).unwrap().value,
+        Cent::from(100)
+    );
+    assert_eq!(
+        all.iter().find(|b| b.account == sub).unwrap().value,
+        Cent::from(40)
+    );
+
+    // A subaccount filter restricts to that one.
+    let just_sub = ledger.balances(&account(1), &usd(), Some(7)).await.unwrap();
+    assert_eq!(just_sub.len(), 1);
+    assert_eq!(just_sub[0].account, sub);
+    assert_eq!(just_sub[0].value, Cent::from(40));
+}
+
+#[tokio::test]
+async fn pay_moves_value_between_subaccounts() {
+    let ledger = setup_ledger().await;
+    let sub = AccountId::with_sub(1, 7);
+    ledger
+        .store()
+        .create_account(Account::new(sub, AccountPolicy::NoOverdraft))
+        .await
+        .unwrap();
+
+    deposit(&ledger, sub, usd(), Cent::from(40), external()).await;
+    // Move 30 from subaccount (1, 7) to the main account (1, 0).
+    pay(&ledger, sub, account(1), usd(), Cent::from(30)).await;
+
+    assert_eq!(ledger.balance(&sub, &usd()).await.unwrap(), Cent::from(10));
+    assert_eq!(
+        ledger.balance(&account(1), &usd()).await.unwrap(),
+        Cent::from(30)
+    );
+}
+
+#[tokio::test]
+async fn closed_subaccounts_drop_out_of_aggregate_reads() {
+    let ledger = setup_ledger().await;
+    let sub = AccountId::with_sub(1, 7);
+    ledger
+        .store()
+        .create_account(Account::new(sub, AccountPolicy::NoOverdraft))
+        .await
+        .unwrap();
+
+    // The subaccount is created then closed while empty.
+    ledger.close(&sub).await.unwrap();
+
+    // list_subaccounts and balances exclude the closed subaccount.
+    let subs = ledger.list_subaccounts(&account(1)).await.unwrap();
+    assert_eq!(subs, vec![account(1)]);
+    let all = ledger.balances(&account(1), &usd(), None).await.unwrap();
+    assert!(all.iter().all(|b| b.account != sub));
 }
