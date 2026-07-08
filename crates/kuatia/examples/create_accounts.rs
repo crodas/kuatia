@@ -39,7 +39,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         policy: AccountPolicy::ExternalAccount, // boundary for deposits/withdrawals
         flags: AccountFlags::empty(),           // not frozen, not closed
         book: DEFAULT_BOOK,                     // the implicit default book
-        user_data: UserData::default(),         // fixed-width correlation slots
         metadata: BTreeMap::new(),              // free-form key/value metadata
     };
     ledger.create_account(external).await?;

@@ -153,7 +153,6 @@ struct Envelope {
     creates: Vec<NewPosting>,       // new postings to create
     account_snapshots: Vec<AccountSnapshotId>,
     book: BookId,
-    user_data: UserData,
     metadata: Metadata,
 }
 ```
