@@ -28,7 +28,6 @@ fn make_account(id: i64, policy: AccountPolicy) -> Account {
         policy,
         flags: AccountFlags::empty(),
         book: BookId(0),
-        user_data: UserData::default(),
         metadata: BTreeMap::new(),
     }
 }

@@ -20,7 +20,7 @@
 //!
 //! # High-level composition
 //!
-//! High-level steps (`PayMovementStep`, `DepositMovementStep`, etc.) compose over
+//! High-level steps (`PayMovementStep` and `DepositMovementStep`) compose over
 //! the intent-layer API and can be combined into multi-transfer sagas via `legend!`.
 
 use std::sync::Arc;
@@ -316,7 +316,7 @@ impl Step<LedgerCtx, SagaError> for FinalizeTransferStep {
 }
 
 // ===========================================================================
-// High-level steps (pay / deposit / withdraw movement steps)
+// High-level steps (pay / deposit movement steps)
 // ===========================================================================
 
 /// Input for the pay movement saga step.
@@ -342,19 +342,6 @@ pub struct DepositInput {
     /// Amount to deposit.
     pub amount: Cent,
     /// External account funding the deposit.
-    pub external: AccountId,
-}
-
-/// Input for the withdraw movement saga step.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WithdrawInput {
-    /// Account to withdraw from.
-    pub from: AccountId,
-    /// Asset being withdrawn.
-    pub asset: AssetId,
-    /// Amount to withdraw.
-    pub amount: Cent,
-    /// External account receiving the withdrawal.
     pub external: AccountId,
 }
 
@@ -420,31 +407,6 @@ impl Step<LedgerCtx, SagaError> for DepositMovementStep {
     async fn compensate(
         ctx: &mut LedgerCtx,
         _input: &DepositInput,
-    ) -> Result<CompensationOutcome, SagaError> {
-        compensate_last_receipt(ctx).await
-    }
-}
-
-/// Saga step: withdraw value to an external account via a single-movement transfer.
-pub struct WithdrawMovementStep;
-
-#[async_trait]
-impl Step<LedgerCtx, SagaError> for WithdrawMovementStep {
-    type Input = WithdrawInput;
-
-    async fn execute(ctx: &mut LedgerCtx, input: &WithdrawInput) -> Result<StepOutcome, SagaError> {
-        let ledger = ctx.ledger_arc()?;
-        let transfer = TransferBuilder::new()
-            .withdraw(input.from, input.asset, input.amount, input.external)
-            .build();
-        let receipt = ledger.commit(transfer).await?;
-        ctx.receipts.push(receipt);
-        Ok(StepOutcome::Continue)
-    }
-
-    async fn compensate(
-        ctx: &mut LedgerCtx,
-        _input: &WithdrawInput,
     ) -> Result<CompensationOutcome, SagaError> {
         compensate_last_receipt(ctx).await
     }

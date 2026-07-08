@@ -485,7 +485,6 @@ mod tests {
             policy,
             flags: AccountFlags::empty(),
             book: BookId(0),
-            user_data: UserData::default(),
             metadata: BTreeMap::new(),
         }
     }
@@ -514,7 +513,6 @@ mod tests {
                 },
             ],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         }
@@ -547,7 +545,6 @@ mod tests {
             consumes: vec![],
             creates: vec![],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
@@ -578,7 +575,6 @@ mod tests {
                 payer: None,
             }],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
@@ -608,7 +604,6 @@ mod tests {
             consumes: vec![missing_pid],
             creates: vec![],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
@@ -651,7 +646,6 @@ mod tests {
                 payer: None,
             }],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
@@ -741,7 +735,6 @@ mod tests {
                 payer: None,
             }],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
@@ -793,7 +786,6 @@ mod tests {
                 payer: None,
             }],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
@@ -846,7 +838,6 @@ mod tests {
                 payer: None,
             }],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
@@ -905,7 +896,6 @@ mod tests {
                 payer: None,
             }],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
@@ -940,7 +930,6 @@ mod tests {
             consumes: vec![pid, pid], // duplicate
             creates: vec![],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
@@ -992,7 +981,6 @@ mod tests {
                 },
             ],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
@@ -1025,7 +1013,6 @@ mod tests {
             policy,
             flags: AccountFlags::empty(),
             book: BookId(0),
-            user_data: UserData::default(),
             metadata: BTreeMap::new(),
         }
     }
@@ -1053,7 +1040,6 @@ mod tests {
                 },
             ],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
@@ -1098,7 +1084,6 @@ mod tests {
                 },
             ],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
@@ -1147,7 +1132,6 @@ mod tests {
                 },
             ],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
@@ -1187,7 +1171,6 @@ mod tests {
                 },
             ],
             book: BookId(0),
-            user_data: UserData::default(),
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };

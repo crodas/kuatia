@@ -31,7 +31,7 @@ pub trait ToBytes {
 /// Bumped to 2 when `Cent` moved to a fixed 16-byte canonical encoding (ADR-0011).
 /// Bumped to 3 when `AccountId` gained a `subaccount` leg folded into its
 /// canonical bytes (ADR-0012).
-pub const CANONICAL_VERSION: u8 = 3;
+pub const CANONICAL_VERSION: u8 = 4;
 
 /// Append a `u16` in big-endian to `buf`.
 pub fn write_u16(buf: &mut Vec<u8>, v: u16) {
@@ -660,17 +660,6 @@ pub struct NewPosting {
 // Transfer
 // ---------------------------------------------------------------------------
 
-/// Fixed-width secondary identifiers.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct UserData {
-    /// 128-bit user-defined slot (e.g. external UUID).
-    pub d128: u128,
-    /// 64-bit user-defined slot (e.g. correlation id).
-    pub d64: u64,
-    /// 32-bit user-defined slot (e.g. category code).
-    pub d32: u32,
-}
-
 /// Free-form key→value metadata.
 pub type Metadata = BTreeMap<String, Vec<u8>>;
 
@@ -687,8 +676,6 @@ pub struct Envelope {
     pub account_snapshots: Vec<AccountSnapshotId>,
     /// Book this envelope belongs to.
     pub book: BookId,
-    /// Fixed-width secondary identifiers.
-    pub user_data: UserData,
     /// Free-form key-value metadata.
     pub metadata: Metadata,
 }
@@ -712,11 +699,6 @@ impl Envelope {
     /// Book this envelope belongs to.
     pub fn book(&self) -> BookId {
         self.book
-    }
-
-    /// Fixed-width secondary identifiers.
-    pub fn user_data(&self) -> &UserData {
-        &self.user_data
     }
 
     /// Free-form key-value metadata.
@@ -769,12 +751,6 @@ impl EnvelopeBuilder {
     /// Set the book.
     pub fn book(mut self, book: BookId) -> Self {
         self.envelope.book = book;
-        self
-    }
-
-    /// Set the fixed-width secondary identifiers.
-    pub fn user_data(mut self, user_data: UserData) -> Self {
-        self.envelope.user_data = user_data;
         self
     }
 
@@ -865,16 +841,14 @@ pub struct Account {
     pub flags: AccountFlags,
     /// Book this entity belongs to.
     pub book: BookId,
-    /// Fixed-width secondary identifiers.
-    pub user_data: UserData,
     /// Free-form key-value metadata.
     pub metadata: Metadata,
 }
 
 impl Account {
     /// Create a version-1 main-subaccount account with the given policy: no flags,
-    /// the default book, and empty user data / metadata. Convenience for the common
-    /// case — set the other fields explicitly when you need them.
+    /// the default book, and empty metadata. Convenience for the common case; set
+    /// the other fields explicitly when you need them.
     pub fn new(id: AccountId, policy: AccountPolicy) -> Self {
         Self::new_ref(id, policy)
     }
@@ -887,7 +861,6 @@ impl Account {
             policy,
             flags: AccountFlags::empty(),
             book: DEFAULT_BOOK,
-            user_data: UserData::default(),
             metadata: Metadata::new(),
         }
     }
@@ -946,8 +919,6 @@ pub struct Transfer {
     pub movements: Vec<Movement>,
     /// Book this entity belongs to.
     pub book: BookId,
-    /// Fixed-width secondary identifiers.
-    pub user_data: UserData,
     /// Free-form key-value metadata.
     pub metadata: Metadata,
 }
@@ -1030,12 +1001,6 @@ impl TransferBuilder {
         self
     }
 
-    /// Set the fixed-width secondary identifiers.
-    pub fn user_data(mut self, user_data: UserData) -> Self {
-        self.transfer.user_data = user_data;
-        self
-    }
-
     /// Set the free-form metadata.
     pub fn metadata(mut self, metadata: Metadata) -> Self {
         self.transfer.metadata = metadata;
@@ -1089,16 +1054,6 @@ impl ToBytes for PostingId {
         let mut buf = Vec::with_capacity(34);
         buf.extend_from_slice(&self.transfer.0);
         write_u16(&mut buf, self.index);
-        buf
-    }
-}
-
-impl ToBytes for UserData {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(28);
-        write_u128(&mut buf, self.d128);
-        write_u64(&mut buf, self.d64);
-        write_u32(&mut buf, self.d32);
         buf
     }
 }
@@ -1186,7 +1141,6 @@ impl ToBytes for Envelope {
         }
 
         buf.extend(self.book.to_bytes());
-        buf.extend(self.user_data.to_bytes());
 
         write_u32(&mut buf, self.metadata.len() as u32);
         for (key, value) in &self.metadata {
@@ -1210,7 +1164,6 @@ impl ToBytes for Account {
         buf.extend(self.policy.to_bytes());
         buf.extend(self.flags.to_bytes());
         buf.extend(self.book.to_bytes());
-        buf.extend(self.user_data.to_bytes());
 
         write_u32(&mut buf, self.metadata.len() as u32);
         for (key, value) in &self.metadata {

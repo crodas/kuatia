@@ -100,6 +100,10 @@ impl SqlStore {
                 "002_subaccounts",
                 include_str!("migrations/002_subaccounts.sql"),
             ),
+            (
+                "003_drop_user_data",
+                include_str!("migrations/003_drop_user_data.sql"),
+            ),
         ];
 
         for (name, sql) in migrations {
@@ -228,9 +232,6 @@ fn row_to_account(row: &sqlx::any::AnyRow) -> Result<Account, StoreError> {
     let book: i64 = row
         .try_get("book")
         .map_err(|e| StoreError::Internal(e.to_string()))?;
-    let user_data_json: String = row
-        .try_get("user_data")
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
     let metadata_json: String = row
         .try_get("metadata")
         .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -241,7 +242,6 @@ fn row_to_account(row: &sqlx::any::AnyRow) -> Result<Account, StoreError> {
         policy: deserialize_policy(&policy_str)?,
         flags: AccountFlags::from_bits_truncate(flags_bits as u32),
         book: BookId::new(book),
-        user_data: deserialize_json(&user_data_json)?,
         metadata: deserialize_json(&metadata_json)?,
     })
 }
@@ -342,7 +342,7 @@ impl AccountStore for SqlStore {
         }
 
         let res = sqlx::query(
-            "INSERT INTO accounts (id, subaccount, version, policy, flags, book, user_data, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id, subaccount, version) DO NOTHING"
+            "INSERT INTO accounts (id, subaccount, version, policy, flags, book, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id, subaccount, version) DO NOTHING"
         )
             .bind(account.id.id)
             .bind(account.id.sub)
@@ -350,7 +350,6 @@ impl AccountStore for SqlStore {
             .bind(serialize_policy(&account.policy)?)
             .bind(account.flags.bits() as i32)
             .bind(account.book.0)
-            .bind(serialize_json(&account.user_data)?)
             .bind(serialize_json(&account.metadata)?)
             .execute(&mut *tx)
             .await
@@ -407,7 +406,7 @@ impl AccountStore for SqlStore {
         }
 
         let res = sqlx::query(
-            "INSERT INTO accounts (id, subaccount, version, policy, flags, book, user_data, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id, subaccount, version) DO NOTHING"
+            "INSERT INTO accounts (id, subaccount, version, policy, flags, book, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id, subaccount, version) DO NOTHING"
         )
             .bind(account.id.id)
             .bind(account.id.sub)
@@ -415,7 +414,6 @@ impl AccountStore for SqlStore {
             .bind(serialize_policy(&account.policy)?)
             .bind(account.flags.bits() as i32)
             .bind(account.book.0)
-            .bind(serialize_json(&account.user_data)?)
             .bind(serialize_json(&account.metadata)?)
             .execute(&mut *tx)
             .await

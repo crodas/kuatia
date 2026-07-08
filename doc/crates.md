@@ -32,10 +32,9 @@ dependencies (`sha2`, `serde`, `bitflags`).
 | `NewPosting` | Posting to be created (no id yet, assigned during validation) |
 | `Transfer` | Atomic unit: consumes postings + creates postings + metadata |
 | `EnvelopeBuilder` | Fluent builder for `Transfer` construction |
-| `Account` | Versioned entity with policy, flags, book, user_data, metadata |
+| `Account` | Versioned entity with policy, flags, book, metadata |
 | `AccountPolicy` | Balance floor rule: `NoOverdraft`, `CappedOverdraft`, `UncappedOverdraft`, `SystemAccount`, `ExternalAccount` |
 | `AccountFlags` | Bitflags: `FROZEN`, `CLOSED` |
-| `UserData` | Fixed 28 bytes (u128 + u64 + u32) for correlation IDs, external refs |
 | `Metadata` | `BTreeMap<String, Vec<u8>>` for free-form key-value data |
 | `Receipt` | Confirmation of a committed transfer (contains `transfer_id`) |
 | `AutoId` | Snowflake-inspired i64 ID generator: `[0][40-bit ms][23-bit CRC32 or counter]`. The ms field counts from `KUATIA_EPOCH_MS` (2026-01-01T00:00:00Z), giving ~34.8 years forward. Lives in `kuatia-types::autoid` |
@@ -285,7 +284,6 @@ sagas and re-runs the whole saga for `Reserving` ones.
 |------|---------|------------|
 | `PayMovementStep` | Build pay transfer, `ledger.commit(...)` | `ledger.reverse(receipt.transfer_id)` |
 | `DepositMovementStep` | Build deposit transfer, `ledger.commit(...)` | `ledger.reverse(receipt.transfer_id)` |
-| `WithdrawMovementStep` | Build withdraw transfer, `ledger.commit(...)` | `ledger.reverse(receipt.transfer_id)` |
 
 #### Custom orchestration
 

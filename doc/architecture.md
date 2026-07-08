@@ -206,7 +206,7 @@ serialization. This serves two purposes:
 - **Tamper evidence**: any modification to a transfer's data changes its ID.
 
 All domain types implement deterministic binary serialization (`ToBytes` trait)
-using big-endian encoding with a version prefix (`CANONICAL_VERSION = 1`).
+using big-endian encoding with a version prefix (`CANONICAL_VERSION = 4`).
 
 ## Append-Only Account Versioning
 
@@ -377,7 +377,6 @@ workflows:
 |------|---------|------------|
 | `PayMovementStep` | Build pay transfer, `ledger.commit(...)` | `ledger.reverse(receipt.transfer_id)` |
 | `DepositMovementStep` | Build deposit transfer, `ledger.commit(...)` | `ledger.reverse(receipt.transfer_id)` |
-| `WithdrawMovementStep` | Build withdraw transfer, `ledger.commit(...)` | `ledger.reverse(receipt.transfer_id)` |
 
 ### Custom orchestration with legend
 

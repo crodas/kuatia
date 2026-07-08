@@ -38,7 +38,6 @@ async fn columns_store_hex_ids_and_json_text() {
         policy: AccountPolicy::NoOverdraft,
         flags: AccountFlags::empty(),
         book: BookId(0),
-        user_data: UserData::default(),
         metadata: std::collections::BTreeMap::new(),
     };
     store.create_account(account).await.unwrap();
@@ -64,14 +63,14 @@ async fn columns_store_hex_ids_and_json_text() {
     assert_eq!(transfer_id, "ab".repeat(32));
 
     // The account payload is readable JSON text, not a blob.
-    let row = sqlx::query("SELECT user_data FROM accounts")
+    let row = sqlx::query("SELECT metadata FROM accounts")
         .fetch_one(&pool)
         .await
         .unwrap();
-    let user_data: String = row.try_get("user_data").unwrap();
+    let metadata: String = row.try_get("metadata").unwrap();
     assert!(
-        serde_json::from_str::<serde_json::Value>(&user_data).is_ok(),
-        "user_data should be JSON text, got: {user_data}"
+        serde_json::from_str::<serde_json::Value>(&metadata).is_ok(),
+        "metadata should be JSON text, got: {metadata}"
     );
 }
 
@@ -154,7 +153,9 @@ async fn migration_upgrades_existing_rows_to_main_account() {
         .execute(&pool)
         .await
         .unwrap();
-    let user_data = serde_json::to_string(&UserData::default()).unwrap();
+    // Legacy 001/002 schema carried a user_data JSON column; the 003 migration
+    // drops it. Seed it with the value the old UserData type serialized to.
+    let user_data = r#"{"d128":0,"d64":0,"d32":0}"#.to_string();
     let metadata =
         serde_json::to_string(&std::collections::BTreeMap::<String, String>::new()).unwrap();
     sqlx::query(

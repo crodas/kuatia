@@ -268,7 +268,6 @@ impl Ledger {
             .consumes(consumes)
             .creates(creates)
             .book(transfer.book)
-            .user_data(transfer.user_data.clone())
             .metadata(transfer.metadata.clone())
             .build();
 
@@ -956,7 +955,7 @@ pub struct LoadedState {
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
-    use kuatia_core::{Account, AccountFlags, ReservationId, TransferBuilder, UserData};
+    use kuatia_core::{Account, AccountFlags, ReservationId, TransferBuilder};
     use kuatia_storage::mem_store::InMemoryStore;
     use std::collections::BTreeMap;
 
@@ -967,7 +966,6 @@ mod recovery_tests {
             policy,
             flags: AccountFlags::empty(),
             book: kuatia_core::BookId(0),
-            user_data: UserData::default(),
             metadata: BTreeMap::new(),
         }
     }
