@@ -19,6 +19,7 @@ doc/
   crates.md         Crate reference: modules, types, APIs
   accounts.md       Account model, policies, lifecycle
   transfers.md      Transfer/Movement API, resolve algorithm
+  journaling.md     Journaling: transfers as (compound) journal entries
   glossary.md       Terms, book design, exchange & supermarket examples
   accounting-mapping.md  Classical double-entry ↔ Kuatia term mapping
 ```
