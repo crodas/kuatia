@@ -137,9 +137,28 @@ preventing TOCTOU races where an account is mutated between load and apply.
 
 The saga `commit()` path auto-populates snapshots when none are provided.
 
+## Subaccounts
+
+An account is identified by a base id plus an `i64` **subaccount**, written
+`AccountId { id, sub }`; `sub = 0` is the main account. Each `(id,
+sub)` is its own record with its own policy, flags, book, and version, so a
+subaccount is a full account that happens to share a base id. Subaccounts are how
+one account holds many concurrent inflights: an inflight hold is a subaccount of
+its destination, keyed by a value derived from the trade (see
+[adr/0012-subaccounts.md](adr/0012-subaccounts.md)).
+
+Balances are reported **segregated per subaccount**, never summed across them:
+
+- `balance(&AccountId, asset)` reads one subaccount.
+- `balances(&AccountId, asset, sub)` returns one entry per non-closed subaccount
+  (`sub = None` spans all; `Some(s)` filters to one). Closed subaccounts are
+  excluded.
+- `list_subaccounts(&AccountId)` lists the non-closed subaccounts of a base
+  account.
+
 ## Balance Computation
 
-Balance for an (account, asset) pair is computed as:
+Balance for an (account reference, asset) pair is computed as:
 
 ```
 balance(account, asset) = sum(p.value for p in postings

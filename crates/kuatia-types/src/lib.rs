@@ -83,7 +83,7 @@ pub struct AccountId {
 /// public API uses [`AccountId`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountSnapshotId {
-    /// The account this snapshot belongs to.
+    /// The account (subaccount) this snapshot belongs to.
     pub account: AccountId,
     /// Double-SHA256 of the account's state at the time of the snapshot.
     pub snapshot_id: [u8; 32],
@@ -609,7 +609,7 @@ pub enum PostingStatus {
 pub struct Posting {
     /// Unique identifier derived from the creating transfer.
     pub id: PostingId,
-    /// The account that owns this posting.
+    /// The account (subaccount) that owns this posting.
     pub owner: AccountId,
     /// The asset this posting denominates.
     pub asset: AssetId,
@@ -646,7 +646,7 @@ impl Posting {
 /// on the [`EnvelopeId`], which is computed during validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewPosting {
-    /// The account that will own the created posting.
+    /// The account (subaccount) that will own the created posting.
     pub owner: AccountId,
     /// The asset this posting denominates.
     pub asset: AssetId,
@@ -724,7 +724,7 @@ impl Envelope {
         &self.metadata
     }
 
-    /// Deduplicated, sorted list of accounts referenced in the created postings.
+    /// Deduplicated, sorted list of account references in the created postings.
     pub fn referenced_accounts(&self) -> Vec<AccountId> {
         let mut ids: Vec<AccountId> = self.creates.iter().map(|p| p.owner).collect();
         ids.sort();
@@ -855,7 +855,7 @@ bitflags::bitflags! {
 /// A registered entity that must exist before it can transact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
-    /// Stable identity for this account.
+    /// Stable identity for this account (base account plus subaccount).
     pub id: AccountId,
     /// Monotonically increasing version, starts at 1 on creation.
     pub version: u64,
@@ -872,10 +872,15 @@ pub struct Account {
 }
 
 impl Account {
-    /// Create a version-1 account with the given policy: no flags, the default
-    /// book, and empty user data / metadata. Convenience for the common case —
-    /// set the other fields explicitly when you need them.
+    /// Create a version-1 main-subaccount account with the given policy: no flags,
+    /// the default book, and empty user data / metadata. Convenience for the common
+    /// case — set the other fields explicitly when you need them.
     pub fn new(id: AccountId, policy: AccountPolicy) -> Self {
+        Self::new_ref(id, policy)
+    }
+
+    /// Like [`Account::new`] but for a specific subaccount reference.
+    pub fn new_ref(id: AccountId, policy: AccountPolicy) -> Self {
         Self {
             id,
             version: 1,
@@ -920,9 +925,9 @@ pub struct Receipt {
 /// postings only for accounts with a positive net debit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Movement {
-    /// Account being debited.
+    /// Account (subaccount) being debited.
     pub from: AccountId,
-    /// Account being credited.
+    /// Account (subaccount) being credited.
     pub to: AccountId,
     /// Asset to transfer.
     pub asset: AssetId,
@@ -959,8 +964,13 @@ impl TransferBuilder {
         Self::default()
     }
 
-    /// Add a raw movement.
-    pub fn movement(
+    /// Add a raw movement between main subaccounts.
+    pub fn movement(self, from: AccountId, to: AccountId, asset: AssetId, amount: Cent) -> Self {
+        self.movement_ref(from, to, asset, amount)
+    }
+
+    /// Add a raw movement between specific subaccounts.
+    pub fn movement_ref(
         mut self,
         from: AccountId,
         to: AccountId,
@@ -976,28 +986,15 @@ impl TransferBuilder {
         self
     }
 
-    /// Add a pay movement: transfer value between two accounts.
+    /// Add a pay movement between main subaccounts.
     pub fn pay(self, from: AccountId, to: AccountId, asset: AssetId, amount: Cent) -> Self {
-        self.movement(from, to, asset, amount)
-    }
-
-    /// Add a movement between two specific subaccounts. Identical to
-    /// [`movement`](Self::movement) — `from`/`to` already carry a subaccount —
-    /// but names the subaccount intent at the call site (ADR-0012).
-    pub fn movement_ref(
-        self,
-        from: AccountId,
-        to: AccountId,
-        asset: AssetId,
-        amount: Cent,
-    ) -> Self {
         self.movement(from, to, asset, amount)
     }
 
     /// Add a pay movement between two specific subaccounts. See
     /// [`movement_ref`](Self::movement_ref).
     pub fn pay_ref(self, from: AccountId, to: AccountId, asset: AssetId, amount: Cent) -> Self {
-        self.movement(from, to, asset, amount)
+        self.movement_ref(from, to, asset, amount)
     }
 
     /// Add a deposit: creates an offset posting on the external account and

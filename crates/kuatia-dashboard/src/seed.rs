@@ -22,9 +22,10 @@ pub const CAROL: AccountId = AccountId::new(102);
 pub const MERCHANT: AccountId = AccountId::new(103);
 
 /// Human-readable labels for the seeded accounts, surfaced by the API so the
-/// frontend can show names instead of raw ids.
+/// frontend can show names instead of raw ids. Labels are per base account;
+/// a subaccount (an inflight hold) shares its base account's label.
 pub fn account_label(id: AccountId) -> Option<&'static str> {
-    Some(match id {
+    Some(match id.base() {
         TREASURY => "Treasury",
         EXTERNAL => "External",
         ALICE => "Alice",
