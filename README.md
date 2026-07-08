@@ -14,6 +14,13 @@ bookkeeping (`Σ debits = Σ credits`), expressed as `sum(consumed) == sum(creat
 per asset over signed postings. There are no mutable balance fields; an account's
 balance is always the sum of its active postings.
 
+It supports **journaling**: a committed transfer is a journal entry, a transfer
+with multiple movements is a compound journal entry (one balanced event touching
+many accounts, and, since each asset balances independently, many assets), and
+the append-only transfer log is the accounting journal. Replaying that log
+reconstructs every balance, so the ledger is auditable by construction. See
+[doc/journaling.md](doc/journaling.md).
+
 ```
 ┌─────────────────────────────────────────────────────┐
 │                   kuatia (async)                    │
@@ -72,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - [Crate Reference](doc/crates.md) — modules, types, and APIs per crate
 - [Accounts](doc/accounts.md) — account model, policies, and lifecycle
 - [Transfers](doc/transfers.md) — Movement struct, resolve algorithm, and TransferBuilder API
+- [Journaling](doc/journaling.md) — transfers as journal entries, compound and multi-asset entries, the transfer log as the journal
 - [Glossary](doc/glossary.md) — terms, book scoping, and worked examples
 - [Accounting Mapping](doc/accounting-mapping.md) — how classical double-entry concepts map onto kuatia
 

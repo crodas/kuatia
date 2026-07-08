@@ -21,6 +21,8 @@ to reverse a decision. Instead, a new ADR supersedes it.
 | [0009](0009-monetary-representation-integer-minor-units.md) | Monetary amounts as integer minor units | accepted | `Cent` is an `i64` newtype of minor units with only checked arithmetic; scale lives in the presentation-only `Amount`, not on the stored value or asset. Makes 0001's conservation exact. |
 | [0010](0010-event-stream-vs-transfer-log.md) | Derived event stream vs. transfer log | accepted | A secondary append-only `EventStore` feed (outbox-style) for transfer + account-lifecycle events; transfer log stays authoritative. `append_event` is idempotent on a content key, a scoped exception to 0003. |
 | [0011](0011-swappable-money-backing.md) | Swappable integer backing for money, default i64 | accepted | `Cent` moves to a `kuatia-money` crate over a `CentBacking` trait; the i64↔i128 width is a cargo feature, hidden from the API, stored as text. Refines 0009. |
+| [0012](0012-subaccounts.md) | Subaccount dimension on account identity | accepted | Account identity gains a subaccount dimension (used for per-destination inflight holding subaccounts). |
+| [0013](0013-journaling-model.md) | Journaling model: transfer as journal entry | accepted | A committed `Transfer`/`Envelope` is a (compound) journal entry; the transfer log is the accounting journal; `Book` is a policy scope, not the journal. Frames 0001/0005/0010 in accounting terms. |
 
 ## Recommended future ADRs
 
@@ -43,18 +45,15 @@ captured as an ADR, roughly in priority order:
    load and apply.
 5. **All arithmetic in Rust, never in SQL**: no `SUM`/`MAX`/etc. on
    monetary values; the storage layer stays a dumb record keeper.
-6. **`Book` is a transfer-policy scope, not the accounting journal**: the
-   naming/modeling decision and why it is easy to conflate
-   (`accounting-mapping.md`).
-7. **Posting proliferation & consolidation**: greedy largest-first
+6. **Posting proliferation & consolidation**: greedy largest-first
    selection (ADR-0001/0005) fragments balances into ever-smaller change
    postings; whether and how to consolidate, and what to do with dust, is
    undecided.
-8. **Retention / pruning of `Inactive` postings and the append-only
+7. **Retention / pruning of `Inactive` postings and the append-only
    logs**: both the transfer log and the derived event stream (ADR-0010)
    grow without bound; archival/retention is deferred and currently a
    conscious omission.
-9. **Read/projection consistency model**: a balance is a non-transactional
+8. **Read/projection consistency model**: a balance is a non-transactional
    sum over `Active` postings, so a read concurrent with a commit is
    eventually consistent; the read-side guarantee is implied but never
    stated.

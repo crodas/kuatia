@@ -176,7 +176,8 @@ let transfer = TransferBuilder::new()
 ```
 
 A single transfer can contain multiple movements of different types. All
-movements execute atomically.
+movements execute atomically. A transfer with multiple movements is a compound
+journal entry; see [journaling.md](journaling.md).
 
 ## Commit Paths
 

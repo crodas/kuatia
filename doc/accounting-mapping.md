@@ -10,7 +10,9 @@ mechanical model is different:
 | `Σ debits = Σ credits` | `sum(consumed) == sum(created)` per asset |
 
 This page maps classical accounting vocabulary onto Kuatia's types and clears
-up the terms that are easy to conflate.
+up the terms that are easy to conflate. For a focused, affirmative walkthrough
+of journaling (single, compound, and multi-asset entries, and the transfer log
+as the journal) see [journaling.md](journaling.md).
 
 The most important correction: in classical accounting a journal is the
 append-only book of original entry, while a journal entry is one committed
