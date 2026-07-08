@@ -45,12 +45,13 @@ sub)` names one; `AccountId::base()` returns the main account of an id. A base
 account does not roll up its subaccounts, so several independent balances live
 under one owner, each individually addressable, drained, and closed. Aggregate
 reads take a base `id` plus an optional subaccount filter; exact entity
-operations take the full `AccountId`.
+operations take the full `AccountId`. Subaccounts let one account hold many
+concurrent inflights (a hold is a subaccount of its destination).
 
 `AccountId` also has an IBAN-style string view via `Display` / `FromStr`: two
 mod-97 check digits + a base-36 body of the two legs (no country code), e.g.
-`9200000000000050000000000007` for `{ id: 5, sub: 7 }` (grouped:
-`9200 0000 0000 0050 0000 0000 07`). Parsing validates the checksum, rejecting
+`221RDWNSN4VCQNK2NN42KJFSAOLI` for `{ id: 5, sub: 7 }` (grouped:
+`221R DWNS N4VC QNK2 NN42 KJFS AOLI`). Parsing validates the checksum, rejecting
 mistyped ids. It is a presentation/routing form (the dashboard URLs); storage
 keeps the two `i64` legs.
 
