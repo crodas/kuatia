@@ -18,7 +18,6 @@ the ledger balance.
 | `policy` | `AccountPolicy` | Balance floor rule (see below) |
 | `flags` | `AccountFlags` | Lifecycle flags (`FROZEN`, `CLOSED`) + user-defined (`USER_0` to `USER_7`) |
 | `book` | `BookId` | Book this account belongs to |
-| `user_data` | `UserData` | Fixed 28 bytes: `u128 + u64 + u32` for external refs |
 | `metadata` | `Metadata` | `BTreeMap<String, Vec<u8>>` for free-form data |
 
 ## Subaccounts

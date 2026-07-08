@@ -83,8 +83,8 @@ Both are a single balanced event. In the classical entry, `Σ Dr (115) = Σ Cr
 These differ in grain: one record vs. the collection of all records.
 
 - `Transfer` / `Envelope` = one record (one journal entry).
-  - `Transfer` is the intent: `{ movements: Vec<Movement>, book, user_data,
-    metadata }`. Callers express what should happen, not which postings.
+  - `Transfer` is the intent: `{ movements: Vec<Movement>, book, metadata }`.
+    Callers express what should happen, not which postings.
   - `Envelope` is the resolved form produced by `resolve()`: `{ consumes:
     Vec<PostingId>, creates: Vec<NewPosting>, account_snapshots, book, … }`.
     It names the concrete postings to spend and create.
