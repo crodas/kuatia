@@ -48,12 +48,12 @@ reads take a base `id` plus an optional subaccount filter; exact entity
 operations take the full `AccountId`. Subaccounts let one account hold many
 concurrent inflights (a hold is a subaccount of its destination).
 
-`AccountId` also has an IBAN-style string view via `Display` / `FromStr`: two
-mod-97 check digits + a base-36 body of the two legs (no country code), e.g.
-`221RDWNSN4VCQNK2NN42KJFSAOLI` for `{ id: 5, sub: 7 }` (grouped:
-`221R DWNS N4VC QNK2 NN42 KJFS AOLI`). Parsing validates the checksum, rejecting
-mistyped ids. It is a presentation/routing form (the dashboard URLs); storage
-keeps the two `i64` legs.
+`AccountId` also has an IBAN-style string view via `Display` / `FromStr`: a fixed
+20 characters, an 18-char base-36 body of the packed legs then two mod-97 check
+digits (no country code), e.g. `FK9RA6QALU15JZ7DZM81` for `{ id: 5, sub: 7 }`
+(grouped: `FK9R A6QA LU15 JZ7D ZM81`, five groups of four). Parsing validates the
+checksum, rejecting mistyped ids. It is a presentation/routing form (the
+dashboard URLs); storage keeps the two `i64` legs. See ADR-0015.
 
 ### Asset
 
