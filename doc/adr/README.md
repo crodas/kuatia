@@ -24,6 +24,7 @@ to reverse a decision. Instead, a new ADR supersedes it.
 | [0012](0012-subaccounts.md) | Subaccount dimension on account identity | accepted | Account identity gains a subaccount dimension (used for per-destination inflight holding subaccounts). |
 | [0013](0013-journaling-model.md) | Journaling model: transfer as journal entry | accepted | A committed `Transfer`/`Envelope` is a (compound) journal entry; the transfer log is the accounting journal; `Book` is a policy scope, not the journal. Frames 0001/0005/0010 in accounting terms. |
 | [0014](0014-inflight-holds-via-holding-accounts.md) | Inflight holds via per-destination holding accounts | accepted | A hold is a subaccount of its destination; committing routes funds through the holding subaccount so pending value stays visible and reconcilable until settle or cancel. |
+| [0015](0015-fixed-width-account-code.md) | Fixed-width 20-character account code | accepted | The IBAN-style code becomes a fixed 20 chars (18-char body + 2 trailing check digits, five groups of four) by packing id (63 bits) and subaccount (30 bits) into one permuted value. Presentation-only; caps the subaccount at `SUB_BITS`. Supersedes the code section of 0012. |
 
 ## Recommended future ADRs
 

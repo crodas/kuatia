@@ -562,8 +562,10 @@ fn inflight_subaccount(transfer: &Transfer) -> i64 {
     let hash = double_sha256(&buf);
     let mut first = [0u8; 8];
     first.copy_from_slice(&hash[..8]);
-    // Mask the sign bit so the subaccount id is always positive.
-    (u64::from_be_bytes(first) & i64::MAX as u64) as i64
+    // Keep only the low SUB_BITS so the hold's subaccount id fits the account
+    // code's encodable range (ADR-0015). The result is always positive.
+    let mask = (1u64 << kuatia_types::SUB_BITS) - 1;
+    (u64::from_be_bytes(first) & mask) as i64
 }
 
 fn holds_of(legs: &[InflightLeg]) -> BTreeSet<AccountId> {

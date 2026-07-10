@@ -34,15 +34,17 @@ balances (sub-ledgers, earmarks, reservations) without minting unrelated
 top-level accounts. Helpers on `AccountId`: `new(id)` (main account),
 `with_sub(id, sub)`, `base()` (the main account of an id), and `is_main()`.
 
-`AccountId` also has an IBAN-style string form (`Display` / `FromStr`): two ISO
-7064 mod-97 check digits, then a 26-character base-36 body carrying the base id
-and the subaccount (13 characters each; no country code).
-The `(id, sub)` pair is run through a keyed 128-bit Feistel permutation before
-encoding (and inverted on parse), so a code does not reveal the raw ids; the key
-is a global seed with a default, configurable via `set_id_seed`. Parsing
-validates the checksum, so a mistyped identifier is rejected. This is
-obfuscation, not security (the seed decodes it), and a presentation/routing form
-only; storage keeps the two `i64` legs.
+`AccountId` also has an IBAN-style string form (`Display` / `FromStr`): a fixed
+20 characters, an 18-character base-36 body then two trailing ISO 7064 mod-97
+check digits, with no country code (e.g. `KUJL QEL8 IX2X GTBK 4425`). The body
+packs the base id (63 bits) and the subaccount (`SUB_BITS` bits) into one 93-bit
+value and runs it through a keyed format-preserving permutation before encoding
+(and inverts it on parse), so a code does not reveal the raw ids; the key is a
+global seed with a default, configurable via `set_id_seed`. Parsing validates the
+checksum, so a mistyped identifier is rejected. This is obfuscation, not security
+(the seed decodes it), and a presentation/routing form only; storage keeps the
+two `i64` legs. The fixed width is what caps the subaccount at `SUB_BITS`; see
+ADR-0015.
 
 Balances are always reported per subaccount and are never summed across them:
 
