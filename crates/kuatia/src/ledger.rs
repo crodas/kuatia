@@ -29,15 +29,7 @@ use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
 use kuatia_storage::store::{EnvelopeRecord, Store};
 
 #[allow(missing_docs)]
-mod envelope_saga {
-    use super::*;
-    legend! {
-        EnvelopeSaga<LedgerCtx, SagaError> {
-            reserve: ReservePostingsStep,
-            finalize: FinalizeTransferStep,
-        }
-    }
-}
+mod envelope_saga;
 use envelope_saga::*;
 
 /// Phase of an in-flight commit, persisted with the write-ahead record so
