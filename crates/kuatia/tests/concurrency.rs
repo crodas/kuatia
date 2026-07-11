@@ -74,8 +74,9 @@ async fn deposit(ledger: &Arc<Ledger>, to: AccountId, amount: Cent) {
 
 /// Many transfers concurrently try to spend the *same* funded posting to
 /// different recipients. Exactly one may win: the winner's `reserve_postings`
-/// flips the single Active posting to `PendingInactive`, and every other saga's
-/// reserve returns zero for a fresh reservation, so it fails and compensates.
+/// claims the single active posting into the reserved index, and every other
+/// saga's reserve returns zero for a fresh reservation, so it fails and
+/// compensates.
 /// The ledger stays conserved: the payer ends at zero and exactly one recipient
 /// receives the full amount.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

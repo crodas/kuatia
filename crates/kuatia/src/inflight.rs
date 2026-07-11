@@ -21,7 +21,7 @@ use kuatia_core::{
 };
 use kuatia_storage::error::StoreError;
 use kuatia_storage::store::EnvelopeRecord;
-use kuatia_types::PostingStatus;
+use kuatia_types::PostingFilter;
 use serde::{Deserialize, Serialize};
 
 use crate::error::LedgerError;
@@ -531,15 +531,14 @@ impl Ledger {
         self.commit(tx).await
     }
 
-    /// Close a holding account once it has no live (Active/PendingInactive)
-    /// postings left. No-op if already closed or still holding funds.
+    /// Close a holding account once it has no live (active or reserved) postings
+    /// left. No-op if already closed or still holding funds.
     async fn close_if_drained(&self, hold: &AccountId) -> Result<(), LedgerError> {
-        let live = self
+        let live = !self
             .store()
-            .get_postings_by_account(hold.id, Some(hold.sub), None, None)
+            .get_postings_by_account(hold.id, Some(hold.sub), None, PostingFilter::Live)
             .await?
-            .into_iter()
-            .any(|p| p.status != PostingStatus::Inactive);
+            .is_empty();
         if live {
             return Ok(());
         }

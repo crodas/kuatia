@@ -3,7 +3,7 @@
 //! The generated conformance suite drives the store through a single `&store`,
 //! so it never exercises two callers racing on the same rows. `reserve_postings`
 //! is the primitive the saga relies on to make double-spends impossible: it must
-//! flip each `Active` posting to `PendingInactive` for exactly one caller, even
+//! move each active posting into the reserved index for exactly one caller, even
 //! when many callers target the same postings at once.
 
 #![allow(missing_docs)]
@@ -29,7 +29,7 @@ fn posting(index: u16) -> Posting {
 /// Many tasks concurrently reserve the same set of postings, each with its own
 /// reservation id. Reservation is a claim, so each posting may be reserved by
 /// exactly one task: the per-task counts sum to the number of postings, and
-/// every posting ends `PendingInactive`.
+/// every posting ends reserved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_reserve_claims_each_posting_once() {
     const POSTINGS: u16 = 32;
@@ -63,11 +63,11 @@ async fn concurrent_reserve_claims_each_posting_once() {
         "each posting is reserved by exactly one task"
     );
 
-    let final_postings = store.get_postings(&ids).await.unwrap();
+    let states = store.get_posting_states(&ids).await.unwrap();
     assert!(
-        final_postings
+        states
             .iter()
-            .all(|p| p.status == PostingStatus::PendingInactive),
+            .all(|s| matches!(s, PostingState::Reserved(_))),
         "every posting ends reserved"
     );
 }

@@ -547,8 +547,9 @@ impl BookId {
     }
 }
 
-/// Identifies a reservation — the owner token stamped on a posting while it is
-/// `PendingInactive`, so only the saga that reserved it may finalize or release it.
+/// Identifies a reservation — the owner token recorded in the reserved index
+/// while a posting is claimed, so only the saga that reserved it may finalize
+/// or release it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ReservationId(pub i64);
 
@@ -661,29 +662,51 @@ impl BookBuilder {
 // Posting
 // ---------------------------------------------------------------------------
 
-/// Lifecycle state of a [`Posting`].
+/// Read filter over the derived lifecycle state of postings.
+///
+/// A posting's state is no longer stored on the posting itself; it is derived
+/// from index-table membership. This filter selects which postings a read
+/// returns:
+///
+/// - `Active` — spendable (present in the active index).
+/// - `Reserved` — claimed by an in-flight saga (present in the reserved index).
+/// - `Live` — `Active ∪ Reserved`; everything that still counts toward balance.
+/// - `All` — every posting in the immutable table, including spent ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PostingFilter {
+    /// Spendable postings only.
+    Active,
+    /// Reserved (in-flight) postings only.
+    Reserved,
+    /// Active or reserved — the balance-bearing set (the old "not Inactive").
+    Live,
+    /// Every posting ever created, including spent ones.
+    All,
+}
+
+/// The derived lifecycle state of a single [`Posting`], computed from
+/// index-table membership rather than stored on the posting.
 ///
 /// ```text
-/// Active ──reserve──▶ PendingInactive ──finalize──▶ Inactive (void)
-///   ▲  ▲                    │
-///   │  └─── release (no-op) ┘
-///   └────── release ────────┘  (compensation)
+/// Active ──reserve──▶ Reserved(rid) ──consume──▶ Spent
+///   ▲  ▲                   │
+///   │  └── release ────────┘  (compensation)
+///   └── (id in active index)
 /// ```
 ///
-/// `reserve_postings` and `release_postings` are batch operations:
-/// - **reserve**: all postings must be Active, otherwise the batch fails.
-/// - **release**: Active is a no-op, PendingInactive reverts to Active,
-///   Inactive (void) fails the batch.
+/// `Reserved` carries the owning [`ReservationId`] so a saga can confirm it
+/// still holds a posting before finalizing or releasing it. `Missing` means the
+/// id is not present in the immutable postings table at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum PostingStatus {
-    /// Available for consumption and counted in balance.
+pub enum PostingState {
+    /// Present in the active index — spendable, counts toward balance.
     Active,
-    /// Reserved for a transfer; not available for other consumption.
-    /// Reverts to `Active` on compensation via `release_postings`.
-    PendingInactive,
-    /// Consumed by a committed transfer. Kept for audit trail (void).
-    /// Cannot be released.
-    Inactive,
+    /// Present in the reserved index, claimed by the given reservation.
+    Reserved(ReservationId),
+    /// Present only in the immutable table — consumed by a committed transfer.
+    Spent,
+    /// Not present in the immutable table.
+    Missing,
 }
 
 /// A signed amount of one asset, owned by exactly one account.
@@ -691,6 +714,10 @@ pub enum PostingStatus {
 /// A positive posting is value controlled by the account; a negative posting is
 /// an offset position (issuance, external flow, overdraft, or system balancing).
 /// Negative postings are allowed on every policy except `NoOverdraft`.
+///
+/// A `Posting` is an immutable record: once created it is never updated. Its
+/// lifecycle state is not a field here; it is derived from index-table
+/// membership (see [`PostingState`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Posting {
     /// Unique identifier derived from the creating transfer.
@@ -701,30 +728,17 @@ pub struct Posting {
     pub asset: AssetId,
     /// Signed: positive = value controlled by the account, negative = offset position.
     pub value: Cent,
-    /// Lifecycle state — only `Active` postings count toward balance.
-    pub status: PostingStatus,
-    /// Owner token while `PendingInactive`. `Some(rid)` iff reserved by saga
-    /// `rid`; `None` when `Active` or `Inactive`. Only the holder of a matching
-    /// `ReservationId` may finalize or release a reserved posting.
-    pub reservation: Option<ReservationId>,
 }
 
 impl Posting {
-    /// Construct an `Active`, unreserved posting.
+    /// Construct a posting record.
     pub fn new(id: PostingId, owner: AccountId, asset: AssetId, value: Cent) -> Self {
         Self {
             id,
             owner,
             asset,
             value,
-            status: PostingStatus::Active,
-            reservation: None,
         }
-    }
-
-    /// Returns `true` if this posting's status is [`PostingStatus::Active`].
-    pub fn is_active(&self) -> bool {
-        self.status == PostingStatus::Active
     }
 }
 
@@ -1200,11 +1214,6 @@ impl ToBytes for Posting {
         buf.extend(self.owner.to_bytes());
         buf.extend_from_slice(&self.asset.0.to_be_bytes());
         buf.extend(self.value.to_bytes());
-        buf.push(match self.status {
-            PostingStatus::Active => 0,
-            PostingStatus::PendingInactive => 1,
-            PostingStatus::Inactive => 2,
-        });
         buf
     }
 }

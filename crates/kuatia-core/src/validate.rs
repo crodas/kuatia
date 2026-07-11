@@ -58,8 +58,6 @@ pub enum ValidationError {
     DuplicateConsumedPosting(PostingId),
     /// A consumed posting id does not exist in the store.
     PostingNotFound(PostingId),
-    /// A consumed posting has already been spent.
-    PostingAlreadyConsumed(PostingId),
     /// A consumed posting is not owned by the expected account.
     OwnershipViolation {
         /// The posting that failed the ownership check.
@@ -137,7 +135,6 @@ impl std::fmt::Display for ValidationError {
             Self::EmptyTransfer => write!(f, "transfer has no postings"),
             Self::DuplicateConsumedPosting(id) => write!(f, "duplicate consumed posting {id:?}"),
             Self::PostingNotFound(id) => write!(f, "posting not found: {id:?}"),
-            Self::PostingAlreadyConsumed(id) => write!(f, "posting already consumed: {id:?}"),
             Self::OwnershipViolation {
                 posting_id,
                 expected,
@@ -243,16 +240,13 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
     let consumed_by_id: HashMap<PostingId, &Posting> =
         input.consumed_postings.iter().map(|p| (p.id, p)).collect();
 
-    // 3 & 4. Every consumed posting exists, is active, and we note ownership
+    // 3. Every consumed posting exists (its lifecycle state is enforced by the
+    // reserve CAS and the finalize "all spent" guard, not here — a `Posting`
+    // carries no state).
     for pid in envelope.consumes() {
-        let posting = consumed_by_id
+        consumed_by_id
             .get(pid)
             .ok_or(ValidationError::PostingNotFound(*pid))?;
-        if posting.status != PostingStatus::Active
-            && posting.status != PostingStatus::PendingInactive
-        {
-            return Err(ValidationError::PostingAlreadyConsumed(*pid));
-        }
     }
 
     // 5. Every referenced account exists, not FROZEN, not CLOSED
@@ -624,51 +618,6 @@ mod tests {
     }
 
     #[test]
-    fn double_spend_rejected() {
-        let pid = PostingId {
-            transfer: EnvelopeId([1; 32]),
-            index: 0,
-        };
-        let posting = Posting {
-            id: pid,
-            owner: AccountId::new(1),
-            asset: AssetId::new(1),
-            value: Cent::from(100),
-            status: PostingStatus::Inactive, // already consumed
-            reservation: None,
-        };
-        let envelope = Envelope {
-            consumes: vec![pid],
-            creates: vec![NewPosting {
-                owner: AccountId::new(2),
-                asset: AssetId::new(1),
-                value: Cent::from(100),
-                payer: None,
-            }],
-            book: BookId(0),
-            account_snapshots: vec![],
-            metadata: BTreeMap::new(),
-        };
-        let accounts = accounts_map(vec![
-            make_account(1, AccountPolicy::NoOverdraft),
-            make_account(2, AccountPolicy::NoOverdraft),
-        ]);
-        let balances = HashMap::new();
-        let input = PlanInput {
-            envelope: &envelope,
-            consumed_postings: &[posting],
-            accounts: &accounts,
-            balances: &balances,
-            book: None,
-        };
-
-        assert_eq!(
-            validate_and_plan(input).unwrap_err(),
-            ValidationError::PostingAlreadyConsumed(pid)
-        );
-    }
-
-    #[test]
     fn account_frozen_rejected() {
         let envelope = deposit_envelope();
         let mut acc = make_account(1, AccountPolicy::NoOverdraft);
@@ -721,8 +670,6 @@ mod tests {
             owner: AccountId::new(1),
             asset: AssetId::new(1),
             value: Cent::from(50),
-            status: PostingStatus::Active,
-            reservation: None,
         };
         // Try to send 50 but create 100 for recipient (conservation will fail first,
         // but let's test overdraft with a valid conservation)
@@ -774,8 +721,6 @@ mod tests {
             owner: AccountId::new(1),
             asset: AssetId::new(1),
             value: Cent::from(100),
-            status: PostingStatus::Active,
-            reservation: None,
         };
         let envelope = Envelope {
             consumes: vec![pid],
@@ -826,8 +771,6 @@ mod tests {
             owner: AccountId::new(1),
             asset: AssetId::new(1),
             value: Cent::from(100),
-            status: PostingStatus::Active,
-            reservation: None,
         };
         let envelope = Envelope {
             consumes: vec![pid],
@@ -884,8 +827,6 @@ mod tests {
             owner: AccountId::new(1),
             asset: AssetId::new(1),
             value: Cent::from(100),
-            status: PostingStatus::Active,
-            reservation: None,
         };
         let envelope = Envelope {
             consumes: vec![pid],
@@ -961,8 +902,6 @@ mod tests {
             owner: AccountId::new(1),
             asset: AssetId::new(1),
             value: Cent::from(100),
-            status: PostingStatus::Active,
-            reservation: None,
         };
         let envelope = Envelope {
             consumes: vec![pid],

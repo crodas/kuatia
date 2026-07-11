@@ -9,7 +9,7 @@
 //! A commit is two saga steps over a pre-resolved [`Envelope`] (resolution runs
 //! before the saga, in `Ledger::commit`):
 //!
-//! 1. **ReservePostingsStep** -- `reserve_postings`: Active → PendingInactive, stamped with the saga's `ReservationId`; interprets the count via `verify_postings`.
+//! 1. **ReservePostingsStep** -- `reserve_postings`: move each consumed posting from the active index into the reserved index under the saga's `ReservationId`; interprets the count via `verify_postings`.
 //! 2. **FinalizeTransferStep** -- delegates to `Ledger::finalize_envelope`, which re-validates against current state (the last-step floor / freeze-close guard), marks the saga `Finalizing`, then runs the dumb primitives (`deactivate_postings` → `insert_postings` → `store_transfer` → `append_event`) verifying every end-state.
 //!
 //! The `EnvelopeSaga` is defined via `legend!` in `ledger.rs` and driven by
@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use kuatia_core::{
-    AccountId, AssetId, Cent, Envelope, Posting, PostingId, PostingStatus, Receipt, ReservationId,
+    AccountId, AssetId, Cent, Envelope, PostingId, PostingState, Receipt, ReservationId,
     TransferBuilder,
 };
 
@@ -49,17 +49,17 @@ async fn verify_postings(
     store: &dyn Store,
     ids: &[PostingId],
     count: u64,
-    ok: impl Fn(&Posting) -> bool,
+    ok: impl Fn(&PostingState) -> bool,
     what: &str,
 ) -> Result<(), SagaError> {
     if count == ids.len() as u64 {
         return Ok(());
     }
-    let postings = store
-        .get_postings(ids)
+    let states = store
+        .get_posting_states(ids)
         .await
         .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
-    if postings.len() == ids.len() && postings.iter().all(&ok) {
+    if states.len() == ids.len() && states.iter().all(&ok) {
         return Ok(());
     }
     Err(SagaError {
@@ -192,7 +192,8 @@ impl LedgerCtx {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReserveInput;
 
-/// Reserves consumed postings by CAS: Active to PendingInactive.
+/// Reserves consumed postings by CAS: move each from the active index to the
+/// reserved index (the delete-returns-one picks a single winner).
 ///
 /// Gets the posting ids from the resolved envelope in the context.
 /// Compensation releases all reserved postings back to Active.
@@ -226,7 +227,7 @@ impl Step<LedgerCtx, SagaError> for ReservePostingsStep {
                 store,
                 &posting_ids,
                 reserved,
-                |p| p.status == PostingStatus::PendingInactive && p.reservation == Some(rid),
+                |s| matches!(s, PostingState::Reserved(r) if *r == rid),
                 "reserve",
             )
             .await?;

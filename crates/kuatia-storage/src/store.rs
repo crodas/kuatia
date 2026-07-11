@@ -13,8 +13,8 @@
 
 use async_trait::async_trait;
 use kuatia_types::{
-    Account, AccountId, AssetId, Book, BookId, Envelope, EnvelopeId, Posting, PostingId,
-    PostingStatus, Receipt, ReservationId,
+    Account, AccountId, AssetId, Book, BookId, Envelope, EnvelopeId, Posting, PostingFilter,
+    PostingId, PostingState, Receipt, ReservationId,
 };
 
 use crate::error::StoreError;
@@ -40,8 +40,8 @@ pub struct PostingQuery {
     pub sub: Option<i64>,
     /// Filter by asset.
     pub asset: Option<AssetId>,
-    /// Filter by posting status.
-    pub status: Option<PostingStatus>,
+    /// Filter by derived lifecycle state.
+    pub filter: PostingFilter,
     /// Max results to return.
     pub limit: Option<u32>,
     /// Number of results to skip.
@@ -97,64 +97,78 @@ pub trait AccountStore: Send + Sync {
     async fn list_accounts(&self) -> Result<Vec<Account>, StoreError>;
 }
 
-/// Posting persistence: reads and lifecycle transitions.
+/// Posting persistence: an immutable posting table plus two id-only index
+/// tables (active, reserved) whose membership expresses lifecycle state.
+///
+/// A posting is written once into the immutable table and never updated. Its
+/// state is derived from which index it is in: active → spendable, reserved →
+/// claimed by a saga, neither → spent. All lifecycle transitions are inserts
+/// and deletes on the index tables; the posting row itself never changes.
 #[async_trait]
 pub trait PostingStore: Send + Sync {
-    /// Fetch postings by their ids.
+    /// Fetch postings by their ids from the immutable table. Consumed (spent)
+    /// postings still resolve here — immutable rows persist forever.
     async fn get_postings(&self, ids: &[PostingId]) -> Result<Vec<Posting>, StoreError>;
-    /// Return postings owned by a base account, optionally filtered by
-    /// subaccount, asset, and/or status. `sub == None` spans every subaccount
-    /// of `id`; `sub == Some(s)` restricts to that one subaccount.
+    /// Return postings owned by a base account, filtered by subaccount, asset,
+    /// and derived lifecycle state (see [`PostingFilter`]). `sub == None` spans
+    /// every subaccount of `id`; `sub == Some(s)` restricts to that one.
     async fn get_postings_by_account(
         &self,
         id: i64,
         sub: Option<i64>,
         asset: Option<&AssetId>,
-        status: Option<PostingStatus>,
+        filter: PostingFilter,
     ) -> Result<Vec<Posting>, StoreError>;
-    /// Reserve postings: `Active → PendingInactive`, stamping `reservation` as
-    /// the owner token. A dumb instruction — each id flips only if still `Active`;
-    /// returns the **number of rows reserved** (0 ≤ n ≤ ids.len()). It does not
-    /// error on a short count; the caller (saga) interprets it.
+    /// Return the derived [`PostingState`] of each id, aligned to the input
+    /// order. This is the single membership probe used by the saga verifier and
+    /// the finalize guards. An id absent from the immutable table is `Missing`.
+    async fn get_posting_states(&self, ids: &[PostingId]) -> Result<Vec<PostingState>, StoreError>;
+    /// Reserve postings: move each id from the active index into the reserved
+    /// index under `reservation`. A dumb instruction — an id moves only if it
+    /// was in the active index (the delete-returns-one is the atomic
+    /// single-winner claim under contention); returns the **number of rows
+    /// reserved** (0 ≤ n ≤ ids.len()). The caller (saga) interprets a short
+    /// count.
     async fn reserve_postings(
         &self,
         ids: &[PostingId],
         reservation: ReservationId,
     ) -> Result<u64, StoreError>;
-    /// Release postings: `PendingInactive` owned by `reservation` → `Active`,
-    /// clearing the owner. A dumb instruction — only postings reserved by this
-    /// `reservation` flip; returns the **number of rows released**. Releasing an
-    /// `Active` (already released) or differently-owned posting simply does not
-    /// count. The caller interprets the result.
+    /// Release postings: move each id reserved by `reservation` back into the
+    /// active index. A dumb instruction — only ids reserved by this
+    /// `reservation` move; returns the **number of rows released**. Releasing an
+    /// id that is already active or reserved by another saga does not count.
     async fn release_postings(
         &self,
         ids: &[PostingId],
         reservation: ReservationId,
     ) -> Result<u64, StoreError>;
 
-    /// Deactivate postings: flip to `Inactive`. A dumb instruction — it applies
-    /// the conditional update and returns the **number of rows changed**; it does
-    /// not decide whether that count is correct. The caller (saga) interprets it.
-    /// - `reservation == None` (raw): only postings still `Active` flip.
-    /// - `reservation == Some(rid)`: only postings `PendingInactive` owned by
-    ///   `rid` flip.
-    /// Returns the count of postings actually transitioned (0 ≤ n ≤ ids.len()).
+    /// Deactivate postings: remove each id from an index so it becomes spent
+    /// (present only in the immutable table). A dumb instruction — it applies
+    /// the conditional delete and returns the **number of rows removed**.
+    /// - `reservation == None` (raw): remove ids from the active index.
+    /// - `reservation == Some(rid)`: remove ids from the reserved index that are
+    ///   owned by `rid`.
+    /// Returns the count actually removed (0 ≤ n ≤ ids.len()).
     async fn deactivate_postings(
         &self,
         ids: &[PostingId],
         reservation: Option<ReservationId>,
     ) -> Result<u64, StoreError>;
 
-    /// Insert postings if absent (idempotent). A dumb instruction — inserts each
-    /// posting unless one with the same id already exists, and returns the
-    /// **number of rows inserted** (already-present postings contribute 0). The
-    /// caller decides what a short count means.
+    /// Insert postings if absent, and add each newly-inserted id to the active
+    /// index. A dumb instruction — inserts each posting into the immutable table
+    /// unless one with the same id already exists, activating only the rows that
+    /// were newly inserted, and returns the **number of immutable rows
+    /// inserted** (already-present postings contribute 0, and do not get
+    /// re-activated). The caller decides what a short count means.
     async fn insert_postings(&self, postings: &[Posting]) -> Result<u64, StoreError>;
 
     /// Query postings with filtering and pagination.
     async fn query_postings(&self, query: &PostingQuery) -> Result<Page<Posting>, StoreError> {
         let all = self
-            .get_postings_by_account(query.account, query.sub, query.asset.as_ref(), query.status)
+            .get_postings_by_account(query.account, query.sub, query.asset.as_ref(), query.filter)
             .await?;
         let total = all.len() as u64;
         let offset = query.offset.unwrap_or(0) as usize;

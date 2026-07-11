@@ -15,7 +15,7 @@ to reverse a decision. Instead, a new ADR supersedes it.
 | [0003](0003-dumb-storage-saga-recovery.md) | Dumb storage + durable saga recovery | accepted | Storage returns affected-row counts and makes no decisions; the saga owns interpretation/idempotency; crash-safety is phase-tracked write-ahead + roll-forward. Refines 0002. |
 | [0004](0004-account-policies-overdraft-model.md) | Account policies & overdraft model | accepted | A closed `AccountPolicy` enum per account gates negative postings + floor; intent is explicit, illegal states unrepresentable. Refines 0001. |
 | [0005](0005-intent-api-movements-vs-envelopes.md) | Intent API: movements vs. envelopes | accepted | Callers express `Movement`/`Transfer` intent; `resolve()` produces the concrete `Envelope`. UTXO mechanics stay internal; idempotency keys on the resolved id. |
-| [0006](0006-reservation-protocol-posting-lifecycle.md) | Reservation protocol & posting lifecycle | accepted | `Active → PendingInactive → Inactive` + a durable `ReservationId` give lock-free, recoverable, exclusive ownership of inputs. The primitive behind 0002/0003. |
+| [0006](0006-reservation-protocol-posting-lifecycle.md) | Reservation protocol & posting lifecycle | accepted (storage representation superseded by 0016) | `Active → PendingInactive → Inactive` + a durable `ReservationId` give lock-free, recoverable, exclusive ownership of inputs. The primitive behind 0002/0003. |
 | [0007](0007-reversal-via-compensating-transfers.md) | Reversal via compensating transfers | accepted | Undo is an inverse envelope committed through the normal path (never deletion/mutation), preserving the append-only audit log. |
 | [0008](0008-conformance-tested-storage.md) | Conformance-tested storage | accepted | One `store_tests!` suite every backend must pass, with `InMemoryStore` as the executable reference; enforces the equal count semantics 0003 relies on. |
 | [0009](0009-monetary-representation-integer-minor-units.md) | Monetary amounts as integer minor units | accepted | `Cent` is an `i64` newtype of minor units with only checked arithmetic; scale lives in the presentation-only `Amount`, not on the stored value or asset. Makes 0001's conservation exact. |
@@ -25,6 +25,8 @@ to reverse a decision. Instead, a new ADR supersedes it.
 | [0013](0013-journaling-model.md) | Journaling model: transfer as journal entry | accepted | A committed `Transfer`/`Envelope` is a (compound) journal entry; the transfer log is the accounting journal; `Book` is a policy scope, not the journal. Frames 0001/0005/0010 in accounting terms. |
 | [0014](0014-inflight-holds-via-holding-accounts.md) | Inflight holds via per-destination holding accounts | accepted | A hold is a subaccount of its destination; committing routes funds through the holding subaccount so pending value stays visible and reconcilable until settle or cancel. |
 | [0015](0015-fixed-width-account-code.md) | Fixed-width 20-character account code | accepted | The IBAN-style code becomes a fixed 20 chars (18-char body + 2 trailing check digits, five groups of four) by packing id (63 bits) and subaccount (30 bits) into one permuted value. Presentation-only; caps the subaccount at `SUB_BITS`. Supersedes the code section of 0012. |
+| [0016](0016-immutable-postings-index-tables.md) | Immutable postings with active/reserved index tables | accepted (hot-table representation refined by 0017) | Postings become an insert-only immutable table; lifecycle state moves to two index tables (`active_postings`, `reserved_postings`). Append-only integrity + least privilege (no `UPDATE`) + hot working set by segregation. Supersedes the storage representation of 0006. |
+| [0017](0017-correctness-first-append-only-hot-indexes.md) | Correctness-first storage: append-only value tables, disposable hot indexes | accepted | The guiding principle: value/audit tables (`postings`, `accounts`) are strictly append-only source of truth; disposable hot tables (`active_postings`, `reserved_postings`, `account_head`) index the live subset by `INSERT`/`DELETE` only and are rebuildable. Correctness first; no `UPDATE` anywhere, enforceable by DB grants. Generalizes 0016 (hot tables now hold full row copies). |
 
 ## Recommended future ADRs
 
@@ -51,11 +53,13 @@ captured as an ADR, roughly in priority order:
    selection (ADR-0001/0005) fragments balances into ever-smaller change
    postings; whether and how to consolidate, and what to do with dust, is
    undecided.
-7. **Retention / pruning of `Inactive` postings and the append-only
-   logs**: both the transfer log and the derived event stream (ADR-0010)
-   grow without bound; archival/retention is deferred and currently a
-   conscious omission.
+7. **Retention / pruning of spent postings and the append-only logs**: the
+   immutable postings table (ADR-0016), the transfer log, and the derived
+   event stream (ADR-0010) all grow without bound; archival/retention is
+   deferred and currently a conscious omission. ADR-0016 makes the spent
+   history physically separable from the live working set, which is where
+   pruning would apply.
 8. **Read/projection consistency model**: a balance is a non-transactional
-   sum over `Active` postings, so a read concurrent with a commit is
-   eventually consistent; the read-side guarantee is implied but never
-   stated.
+   sum over the live (active or reserved) postings, so a read concurrent
+   with a commit is eventually consistent; the read-side guarantee is
+   implied but never stated.

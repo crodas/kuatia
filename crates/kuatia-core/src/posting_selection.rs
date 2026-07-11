@@ -42,7 +42,8 @@ impl std::error::Error for SelectionError {}
 
 /// Picks postings to cover `target`, using largest-first greedy to minimise
 /// the number of postings consumed (and therefore the number of change postings
-/// created). Only active, positive postings of the right asset are considered.
+/// created). Only positive postings of the right asset are considered; the
+/// caller supplies an already-active `available` set.
 pub fn select_postings(
     available: &[Posting],
     asset: AssetId,
@@ -52,7 +53,7 @@ pub fn select_postings(
 
     let mut candidates: Vec<&Posting> = available
         .iter()
-        .filter(|p| p.is_active() && p.asset == asset && p.value.is_positive())
+        .filter(|p| p.asset == asset && p.value.is_positive())
         .collect();
 
     // Largest first
@@ -137,16 +138,16 @@ mod tests {
     }
 
     #[test]
-    fn ignores_inactive_and_wrong_asset() {
-        let mut inactive = make_posting(0, 1000);
-        inactive.status = PostingStatus::Inactive;
-
+    fn ignores_wrong_asset() {
+        // Selection receives an already-active set (state lives in the store's
+        // index tables, not on the posting), so it only has to skip the wrong
+        // asset and negative values.
         let mut wrong_asset = make_posting(1, 1000);
         wrong_asset.asset = AssetId::new(2);
 
         let good = make_posting(2, 50);
 
-        let postings = vec![inactive, wrong_asset, good];
+        let postings = vec![wrong_asset, good];
         let result = select_postings(&postings, AssetId::new(1), Cent::from(50)).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].index, 2);

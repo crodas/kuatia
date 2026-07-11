@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use kuatia::ledger::Ledger;
-use kuatia_core::{Account, AccountId, AccountPolicy, AssetId, Cent, PostingId};
+use kuatia_core::{Account, AccountId, AccountPolicy, AssetId, Cent, PostingId, PostingState};
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
 use kuatia_storage::store::{EnvelopeRecord, TransferQuery};
 use serde::Serialize;
@@ -278,6 +278,16 @@ pub async fn accounts(state: &AppState) -> Result<Vec<AccountDto>, ApiError> {
     Ok(out)
 }
 
+/// Human-readable label for a posting's derived lifecycle state.
+fn posting_state_label(state: &PostingState) -> &'static str {
+    match state {
+        PostingState::Active => "Active",
+        PostingState::Reserved(_) => "Reserved",
+        PostingState::Spent => "Spent",
+        PostingState::Missing => "Missing",
+    }
+}
+
 /// One account with its postings (largest first) and the transfers it took part
 /// in.
 pub async fn account_detail(state: &AppState, id: AccountId) -> Result<AccountDetailDto, ApiError> {
@@ -285,15 +295,15 @@ pub async fn account_detail(state: &AppState, id: AccountId) -> Result<AccountDe
 
     let mut postings: Vec<PostingDto> = state
         .ledger
-        .postings(&id)
+        .postings_with_state(&id)
         .await?
         .iter()
-        .map(|p| PostingDto {
+        .map(|(p, state)| PostingDto {
             id: posting_id(&p.id),
             owner: p.owner,
             asset: p.asset,
             value: p.value,
-            status: format!("{:?}", p.status),
+            status: posting_state_label(state).to_string(),
         })
         .collect();
     postings.sort_by_key(|p| std::cmp::Reverse(p.value));

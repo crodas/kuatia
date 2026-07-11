@@ -8,8 +8,9 @@ use tracing::instrument;
 
 use kuatia_core::{
     AccountId, AccountPolicy, AccountSnapshotId, AssetId, Book, Cent, DEFAULT_BOOK, Envelope,
-    EnvelopeBuilder, EnvelopeId, NewPosting, PlanInput, Posting, PostingId, PostingStatus, Receipt,
-    SelectionError, Transfer, account_snapshot_id, envelope_id, select_postings, validate_and_plan,
+    EnvelopeBuilder, EnvelopeId, NewPosting, PlanInput, Posting, PostingFilter, PostingId,
+    PostingState, Receipt, SelectionError, Transfer, account_snapshot_id, envelope_id,
+    select_postings, validate_and_plan,
 };
 
 use crate::error::LedgerError;
@@ -40,8 +41,8 @@ enum SagaPhase {
     /// re-reserve and re-validate before it can commit.
     Reserving,
     /// Saved at the start of finalize — after validation passed and just before
-    /// the consumed postings begin turning `Inactive` (the point of no return).
-    /// Recovery rolls forward without re-validating.
+    /// the consumed postings begin being removed from the reserved index (the
+    /// point of no return). Recovery rolls forward without re-validating.
     Finalizing,
 }
 
@@ -195,7 +196,7 @@ impl Ledger {
                     account.id,
                     Some(account.sub),
                     Some(asset),
-                    Some(PostingStatus::Active),
+                    PostingFilter::Active,
                 )
                 .await?;
             let total_positive = Cent::checked_sum(
@@ -435,13 +436,13 @@ impl Ledger {
     /// Idempotently finalize `envelope` to its committed state, **verifying every
     /// step's end-state**. Used by the saga's finalize step and by recovery.
     ///
-    /// When the consumed postings are still pre-deactivation it re-validates
-    /// against current state (the last-step floor / freeze-close guard) and then
-    /// marks the saga `Finalizing` (the point of no return). Once any consumed
-    /// posting is already `Inactive` — a prior attempt or recovery passed that
-    /// point — it rolls forward without re-validating (validation rejects
-    /// `Inactive`). It never creates or stores anything unless **all** consumed
-    /// postings are confirmed `Inactive`, which is the double-spend guard.
+    /// When the consumed postings are still reserved it re-validates against
+    /// current state (the last-step floor / freeze-close guard) and then marks
+    /// the saga `Finalizing` (the point of no return). Once any consumed posting
+    /// is already spent — a prior attempt or recovery passed that point — it
+    /// rolls forward without re-validating. It never creates or stores anything
+    /// unless **all** consumed postings are confirmed spent, which is the
+    /// double-spend guard.
     pub(crate) async fn finalize_envelope(
         &self,
         envelope: &Envelope,
@@ -458,39 +459,45 @@ impl Ledger {
         }
         let consumes = envelope.consumes();
 
-        // Read consumed postings (also captures their owners for indexing).
+        // Read consumed postings (immutable rows, kept for owner indexing) and
+        // their derived states.
         let consumed = if consumes.is_empty() {
             Vec::new()
         } else {
             self.store.get_postings(consumes).await?
         };
-        let past_no_return = consumed.iter().any(|p| p.status == PostingStatus::Inactive);
+        let states = if consumes.is_empty() {
+            Vec::new()
+        } else {
+            self.store.get_posting_states(consumes).await?
+        };
+        let past_no_return = states.contains(&PostingState::Spent);
 
         // Last-step boundary re-check: re-validate floor + freeze/close + snapshots
         // against current state, but only while it is still safe (validation
-        // rejects already-`Inactive` consumed postings).
+        // rejects a consumed posting that is no longer live).
         if !past_no_return {
             let loaded = self.load(envelope).await?;
             self.plan(envelope, &loaded)?;
         }
 
-        // Point of no return: record Finalizing before any posting turns Inactive.
+        // Point of no return: record Finalizing before any posting is consumed.
         self.save_pending(envelope, reservation, SagaPhase::Finalizing)
             .await?;
 
-        // Deactivate consumed postings (PendingInactive owned by us → Inactive),
-        // then assert ALL consumed postings are Inactive. This is the double-spend
-        // guard: do not create/store unless the inputs were really consumed by us.
+        // Consume our reserved postings (remove from the reserved index → spent),
+        // then assert ALL consumed postings are spent. This is the double-spend
+        // guard: `deactivate_postings(Some(rid))` only removes rows we reserved,
+        // so any consumed id still active or reserved by another saga leaves the
+        // "all spent" check failing.
         self.store
             .deactivate_postings(consumes, Some(reservation))
             .await?;
         if !consumes.is_empty() {
-            let after = self.store.get_postings(consumes).await?;
-            if after.len() != consumes.len()
-                || after.iter().any(|p| p.status != PostingStatus::Inactive)
-            {
+            let after = self.store.get_posting_states(consumes).await?;
+            if after.len() != consumes.len() || after.iter().any(|s| *s != PostingState::Spent) {
                 return Err(LedgerError::Store(StoreError::Internal(
-                    "finalize: consumed postings not all inactive (contended or not reserved by this saga)".into(),
+                    "finalize: consumed postings not all spent (contended or not reserved by this saga)".into(),
                 )));
             }
         }
@@ -651,7 +658,8 @@ impl Ledger {
     // Internal: resolve account snapshots
     // -----------------------------------------------------------------------
 
-    /// Compute balance from non-Inactive postings for an account/asset pair.
+    /// Compute balance from the live (active or reserved) postings for an
+    /// account/asset pair.
     async fn compute_balance(
         &self,
         account: &AccountId,
@@ -659,14 +667,14 @@ impl Ledger {
     ) -> Result<Cent, LedgerError> {
         let postings = self
             .store
-            .get_postings_by_account(account.id, Some(account.sub), Some(asset), None)
+            .get_postings_by_account(
+                account.id,
+                Some(account.sub),
+                Some(asset),
+                PostingFilter::Live,
+            )
             .await?;
-        Ok(Cent::checked_sum(
-            postings
-                .iter()
-                .filter(|p| p.status != PostingStatus::Inactive)
-                .map(|p| p.value),
-        )?)
+        Ok(Cent::checked_sum(postings.iter().map(|p| p.value))?)
     }
 
     async fn resolve_snapshots(
@@ -742,15 +750,13 @@ impl Ledger {
         if current.is_closed() {
             return Err(LedgerError::AccountAlreadyClosed(*id));
         }
-        // Reject if any posting is still live — Active or PendingInactive
-        // (reserved, i.e. a transfer in flight). Only fully Inactive postings
-        // (or none) permit a close.
-        let blocking = self
+        // Reject if any posting is still live — active or reserved (a transfer
+        // in flight). Only spent postings (or none) permit a close.
+        let blocking = !self
             .store
-            .get_postings_by_account(id.id, Some(id.sub), None, None)
+            .get_postings_by_account(id.id, Some(id.sub), None, PostingFilter::Live)
             .await?
-            .into_iter()
-            .any(|p| p.status != PostingStatus::Inactive);
+            .is_empty();
         if blocking {
             return Err(LedgerError::AccountNotEmpty(*id));
         }
@@ -863,15 +869,27 @@ impl Ledger {
         Ok(self.store.query_transfers(query).await?)
     }
 
-    /// Return all postings (any status) for the given account.
+    /// Return all postings (any state) for the given account.
     pub async fn postings(
         &self,
         account: &AccountId,
     ) -> Result<Vec<kuatia_core::Posting>, LedgerError> {
         Ok(self
             .store
-            .get_postings_by_account(account.id, Some(account.sub), None, None)
+            .get_postings_by_account(account.id, Some(account.sub), None, PostingFilter::All)
             .await?)
+    }
+
+    /// Return all postings for the given account paired with their derived
+    /// lifecycle state (active, reserved, or spent).
+    pub async fn postings_with_state(
+        &self,
+        account: &AccountId,
+    ) -> Result<Vec<(kuatia_core::Posting, PostingState)>, LedgerError> {
+        let postings = self.postings(account).await?;
+        let ids: Vec<PostingId> = postings.iter().map(|p| p.id).collect();
+        let states = self.store.get_posting_states(&ids).await?;
+        Ok(postings.into_iter().zip(states).collect())
     }
 
     /// Query postings with filtering and pagination.
@@ -1046,7 +1064,7 @@ mod recovery_tests {
     }
 
     /// A commit that crashed mid-finalize (phase Finalizing; the consumed posting
-    /// is already Inactive) is rolled forward by `recover()`.
+    /// is already spent) is rolled forward by `recover()`.
     #[tokio::test]
     async fn recover_completes_partial_finalize() {
         let ledger = funded_ledger().await;
@@ -1214,7 +1232,7 @@ mod recovery_tests {
         );
         let active = ledger
             .store()
-            .get_postings_by_account(1, None, Some(&AssetId::new(1)), Some(PostingStatus::Active))
+            .get_postings_by_account(1, None, Some(&AssetId::new(1)), PostingFilter::Active)
             .await
             .unwrap();
         assert_eq!(active.len(), 1); // back to Active

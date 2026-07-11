@@ -8,8 +8,8 @@ use tokio::sync::RwLock;
 
 use kuatia_types::autoid::AutoId;
 use kuatia_types::{
-    Account, AccountId, AssetId, Book, BookId, EnvelopeId, Posting, PostingId, PostingStatus,
-    ReservationId,
+    Account, AccountId, AssetId, Book, BookId, EnvelopeId, Posting, PostingFilter, PostingId,
+    PostingState, ReservationId,
 };
 
 use crate::error::StoreError;
@@ -18,9 +18,23 @@ use crate::store::{
     AccountStore, BookStore, EnvelopeRecord, PostingStore, SagaStore, TransferStore,
 };
 
+/// Postings held as an immutable record table plus two index maps that carry
+/// full row copies of the live set, so a live-set read never merges back to the
+/// immutable record. Kept under one lock so the reserve claim (remove from
+/// active + insert into reserved) is atomic.
+#[derive(Default)]
+struct PostingTables {
+    /// The append-only record of every posting; never mutated or removed.
+    immutable: HashMap<PostingId, Posting>,
+    /// Full copies of spendable postings.
+    active: HashMap<PostingId, Posting>,
+    /// Full copies of reserved postings, each with its owning reservation.
+    reserved: HashMap<PostingId, (Posting, ReservationId)>,
+}
+
 /// In-memory [`Store`](crate::store::Store) implementation backed by `RwLock<HashMap>`.
 pub struct InMemoryStore {
-    postings: RwLock<HashMap<PostingId, Posting>>,
+    postings: RwLock<PostingTables>,
     accounts: RwLock<HashMap<AccountId, Vec<Account>>>,
     transfers: RwLock<HashMap<EnvelopeId, EnvelopeRecord>>,
     sagas: RwLock<HashMap<i64, Vec<u8>>>,
@@ -39,7 +53,7 @@ impl InMemoryStore {
     /// Create an empty in-memory store.
     pub fn new() -> Self {
         Self {
-            postings: RwLock::new(HashMap::new()),
+            postings: RwLock::new(PostingTables::default()),
             accounts: RwLock::new(HashMap::new()),
             transfers: RwLock::new(HashMap::new()),
             sagas: RwLock::new(HashMap::new()),
@@ -138,6 +152,7 @@ impl PostingStore for InMemoryStore {
         let mut result = Vec::with_capacity(ids.len());
         for id in ids {
             let posting = postings
+                .immutable
                 .get(id)
                 .ok_or_else(|| StoreError::NotFound(format!("posting {id:?}")))?;
             result.push(posting.clone());
@@ -150,18 +165,52 @@ impl PostingStore for InMemoryStore {
         id: i64,
         sub: Option<i64>,
         asset: Option<&AssetId>,
-        status: Option<PostingStatus>,
+        filter: PostingFilter,
     ) -> Result<Vec<Posting>, StoreError> {
         let postings = self.postings.read().await;
-        Ok(postings
-            .values()
-            .filter(|p| {
-                p.owner.id == id
-                    && sub.is_none_or(|s| p.owner.sub == s)
-                    && asset.is_none_or(|a| p.asset == *a)
-                    && status.is_none_or(|s| p.status == s)
+        let matches = |p: &&Posting| {
+            p.owner.id == id
+                && sub.is_none_or(|s| p.owner.sub == s)
+                && asset.is_none_or(|a| p.asset == *a)
+        };
+        // Read from the relevant set directly — no merge back to the immutable
+        // record. `Live` is the two disjoint live sets chained together.
+        let reserved = || postings.reserved.values().map(|(p, _)| p);
+        let result: Vec<Posting> = match filter {
+            PostingFilter::Active => postings.active.values().filter(matches).cloned().collect(),
+            PostingFilter::Reserved => reserved().filter(matches).cloned().collect(),
+            PostingFilter::Live => postings
+                .active
+                .values()
+                .chain(reserved())
+                .filter(matches)
+                .cloned()
+                .collect(),
+            PostingFilter::All => postings
+                .immutable
+                .values()
+                .filter(matches)
+                .cloned()
+                .collect(),
+        };
+        Ok(result)
+    }
+
+    async fn get_posting_states(&self, ids: &[PostingId]) -> Result<Vec<PostingState>, StoreError> {
+        let postings = self.postings.read().await;
+        Ok(ids
+            .iter()
+            .map(|id| {
+                if postings.active.contains_key(id) {
+                    PostingState::Active
+                } else if let Some((_, rid)) = postings.reserved.get(id) {
+                    PostingState::Reserved(*rid)
+                } else if postings.immutable.contains_key(id) {
+                    PostingState::Spent
+                } else {
+                    PostingState::Missing
+                }
             })
-            .cloned()
             .collect())
     }
 
@@ -173,12 +222,11 @@ impl PostingStore for InMemoryStore {
         let mut postings = self.postings.write().await;
         let mut reserved: u64 = 0;
         for id in ids {
-            let Some(posting) = postings.get_mut(id) else {
-                continue; // dumb: a missing row just doesn't count
-            };
-            if posting.status == PostingStatus::Active {
-                posting.status = PostingStatus::PendingInactive;
-                posting.reservation = Some(reservation);
+            // Removing the active copy is the atomic claim: only one caller can
+            // remove a given id, and only then is the copy moved to the reserved
+            // set (carrying its data, so reserved reads never merge).
+            if let Some(p) = postings.active.remove(id) {
+                postings.reserved.insert(*id, (p, reservation));
                 reserved += 1;
             }
         }
@@ -193,15 +241,11 @@ impl PostingStore for InMemoryStore {
         let mut postings = self.postings.write().await;
         let mut released: u64 = 0;
         for id in ids {
-            let Some(posting) = postings.get_mut(id) else {
-                continue;
-            };
-            if posting.status == PostingStatus::PendingInactive
-                && posting.reservation == Some(reservation)
-            {
-                posting.status = PostingStatus::Active;
-                posting.reservation = None;
-                released += 1;
+            if postings.reserved.get(id).map(|(_, r)| *r) == Some(reservation) {
+                if let Some((p, _)) = postings.reserved.remove(id) {
+                    postings.active.insert(*id, p);
+                    released += 1;
+                }
             }
         }
         Ok(released)
@@ -215,19 +259,18 @@ impl PostingStore for InMemoryStore {
         let mut postings = self.postings.write().await;
         let mut changed: u64 = 0;
         for id in ids {
-            let Some(posting) = postings.get_mut(id) else {
-                continue; // dumb: a missing row just doesn't count
-            };
-            let matches = match reservation {
-                None => posting.status == PostingStatus::Active,
+            let removed = match reservation {
+                None => postings.active.remove(id).is_some(),
                 Some(rid) => {
-                    posting.status == PostingStatus::PendingInactive
-                        && posting.reservation == Some(rid)
+                    if postings.reserved.get(id).map(|(_, r)| *r) == Some(rid) {
+                        postings.reserved.remove(id);
+                        true
+                    } else {
+                        false
+                    }
                 }
             };
-            if matches {
-                posting.status = PostingStatus::Inactive;
-                posting.reservation = None;
+            if removed {
                 changed += 1;
             }
         }
@@ -238,8 +281,13 @@ impl PostingStore for InMemoryStore {
         let mut store = self.postings.write().await;
         let mut inserted: u64 = 0;
         for posting in postings {
-            if let std::collections::hash_map::Entry::Vacant(e) = store.entry(posting.id) {
+            if let std::collections::hash_map::Entry::Vacant(e) = store.immutable.entry(posting.id)
+            {
                 e.insert(posting.clone());
+                // Only newly-inserted postings are activated; a since-spent
+                // posting is not re-activated on a replayed insert. The active
+                // set carries a full copy so spendable reads never merge.
+                store.active.insert(posting.id, posting.clone());
                 inserted += 1;
             }
         }
@@ -293,11 +341,12 @@ impl TransferStore for InMemoryStore {
                     .creates()
                     .iter()
                     .any(|np| matches(&np.owner))
-                    || record
-                        .envelope
-                        .consumes()
-                        .iter()
-                        .any(|pid| postings.get(pid).is_some_and(|p| matches(&p.owner)))
+                    || record.envelope.consumes().iter().any(|pid| {
+                        postings
+                            .immutable
+                            .get(pid)
+                            .is_some_and(|p| matches(&p.owner))
+                    })
             })
             .cloned()
             .collect();

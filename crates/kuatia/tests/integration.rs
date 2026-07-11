@@ -409,12 +409,12 @@ async fn fx_trade_via_market_account() {
     // Build the atomic envelope manually since it spans two assets
     let a1_usd_postings = ledger
         .store()
-        .get_postings_by_account(1, None, Some(&usd()), Some(PostingStatus::Active))
+        .get_postings_by_account(1, None, Some(&usd()), PostingFilter::Active)
         .await
         .unwrap();
     let fx_eur_postings = ledger
         .store()
-        .get_postings_by_account(50, None, Some(&eur()), Some(PostingStatus::Active))
+        .get_postings_by_account(50, None, Some(&eur()), PostingFilter::Active)
         .await
         .unwrap();
 
@@ -535,10 +535,11 @@ async fn close_rejects_reserved_postings() {
 
     deposit(&ledger, account(1), usd(), Cent::from(100), external()).await;
 
-    // Reserve the account's only posting (a transfer in flight): Active → PendingInactive.
+    // Reserve the account's only posting (a transfer in flight): move it from
+    // the active index into the reserved index.
     let postings = ledger
         .store()
-        .get_postings_by_account(1, None, Some(&usd()), Some(PostingStatus::Active))
+        .get_postings_by_account(1, None, Some(&usd()), PostingFilter::Active)
         .await
         .unwrap();
     ledger
@@ -547,7 +548,7 @@ async fn close_rejects_reserved_postings() {
         .await
         .unwrap();
 
-    // Close must reject: the posting is live (PendingInactive), not Inactive.
+    // Close must reject: the posting is live (reserved), not spent.
     let result = ledger.close(&account(1)).await;
     assert!(result.is_err());
 }
@@ -594,9 +595,13 @@ async fn postings_returns_all_postings() {
     // Original 100 posting (now consumed) + 40 change posting (active)
     assert_eq!(posts.len(), 2);
 
-    let active: Vec<_> = posts.iter().filter(|p| p.is_active()).collect();
+    let with_state = ledger.postings_with_state(&account(1)).await.unwrap();
+    let active: Vec<_> = with_state
+        .iter()
+        .filter(|(_, s)| *s == PostingState::Active)
+        .collect();
     assert_eq!(active.len(), 1);
-    assert_eq!(active[0].value, Cent::from(40));
+    assert_eq!(active[0].0.value, Cent::from(40));
 }
 
 #[tokio::test]
@@ -777,7 +782,7 @@ async fn capped_overdraft_creates_negative_posting() {
     // A negative posting now backs the overdraft.
     let postings = ledger
         .store()
-        .get_postings_by_account(10, None, Some(&usd()), Some(PostingStatus::Active))
+        .get_postings_by_account(10, None, Some(&usd()), PostingFilter::Active)
         .await
         .unwrap();
     assert!(postings.iter().any(|p| p.value == Cent::from(-50)));

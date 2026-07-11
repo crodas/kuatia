@@ -120,6 +120,11 @@ async fn seed_active(store: &(impl Store + 'static), _tag: u8, create: &[Posting
     store.insert_postings(create).await.unwrap();
 }
 
+/// Fetch the derived [`PostingState`] of a single posting.
+async fn state_of(store: &(impl Store + 'static), id: PostingId) -> PostingState {
+    store.get_posting_states(&[id]).await.unwrap()[0]
+}
+
 /// Persist `envelope` as a committed transfer, deriving its created postings the
 /// way the ledger does (`PostingId { transfer: tid, index }`) and indexing the
 /// created owners — the same shape the saga produces.
@@ -321,20 +326,20 @@ pub async fn get_postings_by_account_filters(store: &(impl Store + 'static)) {
     seed_active(store, 200, &[p1, p2, p3]).await;
 
     let all = store
-        .get_postings_by_account(1, None, None, None)
+        .get_postings_by_account(1, None, None, PostingFilter::All)
         .await
         .unwrap();
     assert_eq!(all.len(), 2);
 
     let filtered = store
-        .get_postings_by_account(1, None, Some(&AssetId::new(1)), None)
+        .get_postings_by_account(1, None, Some(&AssetId::new(1)), PostingFilter::All)
         .await
         .unwrap();
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].value, Cent::from(100));
 
     let active = store
-        .get_postings_by_account(1, None, None, Some(PostingStatus::Active))
+        .get_postings_by_account(1, None, None, PostingFilter::Active)
         .await
         .unwrap();
     assert_eq!(active.len(), 2);
@@ -352,14 +357,14 @@ pub async fn get_postings_by_subaccount(store: &(impl Store + 'static)) {
 
     // sub = None spans every subaccount of base id 1.
     let all = store
-        .get_postings_by_account(1, None, Some(&AssetId::new(1)), None)
+        .get_postings_by_account(1, None, Some(&AssetId::new(1)), PostingFilter::All)
         .await
         .unwrap();
     assert_eq!(all.len(), 3);
 
     // sub = Some(0) is the main account only.
     let main_only = store
-        .get_postings_by_account(1, Some(0), Some(&AssetId::new(1)), None)
+        .get_postings_by_account(1, Some(0), Some(&AssetId::new(1)), PostingFilter::All)
         .await
         .unwrap();
     assert_eq!(main_only.len(), 1);
@@ -369,7 +374,7 @@ pub async fn get_postings_by_subaccount(store: &(impl Store + 'static)) {
     // sub = Some(7) is that subaccount only; its two postings are never folded
     // into the main account's figure.
     let sub_only = store
-        .get_postings_by_account(1, Some(7), Some(&AssetId::new(1)), None)
+        .get_postings_by_account(1, Some(7), Some(&AssetId::new(1)), PostingFilter::All)
         .await
         .unwrap();
     assert_eq!(sub_only.len(), 2);
@@ -381,7 +386,7 @@ pub async fn get_postings_by_subaccount(store: &(impl Store + 'static)) {
 
     // A subaccount that was never used returns nothing.
     let empty = store
-        .get_postings_by_account(1, Some(9), None, None)
+        .get_postings_by_account(1, Some(9), None, PostingFilter::All)
         .await
         .unwrap();
     assert!(empty.is_empty());
@@ -401,7 +406,7 @@ pub async fn query_postings_pagination(store: &(impl Store + 'static)) {
             account: 1,
             sub: None,
             asset: None,
-            status: None,
+            filter: PostingFilter::All,
             limit: Some(2),
             offset: Some(0),
         })
@@ -416,7 +421,7 @@ pub async fn query_postings_pagination(store: &(impl Store + 'static)) {
             account: 1,
             sub: None,
             asset: None,
-            status: None,
+            filter: PostingFilter::All,
             limit: Some(2),
             offset: Some(2),
         })
@@ -431,7 +436,7 @@ pub async fn query_postings_pagination(store: &(impl Store + 'static)) {
             account: 1,
             sub: None,
             asset: None,
-            status: None,
+            filter: PostingFilter::All,
             limit: Some(2),
             offset: Some(4),
         })
@@ -446,7 +451,7 @@ pub async fn query_postings_pagination(store: &(impl Store + 'static)) {
             account: 1,
             sub: None,
             asset: Some(AssetId::new(1)),
-            status: None,
+            filter: PostingFilter::All,
             limit: Some(10),
             offset: None,
         })
@@ -456,22 +461,17 @@ pub async fn query_postings_pagination(store: &(impl Store + 'static)) {
     assert_eq!(filtered.items.len(), 5);
 }
 
-/// Reserve a batch of postings: Active → PendingInactive.
+/// Reserve a batch of postings: active index → reserved index.
 pub async fn reserve_postings_batch(store: &(impl Store + 'static)) {
     let p1 = make_posting([1; 32], 0, 1, 1, 100);
     let p2 = make_posting([1; 32], 1, 1, 1, 200);
     seed_active(store, 200, &[p1.clone(), p2.clone()]).await;
 
-    store
-        .reserve_postings(&[p1.id, p2.id], ReservationId::new(1))
-        .await
-        .unwrap();
+    let rid = ReservationId::new(1);
+    store.reserve_postings(&[p1.id, p2.id], rid).await.unwrap();
 
-    let got = store.get_postings(&[p1.id, p2.id]).await.unwrap();
-    assert!(
-        got.iter()
-            .all(|p| p.status == PostingStatus::PendingInactive)
-    );
+    let states = store.get_posting_states(&[p1.id, p2.id]).await.unwrap();
+    assert!(states.iter().all(|s| *s == PostingState::Reserved(rid)));
 }
 
 /// Reserve only flips the still-Active postings and reports that count; an
@@ -490,7 +490,7 @@ pub async fn reserve_skips_non_active(store: &(impl Store + 'static)) {
         1
     );
 
-    // p1 already PendingInactive → only p2 (still Active) reserves.
+    // p1 already reserved → only p2 (still active) reserves.
     assert_eq!(
         store
             .reserve_postings(&[p1.id, p2.id], ReservationId::new(1))
@@ -499,8 +499,8 @@ pub async fn reserve_skips_non_active(store: &(impl Store + 'static)) {
         1
     );
     assert_eq!(
-        store.get_postings(&[p2.id]).await.unwrap()[0].status,
-        PostingStatus::PendingInactive
+        state_of(store, p2.id).await,
+        PostingState::Reserved(ReservationId::new(1))
     );
 }
 
@@ -518,8 +518,7 @@ pub async fn release_postings_batch(store: &(impl Store + 'static)) {
         .await
         .unwrap();
 
-    let got = store.get_postings(&[p1.id]).await.unwrap();
-    assert_eq!(got[0].status, PostingStatus::Active);
+    assert_eq!(state_of(store, p1.id).await, PostingState::Active);
 }
 
 /// Releasing an Active posting is a no-op (succeeds silently).
@@ -532,16 +531,15 @@ pub async fn release_active_is_noop(store: &(impl Store + 'static)) {
         .await
         .unwrap();
 
-    let got = store.get_postings(&[p1.id]).await.unwrap();
-    assert_eq!(got[0].status, PostingStatus::Active);
+    assert_eq!(state_of(store, p1.id).await, PostingState::Active);
 }
 
-/// Releasing an Inactive (void) posting is a no-op: zero rows released.
+/// Releasing a spent posting is a no-op: zero rows released.
 pub async fn release_inactive_zero(store: &(impl Store + 'static)) {
     let p1 = make_posting([1; 32], 0, 1, 1, 100);
     seed_active(store, 200, std::slice::from_ref(&p1)).await;
 
-    // Deactivate p1 (raw path: still Active) so the release sees a void posting.
+    // Deactivate p1 (raw path: still active) so the release sees a spent posting.
     assert_eq!(store.deactivate_postings(&[p1.id], None).await.unwrap(), 1);
 
     assert_eq!(
@@ -551,14 +549,12 @@ pub async fn release_inactive_zero(store: &(impl Store + 'static)) {
             .unwrap(),
         0
     );
-    assert_eq!(
-        store.get_postings(&[p1.id]).await.unwrap()[0].status,
-        PostingStatus::Inactive
-    );
+    assert_eq!(state_of(store, p1.id).await, PostingState::Spent);
 }
 
-/// Deactivating a reserved posting (saga path) transitions it
-/// PendingInactive → Inactive while a separate insert adds the created posting.
+/// Deactivating a reserved posting (saga path) removes it from the reserved
+/// index (→ spent) while a separate insert adds and activates the created
+/// posting.
 pub async fn commit_deactivates_postings(store: &(impl Store + 'static)) {
     let p1 = make_posting([1; 32], 0, 1, 1, 100);
     seed_active(store, 200, std::slice::from_ref(&p1)).await;
@@ -568,7 +564,7 @@ pub async fn commit_deactivates_postings(store: &(impl Store + 'static)) {
         .unwrap();
 
     let p2 = make_posting([2; 32], 0, 1, 1, 100);
-    // Saga path: p1 is PendingInactive owned by reservation 1.
+    // Saga path: p1 is reserved by reservation 1.
     assert_eq!(
         store
             .deactivate_postings(&[p1.id], Some(ReservationId::new(1)))
@@ -581,11 +577,8 @@ pub async fn commit_deactivates_postings(store: &(impl Store + 'static)) {
         .await
         .unwrap();
 
-    let got = store.get_postings(&[p1.id]).await.unwrap();
-    assert_eq!(got[0].status, PostingStatus::Inactive);
-
-    let got2 = store.get_postings(&[p2.id]).await.unwrap();
-    assert_eq!(got2[0].status, PostingStatus::Active);
+    assert_eq!(state_of(store, p1.id).await, PostingState::Spent);
+    assert_eq!(state_of(store, p2.id).await, PostingState::Active);
 }
 
 // ---------------------------------------------------------------------------
@@ -616,8 +609,8 @@ pub async fn insert_postings_counts(store: &(impl Store + 'static)) {
     assert_eq!(store.insert_postings(&[p1, p2]).await.unwrap(), 0);
 }
 
-/// `deactivate_postings` (raw path) flips Active→Inactive and reports the count;
-/// a replay over already-Inactive postings reports zero.
+/// `deactivate_postings` (raw path) removes active ids (→ spent) and reports the
+/// count; a replay over already-spent postings reports zero.
 pub async fn deactivate_postings_counts(store: &(impl Store + 'static)) {
     let p1 = make_posting([4; 32], 0, 1, 1, 100);
     let p2 = make_posting([4; 32], 1, 1, 1, 200);
@@ -633,7 +626,7 @@ pub async fn deactivate_postings_counts(store: &(impl Store + 'static)) {
             .unwrap(),
         2
     );
-    // replay: already Inactive → 0
+    // replay: already spent → 0
     assert_eq!(
         store
             .deactivate_postings(&[p1.id, p2.id], None)
@@ -641,10 +634,7 @@ pub async fn deactivate_postings_counts(store: &(impl Store + 'static)) {
             .unwrap(),
         0
     );
-    assert_eq!(
-        store.get_postings(&[p1.id]).await.unwrap()[0].status,
-        PostingStatus::Inactive
-    );
+    assert_eq!(state_of(store, p1.id).await, PostingState::Spent);
 }
 
 /// `deactivate_postings` (saga path) only flips postings reserved by the given
@@ -676,6 +666,125 @@ pub async fn deactivate_postings_saga_path(store: &(impl Store + 'static)) {
             .unwrap(),
         1
     );
+}
+
+/// `get_posting_states` reflects index membership across every derived state:
+/// active, reserved (with its owner), spent, and missing.
+pub async fn get_posting_states_reflect_membership(store: &(impl Store + 'static)) {
+    let active = make_posting([9; 32], 0, 1, 1, 100);
+    let reserved = make_posting([9; 32], 1, 1, 1, 200);
+    let spent = make_posting([9; 32], 2, 1, 1, 300);
+    let missing = PostingId {
+        transfer: EnvelopeId([0xEE; 32]),
+        index: 0,
+    };
+    store
+        .insert_postings(&[active.clone(), reserved.clone(), spent.clone()])
+        .await
+        .unwrap();
+
+    let rid = ReservationId::new(3);
+    store.reserve_postings(&[reserved.id], rid).await.unwrap();
+    store.deactivate_postings(&[spent.id], None).await.unwrap();
+
+    let states = store
+        .get_posting_states(&[active.id, reserved.id, spent.id, missing])
+        .await
+        .unwrap();
+    assert_eq!(
+        states,
+        vec![
+            PostingState::Active,
+            PostingState::Reserved(rid),
+            PostingState::Spent,
+            PostingState::Missing,
+        ]
+    );
+}
+
+/// `get_posting_states` stays aligned to input order for a larger batch, with
+/// ids interleaved out of insertion order and repeated. This guards the batched
+/// SQL path, which fetches each state table as a set and must reconstruct the
+/// per-id state positionally (duplicates resolve to the same state).
+pub async fn get_posting_states_batch_preserves_order(store: &(impl Store + 'static)) {
+    let active = make_posting([7; 32], 0, 1, 1, 100);
+    let reserved = make_posting([7; 32], 1, 1, 1, 200);
+    let spent = make_posting([7; 32], 2, 1, 1, 300);
+    let missing = PostingId {
+        transfer: EnvelopeId([0xAB; 32]),
+        index: 5,
+    };
+    store
+        .insert_postings(&[active.clone(), reserved.clone(), spent.clone()])
+        .await
+        .unwrap();
+
+    let rid = ReservationId::new(7);
+    store.reserve_postings(&[reserved.id], rid).await.unwrap();
+    store.deactivate_postings(&[spent.id], None).await.unwrap();
+
+    // Interleaved, out of insertion order, with `active` and `missing` repeated.
+    let query = [
+        missing,
+        spent.id,
+        active.id,
+        reserved.id,
+        active.id,
+        missing,
+    ];
+    let states = store.get_posting_states(&query).await.unwrap();
+    assert_eq!(
+        states,
+        vec![
+            PostingState::Missing,
+            PostingState::Spent,
+            PostingState::Active,
+            PostingState::Reserved(rid),
+            PostingState::Active,
+            PostingState::Missing,
+        ]
+    );
+
+    // Empty input returns an empty vec (the batched path guards this).
+    assert!(store.get_posting_states(&[]).await.unwrap().is_empty());
+}
+
+/// A consumed posting is removed from the indexes but stays in the immutable
+/// table forever: `get_postings` still returns it while its state is `Spent`.
+pub async fn spent_posting_remains_in_immutable_table(store: &(impl Store + 'static)) {
+    let p = make_posting([0xA1; 32], 0, 1, 1, 100);
+    seed_active(store, 0, std::slice::from_ref(&p)).await;
+    store.deactivate_postings(&[p.id], None).await.unwrap();
+
+    let got = store.get_postings(&[p.id]).await.unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].value, Cent::from(100));
+    assert_eq!(state_of(store, p.id).await, PostingState::Spent);
+}
+
+/// The `Live` filter returns active and reserved postings but excludes spent
+/// ones (the replacement for the old "not Inactive" balance-bearing set).
+pub async fn get_postings_by_account_live_filter(store: &(impl Store + 'static)) {
+    let active = make_posting([0xB2; 32], 0, 1, 1, 100);
+    let reserved = make_posting([0xB2; 32], 1, 1, 1, 200);
+    let spent = make_posting([0xB2; 32], 2, 1, 1, 300);
+    store
+        .insert_postings(&[active.clone(), reserved.clone(), spent.clone()])
+        .await
+        .unwrap();
+    store
+        .reserve_postings(&[reserved.id], ReservationId::new(1))
+        .await
+        .unwrap();
+    store.deactivate_postings(&[spent.id], None).await.unwrap();
+
+    let live = store
+        .get_postings_by_account(1, None, None, PostingFilter::Live)
+        .await
+        .unwrap();
+    let mut ids: Vec<PostingId> = live.iter().map(|p| p.id).collect();
+    ids.sort_by_key(|id| id.index);
+    assert_eq!(ids, vec![active.id, reserved.id]);
 }
 
 /// `store_transfer` returns 1 when the record is newly inserted, 0 on replay,
@@ -1063,6 +1172,10 @@ macro_rules! store_tests {
             insert_postings_counts,
             deactivate_postings_counts,
             deactivate_postings_saga_path,
+            get_posting_states_reflect_membership,
+            get_posting_states_batch_preserves_order,
+            spent_posting_remains_in_immutable_table,
+            get_postings_by_account_live_filter,
             store_transfer_counts,
             // Reservation / double-spend regressions
             reserve_twice_second_zero,
