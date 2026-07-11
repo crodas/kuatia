@@ -25,6 +25,7 @@ to reverse a decision. Instead, a new ADR supersedes it.
 | [0013](0013-journaling-model.md) | Journaling model: transfer as journal entry | accepted | A committed `Transfer`/`Envelope` is a (compound) journal entry; the transfer log is the accounting journal; `Book` is a policy scope, not the journal. Frames 0001/0005/0010 in accounting terms. |
 | [0014](0014-inflight-holds-via-holding-accounts.md) | Inflight holds via per-destination holding accounts | accepted | A hold is a subaccount of its destination; committing routes funds through the holding subaccount so pending value stays visible and reconcilable until settle or cancel. |
 | [0015](0015-fixed-width-account-code.md) | Fixed-width 20-character account code | accepted | The IBAN-style code becomes a fixed 20 chars (18-char body + 2 trailing check digits, five groups of four) by packing id (63 bits) and subaccount (30 bits) into one permuted value. Presentation-only; caps the subaccount at `SUB_BITS`. Supersedes the code section of 0012. |
+| [0016](0016-hold-expiry-and-reaper.md) | Hold expiry via deadline metadata and an in-memory reaper | accepted | An authorization carries an optional `expires_at` in its metadata; an in-memory `BTreeMap` deadline index (rebuilt on recover) drives a background reaper that voids due holds via the ordinary `void` path. No mutable expiry store. Extends 0014. |
 
 ## Recommended future ADRs
 

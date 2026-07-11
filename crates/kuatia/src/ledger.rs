@@ -1,9 +1,10 @@
 //! The async ledger resource -- the primary entry point for callers.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 
 use legend::{ExecutionResult, legend};
+use tokio::sync::Notify;
 use tracing::instrument;
 
 use kuatia_core::{
@@ -68,6 +69,15 @@ pub struct SubAccountBalance {
 /// Async ledger resource composing the commit pipeline.
 pub struct Ledger {
     store: Arc<dyn Store>,
+    /// In-memory index of inflight deadlines: `expires_at` (Unix ms) -> the
+    /// inflight handles due at that time. A derived cache, rebuilt from the
+    /// authorize metadata by [`recover`](Self::recover); it drives the expiry
+    /// reaper (ADR-0016). The durable source of truth is the deadline recorded in
+    /// each authorize transfer's metadata, never this map.
+    pub(crate) expiry: Mutex<BTreeMap<i64, BTreeSet<EnvelopeId>>>,
+    /// Wakes the reaper when a newly authorized hold has an earlier deadline than
+    /// the one it is currently sleeping on.
+    pub(crate) reaper_wake: Notify,
 }
 
 impl Ledger {
@@ -75,6 +85,8 @@ impl Ledger {
     pub fn new(store: impl Store + 'static) -> Self {
         Self {
             store: Arc::new(store),
+            expiry: Mutex::new(BTreeMap::new()),
+            reaper_wake: Notify::new(),
         }
     }
 
@@ -429,6 +441,9 @@ impl Ledger {
                 }
             }
         }
+        // Rebuild the in-memory expiry index from the durable authorize metadata,
+        // so deadlines set before a crash still drive the reaper (ADR-0016).
+        self.rebuild_expiry_index().await?;
         Ok(count)
     }
 

@@ -41,12 +41,18 @@ stateDiagram-v2
     Held --> Held: confirm (partial)
     Held --> Confirmed: confirm_all / drained
     Held --> Voided: void
+    Held --> Expired: deadline passes
+    Expired --> Voided: reaper voids
     Confirmed --> [*]
     Voided --> [*]
 ```
 
 Every operation is an ordinary `commit`, so idempotency, conservation, and crash
 recovery are inherited unchanged. A hold closes automatically once drained.
+
+`Expired` is a derived, transient state: a hold whose deadline has passed but
+whose funds are still held. The reaper resolves it to `Voided` by returning the
+funds to their funders. See [Expiry](#expiry) below.
 
 ## API
 
@@ -84,8 +90,50 @@ let status = ledger.inflight_status(&auth.inflight).await?;
 let open = ledger.list_open_inflights().await?;
 ```
 
-`authorize` returns an `Authorization { inflight, receipt, legs }`. The
+`authorize` returns an `Authorization { inflight, legs, expires_at }`. The
 `inflight` field (an `EnvelopeId`) is the handle passed to every other call.
+
+## Expiry
+
+A hold can carry a deadline. Funds still held past it are returned to their
+funders automatically, so an abandoned authorization does not park a payer's
+balance forever.
+
+```rust
+// Authorize with an auto-void deadline (Unix milliseconds).
+let deadline = now_millis + 30 * 60 * 1000; // 30 minutes from now
+let auth = ledger.authorize_with_expiry(trade, deadline).await?;
+
+// Run once per process: a background task that voids holds as they expire.
+// Keep the handle alive for as long as the ledger should auto-void; dropping it
+// stops the task.
+let reaper = ledger.spawn_expiry_reaper();
+
+// Or drive expiry manually (e.g. from your own scheduler): void everything due
+// at or before `now`.
+let reaped = ledger.expire_due(now_millis).await;
+```
+
+Plain `authorize` records no deadline: the hold never expires and must be
+settled explicitly.
+
+How it works (see [adr/0016-hold-expiry-and-reaper.md](adr/0016-hold-expiry-and-reaper.md)):
+
+- The deadline is stored in the authorize transfer's metadata, next to the leg
+  table. Nothing mutable is added, and the deadline is content-addressed into the
+  handle like the rest of the payload.
+- The ledger keeps an in-memory `BTreeMap<deadline, {handle}>` that drives the
+  reaper: it sleeps until the earliest deadline rather than polling. The map is a
+  cache, rebuilt from the durable metadata by `Ledger::recover()` on startup, so
+  a restart loses no deadline.
+- Auto-void is the ordinary `void`, so it is crash-safe, idempotent, and appears
+  in the audit trail as a normal void (the funds went back to the funder either
+  way). `inflight_status` reports `InflightState::Expired` for a past-deadline
+  hold that the reaper has not yet reached.
+
+Run at most one reaper per store. Two racing reapers are safe (the loser voids
+nothing) but redundant. While the ledger is down, deadlines do not fire; they are
+swept on the next startup after `recover()` rebuilds the index.
 
 ## Guarantees
 
@@ -128,7 +176,10 @@ summed.
 ## Where it lives
 
 - `crates/kuatia/src/inflight.rs` — the API and metadata schema.
+- `crates/kuatia/src/expiry.rs` — the deadline index and the reaper task.
 - `crates/kuatia/tests/inflight.rs` — authorize, confirm, partial confirm, void,
   over-confirm rejection, concurrent inflights per account, segregated balances,
   and status tests.
+- `crates/kuatia/tests/expiry.rs` — deadline surfacing, the `Expired` state,
+  `expire_due`, the reaper, and index rebuild.
 - `AccountFlags::INFLIGHT` — `crates/kuatia-types/src/lib.rs`.

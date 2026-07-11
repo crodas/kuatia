@@ -5,6 +5,7 @@
 //! commit pipeline (load → plan → apply) behind a convenient async API.
 
 pub mod error;
+pub mod expiry;
 pub mod inflight;
 pub mod ledger;
 pub mod saga;

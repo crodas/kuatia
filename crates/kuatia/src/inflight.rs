@@ -53,6 +53,10 @@ pub struct Authorization {
     pub inflight: EnvelopeId,
     /// The legs, one per original movement.
     pub legs: Vec<InflightLeg>,
+    /// Deadline (Unix milliseconds) after which the reaper auto-voids any funds
+    /// still held. `None` for [`authorize`](Ledger::authorize): the hold never
+    /// expires and must be settled explicitly.
+    pub expires_at: Option<i64>,
 }
 
 impl Authorization {
@@ -78,6 +82,10 @@ pub enum InflightState {
     Voided,
     /// Fully settled, but a mix of confirmed and voided legs.
     Mixed,
+    /// Funds are still held and the deadline has passed, but the reaper has not
+    /// voided them yet. A transient state resolved to `Voided` (or `Mixed`) once
+    /// the reaper runs.
+    Expired,
 }
 
 /// Per-(destination, asset) status line.
@@ -106,6 +114,9 @@ pub struct InflightStatus {
     pub inflight: EnvelopeId,
     /// One entry per (destination, asset).
     pub legs: Vec<InflightLegStatus>,
+    /// Deadline (Unix milliseconds) after which held funds are auto-voided, or
+    /// `None` if the hold never expires.
+    pub expires_at: Option<i64>,
     /// Overall state.
     pub state: InflightState,
 }
@@ -119,8 +130,14 @@ pub struct InflightStatus {
 /// whole lifecycle is self-describing and read back, not inferred.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum InflightMeta {
-    /// Tags the authorize transfer and carries its leg table.
-    Authorize { legs: Vec<InflightLeg> },
+    /// Tags the authorize transfer and carries its leg table. `expires_at` is the
+    /// optional auto-void deadline (Unix ms); `#[serde(default)]` decodes holds
+    /// written before expiry existed as `None` (never expire).
+    Authorize {
+        legs: Vec<InflightLeg>,
+        #[serde(default)]
+        expires_at: Option<i64>,
+    },
     /// Tags a per-destination holding subaccount.
     Hold { destination: AccountId },
     /// Tags a settling transfer that delivers to a destination.
@@ -186,6 +203,28 @@ impl Ledger {
         self: &Arc<Self>,
         transfer: Transfer,
     ) -> Result<Authorization, LedgerError> {
+        self.authorize_inner(transfer, None).await
+    }
+
+    /// Authorize a trade with an auto-void deadline. Identical to
+    /// [`authorize`](Self::authorize), but funds still held at `expires_at` (Unix
+    /// milliseconds) are returned to their funders by the expiry reaper (see
+    /// [`spawn_expiry_reaper`](Self::spawn_expiry_reaper)). A deadline already in
+    /// the past reaps on the next reaper pass. The hold remains manually
+    /// confirmable or voidable before the deadline.
+    pub async fn authorize_with_expiry(
+        self: &Arc<Self>,
+        transfer: Transfer,
+        expires_at: i64,
+    ) -> Result<Authorization, LedgerError> {
+        self.authorize_inner(transfer, Some(expires_at)).await
+    }
+
+    async fn authorize_inner(
+        self: &Arc<Self>,
+        transfer: Transfer,
+        expires_at: Option<i64>,
+    ) -> Result<Authorization, LedgerError> {
         // All holds of this inflight share one subaccount, derived from the
         // submitted trade so it is stable and known before the holds are created
         // (the authorize transfer's own id cannot be used: it is a hash of the
@@ -237,14 +276,22 @@ impl Ledger {
         let mut md = transfer.metadata.clone();
         md.insert(
             K_INFLIGHT.to_string(),
-            encode_meta(&InflightMeta::Authorize { legs: legs.clone() })?,
+            encode_meta(&InflightMeta::Authorize {
+                legs: legs.clone(),
+                expires_at,
+            })?,
         );
         let rewritten = builder.metadata(md).build();
 
         let receipt = self.commit(rewritten).await?;
+        // Register the deadline so the reaper auto-voids it (no-op when None).
+        if let Some(at) = expires_at {
+            self.register_expiry(receipt.transfer_id, at);
+        }
         Ok(Authorization {
             inflight: receipt.transfer_id,
             legs,
+            expires_at,
         })
     }
 
@@ -258,7 +305,7 @@ impl Ledger {
         self: &Arc<Self>,
         inflight: &EnvelopeId,
     ) -> Result<Vec<Receipt>, LedgerError> {
-        let (record, legs) = self.load_inflight(inflight).await?;
+        let (record, legs, _expires_at) = self.load_inflight(inflight).await?;
         let book = record.envelope.book();
         let mut receipts = Vec::new();
         for hold in holds_of(&legs) {
@@ -283,6 +330,8 @@ impl Ledger {
             }
             self.close_if_drained(&hold).await?;
         }
+        // Terminal: drop any pending deadline so the reaper skips it.
+        self.deregister_expiry(inflight);
         Ok(receipts)
     }
 
@@ -304,7 +353,7 @@ impl Ledger {
         inflight: &EnvelopeId,
         confirms: Transfer,
     ) -> Result<Vec<Receipt>, LedgerError> {
-        let (record, legs) = self.load_inflight(inflight).await?;
+        let (record, legs, _expires_at) = self.load_inflight(inflight).await?;
         let book = record.envelope.book();
         let mut receipts = Vec::new();
         let mut touched: BTreeSet<AccountId> = BTreeSet::new();
@@ -354,7 +403,7 @@ impl Ledger {
         self: &Arc<Self>,
         inflight: &EnvelopeId,
     ) -> Result<Vec<Receipt>, LedgerError> {
-        let (record, legs) = self.load_inflight(inflight).await?;
+        let (record, legs, _expires_at) = self.load_inflight(inflight).await?;
         let book = record.envelope.book();
         let mut receipts = Vec::new();
         for hold in holds_of(&legs) {
@@ -398,6 +447,8 @@ impl Ledger {
             }
             self.close_if_drained(&hold).await?;
         }
+        // Terminal: drop any pending deadline so the reaper skips it.
+        self.deregister_expiry(inflight);
         Ok(receipts)
     }
 
@@ -412,7 +463,7 @@ impl Ledger {
         &self,
         inflight: &EnvelopeId,
     ) -> Result<InflightStatus, LedgerError> {
-        let (_record, legs) = self.load_inflight(inflight).await?;
+        let (_record, legs, expires_at) = self.load_inflight(inflight).await?;
 
         // Authorized per (hold, asset).
         let mut authorized: BTreeMap<(AccountId, AssetId), Cent> = BTreeMap::new();
@@ -459,10 +510,18 @@ impl Ledger {
             });
         }
 
-        let state = overall_state(&lines);
+        // Report `Expired` when funds are still held past the deadline but the
+        // reaper has not voided them yet. Time is read once, here, so status is a
+        // faithful snapshot rather than an inferred flag.
+        let expired = match expires_at {
+            Some(at) => crate::ledger::now_millis()? >= at,
+            None => false,
+        };
+        let state = overall_state(&lines, expired);
         Ok(InflightStatus {
             inflight: *inflight,
             legs: lines,
+            expires_at,
             state,
         })
     }
@@ -479,25 +538,50 @@ impl Ledger {
             .collect())
     }
 
+    /// Every currently open inflight that carries an auto-void deadline, as
+    /// `(handle, expires_at)`. Reads the deadline straight from each authorize
+    /// transfer's metadata, so it reflects the durable record. Used to rebuild the
+    /// in-memory expiry index on startup (see
+    /// [`rebuild_expiry_index`](Self::rebuild_expiry_index)).
+    pub(crate) async fn open_inflights_with_expiry(
+        &self,
+    ) -> Result<Vec<(EnvelopeId, i64)>, LedgerError> {
+        let mut out: BTreeMap<EnvelopeId, i64> = BTreeMap::new();
+        for hold in self.list_open_inflights().await? {
+            // The authorize transfer creates this hold's postings, so it is in the
+            // hold's history. One authorize funds several holds; the map dedups.
+            for record in self.history(&hold).await? {
+                if let Some(InflightMeta::Authorize {
+                    expires_at: Some(at),
+                    ..
+                }) = read_meta(record.envelope.metadata())
+                {
+                    out.insert(record.receipt.transfer_id, at);
+                }
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Load the authorize transfer and decode its leg table.
+    /// Load the authorize transfer and decode its leg table and deadline.
     async fn load_inflight(
         &self,
         inflight: &EnvelopeId,
-    ) -> Result<(EnvelopeRecord, Vec<InflightLeg>), LedgerError> {
+    ) -> Result<(EnvelopeRecord, Vec<InflightLeg>, Option<i64>), LedgerError> {
         let record = self
             .store()
             .get_transfer(inflight)
             .await?
             .ok_or(LedgerError::InflightNotFound(*inflight))?;
-        let legs = match read_meta(record.envelope.metadata()) {
-            Some(InflightMeta::Authorize { legs }) => legs,
+        let (legs, expires_at) = match read_meta(record.envelope.metadata()) {
+            Some(InflightMeta::Authorize { legs, expires_at }) => (legs, expires_at),
             _ => return Err(LedgerError::NotInflightTransaction(*inflight)),
         };
-        Ok((record, legs))
+        Ok((record, legs, expires_at))
     }
 
     /// Commit a `hold -> target` settling transfer tagged with the inflight role.
@@ -590,7 +674,7 @@ fn destination_of(
         .ok_or_else(|| malformed(inflight))
 }
 
-fn overall_state(lines: &[InflightLegStatus]) -> InflightState {
+fn overall_state(lines: &[InflightLegStatus], expired: bool) -> InflightState {
     let mut any_held = false;
     let mut any_confirmed = false;
     let mut any_voided = false;
@@ -604,6 +688,12 @@ fn overall_state(lines: &[InflightLegStatus]) -> InflightState {
         if l.voided.is_positive() {
             any_voided = true;
         }
+    }
+    // A past deadline with funds still held is reported as Expired regardless of
+    // what has settled so far; once the reaper voids the remainder it reads as
+    // Voided or Mixed.
+    if any_held && expired {
+        return InflightState::Expired;
     }
     match (any_held, any_confirmed, any_voided) {
         (true, false, false) => InflightState::Held,

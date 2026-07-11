@@ -8,6 +8,7 @@
 pub use kuatia_core::*;
 
 pub use crate::error::LedgerError;
+pub use crate::expiry::ReaperHandle;
 pub use crate::inflight::{
     Authorization, InflightLeg, InflightLegStatus, InflightState, InflightStatus,
 };
