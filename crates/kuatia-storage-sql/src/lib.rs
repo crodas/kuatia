@@ -125,11 +125,23 @@ impl SqlStore {
                 continue;
             }
 
+            // Apply every statement and record the migration in one transaction,
+            // so a crash mid-migration rolls back cleanly and the migration is
+            // retried as a whole. Migration 004 drops and rebuilds `postings`;
+            // without the transaction a partial apply would leave the schema in a
+            // state the migration cannot be re-run against. Both SQLite and
+            // PostgreSQL support transactional DDL.
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+
             for statement in sql.split(';') {
                 let trimmed = statement.trim();
                 if !trimmed.is_empty() {
                     sqlx::query(trimmed)
-                        .execute(&self.pool)
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| StoreError::Internal(e.to_string()))?;
                 }
@@ -137,7 +149,11 @@ impl SqlStore {
 
             sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
                 .bind(*name)
-                .execute(&self.pool)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+            tx.commit()
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
         }
@@ -586,6 +602,10 @@ impl PostingStore for SqlStore {
         if asset.is_some() {
             sql.push_str(&format!(" AND asset = ${placeholder}"));
         }
+        // Deterministic order by the posting primary key, matching
+        // `query_postings`, so callers (and pagination built on top) see a
+        // stable sequence.
+        sql.push_str(" ORDER BY transfer_id, idx");
 
         let mut q = sqlx::query(&sql).bind(id);
         if let Some(s) = sub {
@@ -712,7 +732,13 @@ impl PostingStore for SqlStore {
             let c = format!("SELECT COUNT(*) as cnt FROM {source} {w}");
             let limit = query.limit.unwrap_or(u32::MAX);
             let offset = query.offset.unwrap_or(0);
-            w.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
+            // Order by the posting primary key so pagination is deterministic:
+            // without it LIMIT/OFFSET could skip or repeat rows across pages,
+            // especially for `Live`, whose source is a `UNION ALL` with no
+            // inherent order.
+            w.push_str(&format!(
+                " ORDER BY transfer_id, idx LIMIT {limit} OFFSET {offset}"
+            ));
             (format!("SELECT * FROM {source} {w}"), c)
         };
 

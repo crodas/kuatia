@@ -216,8 +216,9 @@ validation steps are:
 
 1. Non-empty (must consume or create at least one posting)
 2. No duplicate consumed PostingIds
-3. All consumed postings exist
-4. All consumed postings are Active or PendingInactive
+3. All consumed postings exist in the immutable table (a `Posting` carries no
+   lifecycle state; double-spend safety is enforced by the reserve claim and the
+   finalize "all spent" guard, not by validation)
 5. All referenced accounts exist, not frozen, not closed
 6. Account snapshot pinning (if provided)
 7. Book policy (if a book is loaded): referenced assets/accounts/flags allowed

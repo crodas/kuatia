@@ -25,10 +25,11 @@ dependencies (`sha2`, `serde`, `bitflags`).
 | `AccountSnapshotId { account, snapshot_id }` | Account state hash for version pinning |
 | `Cent` | Smallest monetary unit (private field, backing integer hidden). Backing is `i64` by default, `i128` under the `i128` feature. Checked arithmetic via `checked_add`, `checked_sub`, `checked_neg`, `checked_sum` returning `Result<Cent, OverflowError>` |
 | `OverflowError` | Returned when a `Cent` operation would overflow or underflow |
-| `PostingStatus` | Posting lifecycle: `Active`, `PendingInactive`, `Inactive` |
+| `PostingState` | Derived posting lifecycle (from index-table membership, not stored): `Active`, `Reserved(ReservationId)`, `Spent`, `Missing` |
+| `PostingFilter` | Read filter over derived posting state: `Active`, `Reserved`, `Live` (Active ∪ Reserved), `All` |
 | `Amount` | Parser/formatter for decimal strings. Not stored; use at API boundaries only |
-| `Posting` | Signed amount of one asset owned by one account. Has `status: PostingStatus` and `reservation: Option<ReservationId>` (owner token while `PendingInactive`) |
-| `ReservationId` | Owner token stamped on a reserved posting so only the reserving saga may finalize/release it |
+| `Posting` | Immutable signed amount of one asset owned by one account. Carries no lifecycle field; its state is derived from index-table membership (see `PostingState`) |
+| `ReservationId` | Owner token recorded in the reserved index so only the reserving saga may finalize/release a posting |
 | `NewPosting` | Posting to be created (no id yet, assigned during validation) |
 | `Transfer` | Atomic unit: consumes postings + creates postings + metadata |
 | `EnvelopeBuilder` | Fluent builder for `Transfer` construction |
@@ -48,8 +49,7 @@ in order:
 graph TD
     A[1. Non-empty] --> B[2. No duplicate consumes]
     B --> C[3. Posting existence]
-    C --> D[4. Posting active or reserved]
-    D --> E[5. Account existence & lifecycle]
+    C --> E[5. Account existence & lifecycle]
     E --> F[6. Snapshot pinning]
     F --> BP[7. Book policy]
     BP --> G[8. Per-asset conservation]
@@ -61,9 +61,9 @@ graph TD
 
 1. **Non-empty**: transfer must consume or create at least one posting
 2. **No duplicate consumes**: each posting consumed at most once
-3. **Posting existence**: every consumed posting exists in state
-4. **Posting active or reserved**: consumed postings must be `Active` or
-   `PendingInactive` (prevents double-spend)
+3. **Posting existence**: every consumed posting exists in the immutable table
+   (a `Posting` carries no lifecycle state; double-spend safety is enforced by
+   the reserve claim and the finalize "all spent" guard, not here)
 5. **Account existence & lifecycle**: all referenced accounts exist, not
    frozen, not closed
 6. **Snapshot pinning**: account snapshots (if provided) must match current
@@ -108,7 +108,7 @@ writes, then calls the dumb primitives, interpreting/verifying each count:
 graph LR
     A[resolve] -->|Envelope| W[save PendingSaga: Reserving]
     W --> B[reserve_postings]
-    B -->|Active→PendingInactive| F[finalize]
+    B -->|active index → reserved index| F[finalize]
     F --> V[validate_and_plan re-check]
     V --> M[mark Finalizing]
     M --> D[deactivate → insert → store_transfer → append_event]
@@ -157,13 +157,13 @@ Transfers are built via `TransferBuilder` and committed with
 
 | Method | Description |
 |--------|-------------|
-| `balance(account, asset)` | Sum of non-Inactive postings (computed by Ledger) |
+| `balance(account, asset)` | Sum of live (Active or Reserved) postings (computed by Ledger) |
 | `list_accounts()` | All current account snapshots |
 | `get_account(id)` | Latest account snapshot |
 | `query_transfers(query)` | Paginated, filtered transfer history (by date range, book) |
 | `history(account)` | All transfers involving an account |
-| `postings(account)` | All postings (any status) |
-| `query_postings(query)` | Paginated, filtered postings (by asset, status) |
+| `postings(account)` | All postings (any state) |
+| `query_postings(query)` | Paginated, filtered postings (by asset, `PostingFilter`) |
 | `account_history(id)` | All version snapshots |
 | `get_events_since(seq, limit)` | Query ledger event log after a sequence number |
 
@@ -185,8 +185,8 @@ graph TB
 
 - **`AccountStore`**: `get_account`, `get_accounts`, `create_account`,
   `append_account_version`, `get_account_history`, `list_accounts`
-- **`PostingStore`**: `get_postings`,
-  `get_postings_by_account(account, asset?, status?)`, `query_postings(query)`,
+- **`PostingStore`**: `get_postings`, `get_posting_states`,
+  `get_postings_by_account(account, sub?, asset?, filter)`, `query_postings(query)`,
   and the dumb write primitives `reserve_postings(ids, reservation) -> u64`,
   `release_postings(ids, reservation) -> u64`,
   `deactivate_postings(ids, reservation?) -> u64`,
@@ -210,24 +210,29 @@ recovery rather than a single transaction.
 conditional update and return how many rows changed (the saga decides what a
 short count means):
 
+State is derived from which index a posting is in: active index → `Active`,
+reserved index → `Reserved(rid)`, neither (only the immutable table) → `Spent`.
+Every transition is an insert/delete on an index table; the posting row never
+changes.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Active: insert_postings
-    Active --> PendingInactive: reserve_postings
-    PendingInactive --> Active: release_postings
-    PendingInactive --> Inactive: deactivate_postings(reservation)
-    Active --> Inactive: deactivate_postings(None)
+    Active --> Reserved: reserve_postings
+    Reserved --> Active: release_postings
+    Reserved --> Spent: deactivate_postings(reservation)
+    Active --> Spent: deactivate_postings(None)
 ```
 
-Each cell is the count a primitive returns (1 = flipped, 0 = no-op / not
+Each cell is the count a primitive returns (1 = moved, 0 = no-op / not
 applicable). The saga interprets a 0:
 
-| Operation | Active | PendingInactive (this rid) | Inactive |
-|-----------|--------|----------------------------|----------|
-| `reserve_postings(rid)` | → PendingInactive (1) | 0 | 0 |
+| Operation | Active | Reserved (this rid) | Spent |
+|-----------|--------|---------------------|-------|
+| `reserve_postings(rid)` | → Reserved (1) | 0 | 0 |
 | `release_postings(rid)` | 0 | → Active (1) | 0 |
-| `deactivate_postings(Some rid)` | 0 | → Inactive (1) | 0 |
-| `deactivate_postings(None)` | → Inactive (1) | 0 | 0 |
+| `deactivate_postings(Some rid)` | 0 | → Spent (1) | 0 |
+| `deactivate_postings(None)` | → Spent (1) | 0 | 0 |
 
 There is no all-or-nothing batch rejection: a posting whose condition does not
 hold is skipped (counted as 0, not an error), so a call can apply to some ids
@@ -271,7 +276,7 @@ the saga derives meaning from them.
 
 | Step | Execute | Compensate | Retry |
 |------|---------|------------|-------|
-| `ReservePostingsStep` | `reserve_postings` `Active → PendingInactive`, interpret count | Release back to `Active` | 3 |
+| `ReservePostingsStep` | `reserve_postings`: active index → reserved index, interpret count | Release back to `Active` | 3 |
 | `FinalizeTransferStep` | `Ledger::finalize_envelope`: re-validate (last-step floor/freeze guard) → mark `Finalizing` → `deactivate` → `insert` → `store_transfer` → `append_event`, verifying every end-state | `reverse(transfer_id)` | 3 |
 
 Validation lives inside the finalize step so it runs immediately before the
