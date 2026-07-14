@@ -21,7 +21,6 @@ use kuatia_core::{
 };
 use kuatia_storage::error::StoreError;
 use kuatia_storage::store::EnvelopeRecord;
-use kuatia_types::PostingFilter;
 use serde::{Deserialize, Serialize};
 
 use crate::error::LedgerError;
@@ -261,18 +260,17 @@ impl Ledger {
         let (record, legs) = self.load_inflight(inflight).await?;
         let book = record.envelope.book();
         let mut receipts = Vec::new();
-        for hold in holds_of(&legs) {
-            let dest = destination_of(&legs, hold, *inflight)?;
-            for asset in assets_of(&legs, hold) {
-                let bal = self.balance(&hold, &asset).await?;
+        for group in group_holds(&legs, *inflight)? {
+            for asset in group.assets {
+                let bal = self.balance(&group.hold, &asset).await?;
                 if bal.is_positive() {
                     receipts.push(
                         self.settle(
                             book,
                             *inflight,
-                            hold,
-                            dest,
-                            dest,
+                            group.hold,
+                            group.destination,
+                            group.destination,
                             asset,
                             bal,
                             SettleRole::Confirm,
@@ -281,7 +279,7 @@ impl Ledger {
                     );
                 }
             }
-            self.close_if_drained(&hold).await?;
+            self.close_if_drained(&group.hold).await?;
         }
         Ok(receipts)
     }
@@ -357,16 +355,15 @@ impl Ledger {
         let (record, legs) = self.load_inflight(inflight).await?;
         let book = record.envelope.book();
         let mut receipts = Vec::new();
-        for hold in holds_of(&legs) {
-            let dest = destination_of(&legs, hold, *inflight)?;
-            for asset in assets_of(&legs, hold) {
-                let mut remaining = self.balance(&hold, &asset).await?;
+        for group in group_holds(&legs, *inflight)? {
+            for asset in &group.assets {
+                let mut remaining = self.balance(&group.hold, asset).await?;
                 // Return to funders in leg order, each up to what it funded. For
                 // the common single-funder-per-(hold, asset) case this returns the
                 // whole remaining balance to that funder.
                 let mut funders: Vec<(AccountId, Cent)> = legs
                     .iter()
-                    .filter(|l| l.hold == hold && l.asset == asset)
+                    .filter(|l| l.hold == group.hold && l.asset == *asset)
                     .map(|l| (l.funder, l.amount))
                     .collect();
                 // Ensure any co-funding rounding leftover lands on the last funder.
@@ -383,10 +380,10 @@ impl Ledger {
                             self.settle(
                                 book,
                                 *inflight,
-                                hold,
+                                group.hold,
                                 funder,
-                                dest,
-                                asset,
+                                group.destination,
+                                *asset,
                                 give,
                                 SettleRole::Void,
                             )
@@ -396,7 +393,7 @@ impl Ledger {
                     }
                 }
             }
-            self.close_if_drained(&hold).await?;
+            self.close_if_drained(&group.hold).await?;
         }
         Ok(receipts)
     }
@@ -413,6 +410,7 @@ impl Ledger {
         inflight: &EnvelopeId,
     ) -> Result<InflightStatus, LedgerError> {
         let (_record, legs) = self.load_inflight(inflight).await?;
+        let groups = group_holds(&legs, *inflight)?;
 
         // Authorized per (hold, asset).
         let mut authorized: BTreeMap<(AccountId, AssetId), Cent> = BTreeMap::new();
@@ -424,39 +422,46 @@ impl Ledger {
         // Confirmed / voided per (hold, asset), summed from settle transfers.
         let mut confirmed: BTreeMap<(AccountId, AssetId), Cent> = BTreeMap::new();
         let mut voided: BTreeMap<(AccountId, AssetId), Cent> = BTreeMap::new();
-        for hold in holds_of(&legs) {
-            for record in self.history(&hold).await? {
+        for group in &groups {
+            for record in self.history(&group.hold).await? {
                 let bucket = match read_meta(record.envelope.metadata()) {
                     Some(InflightMeta::Confirm { .. }) => &mut confirmed,
                     Some(InflightMeta::Void { .. }) => &mut voided,
                     _ => continue,
                 };
                 for np in record.envelope.creates() {
-                    if np.owner == hold {
+                    if np.owner == group.hold {
                         continue; // change returned to the hold, not settled out
                     }
-                    let e = bucket.entry((hold, np.asset)).or_insert(Cent::ZERO);
+                    let e = bucket.entry((group.hold, np.asset)).or_insert(Cent::ZERO);
                     *e = e.checked_add(np.value)?;
                 }
             }
         }
 
         let mut lines = Vec::new();
-        for ((hold, asset), auth) in &authorized {
-            let held = self.balance(hold, asset).await?;
-            let dest = destination_of(&legs, *hold, *inflight)?;
-            lines.push(InflightLegStatus {
-                destination: dest,
-                hold: *hold,
-                asset: *asset,
-                authorized: *auth,
-                confirmed: confirmed
-                    .get(&(*hold, *asset))
-                    .copied()
-                    .unwrap_or(Cent::ZERO),
-                voided: voided.get(&(*hold, *asset)).copied().unwrap_or(Cent::ZERO),
-                held,
-            });
+        for group in &groups {
+            for asset in &group.assets {
+                let held = self.balance(&group.hold, asset).await?;
+                lines.push(InflightLegStatus {
+                    destination: group.destination,
+                    hold: group.hold,
+                    asset: *asset,
+                    authorized: authorized
+                        .get(&(group.hold, *asset))
+                        .copied()
+                        .unwrap_or(Cent::ZERO),
+                    confirmed: confirmed
+                        .get(&(group.hold, *asset))
+                        .copied()
+                        .unwrap_or(Cent::ZERO),
+                    voided: voided
+                        .get(&(group.hold, *asset))
+                        .copied()
+                        .unwrap_or(Cent::ZERO),
+                    held,
+                });
+            }
         }
 
         let state = overall_state(&lines);
@@ -534,12 +539,7 @@ impl Ledger {
     /// Close a holding account once it has no live (active or reserved) postings
     /// left. No-op if already closed or still holding funds.
     async fn close_if_drained(&self, hold: &AccountId) -> Result<(), LedgerError> {
-        let live = !self
-            .store()
-            .get_postings_by_account(hold.id, Some(hold.sub), None, PostingFilter::Live)
-            .await?
-            .is_empty();
-        if live {
+        if self.has_live_postings(hold).await? {
             return Ok(());
         }
         if !self.get_account(hold).await?.is_closed() {
@@ -565,6 +565,32 @@ fn inflight_subaccount(transfer: &Transfer) -> i64 {
     // code's encodable range (ADR-0015). The result is always positive.
     let mask = (1u64 << kuatia_types::SUB_BITS) - 1;
     (u64::from_be_bytes(first) & mask) as i64
+}
+
+/// A holding subaccount of an inflight together with its destination and the
+/// assets it carries. Groups a leg table by hold so the confirm, void, and
+/// status paths share one traversal instead of each re-deriving `holds_of` /
+/// `destination_of` / `assets_of` inline.
+struct HoldGroup {
+    hold: AccountId,
+    destination: AccountId,
+    assets: Vec<AssetId>,
+}
+
+/// Group `legs` by holding subaccount, resolving each hold's destination. This
+/// is the single "walk the holds of an inflight" traversal; it is pure over the
+/// leg table and yields holds in sorted order (each with its assets sorted).
+fn group_holds(legs: &[InflightLeg], inflight: EnvelopeId) -> Result<Vec<HoldGroup>, LedgerError> {
+    holds_of(legs)
+        .into_iter()
+        .map(|hold| {
+            Ok(HoldGroup {
+                hold,
+                destination: destination_of(legs, hold, inflight)?,
+                assets: assets_of(legs, hold).into_iter().collect(),
+            })
+        })
+        .collect()
 }
 
 fn holds_of(legs: &[InflightLeg]) -> BTreeSet<AccountId> {

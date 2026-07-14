@@ -686,12 +686,7 @@ impl Ledger {
         }
         // Reject if any posting is still live — active or reserved (a transfer
         // in flight). Only spent postings (or none) permit a close.
-        let blocking = !self
-            .store
-            .get_postings_by_account(id.id, Some(id.sub), None, PostingFilter::Live)
-            .await?
-            .is_empty();
-        if blocking {
+        if self.has_live_postings(id).await? {
             return Err(LedgerError::AccountNotEmpty(*id));
         }
         let mut next = current.clone();
@@ -707,6 +702,19 @@ impl Ledger {
             })
             .await?;
         Ok(())
+    }
+
+    /// Whether `account` (exact base id and subaccount) has any live posting: one
+    /// that is active or reserved by an in-flight saga. Spent postings do not
+    /// count. This is the emptiness test [`close`](Self::close) gates on, and the
+    /// inflight layer uses it to decide when a drained hold can be closed.
+    #[instrument(skip(self), name = "ledger.has_live_postings")]
+    pub async fn has_live_postings(&self, account: &AccountId) -> Result<bool, LedgerError> {
+        Ok(!self
+            .store
+            .get_postings_by_account(account.id, Some(account.sub), None, PostingFilter::Live)
+            .await?
+            .is_empty())
     }
 
     /// Query the current balance of one subaccount for a given asset. This reads
