@@ -350,3 +350,57 @@ async fn migrate_is_idempotent() {
     store.migrate().await.unwrap();
     store.migrate().await.unwrap();
 }
+
+/// The id-batch primitives chunk a large id set so it never exceeds the
+/// backend's bind-parameter limit (SQLite caps a statement at 32766 variables).
+/// A batch larger than one chunk must reserve, read, and deactivate every id
+/// exactly as a small one does.
+#[tokio::test]
+async fn id_batch_primitives_chunk_large_batches() {
+    // Comfortably larger than the internal chunk size so the batch spans
+    // multiple statements.
+    const N: u16 = 9000;
+    let store = new_store().await;
+
+    let tid = EnvelopeId([0xcd; 32]);
+    let postings: Vec<Posting> = (0..N)
+        .map(|i| {
+            Posting::new(
+                PostingId {
+                    transfer: tid,
+                    index: i,
+                },
+                AccountId::new(1),
+                AssetId::new(1),
+                Cent::from(1),
+            )
+        })
+        .collect();
+    let ids: Vec<PostingId> = postings.iter().map(|p| p.id).collect();
+
+    assert_eq!(
+        store.insert_postings(&postings).await.unwrap(),
+        u64::from(N)
+    );
+
+    // Reserve the whole batch in one call: every id is claimed across chunks.
+    let rid = ReservationId::new(1);
+    assert_eq!(
+        store.reserve_postings(&ids, rid).await.unwrap(),
+        u64::from(N)
+    );
+
+    // Reads span chunks and return every id.
+    let states = store.get_posting_states(&ids).await.unwrap();
+    assert_eq!(states.len(), N as usize);
+    assert!(states.iter().all(|s| *s == PostingState::Reserved(rid)));
+    assert_eq!(store.get_postings(&ids).await.unwrap().len(), N as usize);
+
+    // Deactivating the whole batch spends every id.
+    assert_eq!(
+        store.deactivate_postings(&ids, Some(rid)).await.unwrap(),
+        u64::from(N)
+    );
+    let after = store.get_posting_states(&ids).await.unwrap();
+    assert!(after.iter().all(|s| *s == PostingState::Spent));
+}
