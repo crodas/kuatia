@@ -4,10 +4,9 @@
 
 An account is a versioned entity that owns postings. Balance is never
 stored: it is always computed from postings for a given (account, asset)
-pair. The ledger balance sums non-`Inactive` postings (`Active +
-PendingInactive`); the available balance sums only `Active` postings
-(excluding those reserved for an in-flight transfer). `balance()` returns
-the ledger balance.
+pair. `balance()` sums the live postings, meaning those in the active or
+reserved index (`Active ∪ Reserved`); spent postings, which remain only in
+the immutable table, are excluded.
 
 ## Structure
 

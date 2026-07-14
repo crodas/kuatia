@@ -176,7 +176,7 @@ impl PostingStore for InMemoryStore {
         // Read from the relevant set directly — no merge back to the immutable
         // record. `Live` is the two disjoint live sets chained together.
         let reserved = || postings.reserved.values().map(|(p, _)| p);
-        let result: Vec<Posting> = match filter {
+        let mut result: Vec<Posting> = match filter {
             PostingFilter::Active => postings.active.values().filter(matches).cloned().collect(),
             PostingFilter::Reserved => reserved().filter(matches).cloned().collect(),
             PostingFilter::Live => postings
@@ -193,6 +193,9 @@ impl PostingStore for InMemoryStore {
                 .cloned()
                 .collect(),
         };
+        // Deterministic order by the posting id, matching the SQL backend and
+        // `query_postings`; the maps above iterate in an unspecified order.
+        result.sort_by_key(|p| p.id);
         Ok(result)
     }
 

@@ -111,7 +111,9 @@ pub trait PostingStore: Send + Sync {
     async fn get_postings(&self, ids: &[PostingId]) -> Result<Vec<Posting>, StoreError>;
     /// Return postings owned by a base account, filtered by subaccount, asset,
     /// and derived lifecycle state (see [`PostingFilter`]). `sub == None` spans
-    /// every subaccount of `id`; `sub == Some(s)` restricts to that one.
+    /// every subaccount of `id`; `sub == Some(s)` restricts to that one. Results
+    /// are ordered by posting id, so callers and pagination built on top see a
+    /// stable sequence.
     async fn get_postings_by_account(
         &self,
         id: i64,
@@ -167,6 +169,8 @@ pub trait PostingStore: Send + Sync {
 
     /// Query postings with filtering and pagination.
     async fn query_postings(&self, query: &PostingQuery) -> Result<Page<Posting>, StoreError> {
+        // `get_postings_by_account` returns a deterministic id-ordered sequence,
+        // so LIMIT/OFFSET here paginate stably without an extra sort.
         let all = self
             .get_postings_by_account(query.account, query.sub, query.asset.as_ref(), query.filter)
             .await?;

@@ -125,11 +125,23 @@ impl SqlStore {
                 continue;
             }
 
+            // Apply every statement and record the migration in one transaction,
+            // so a crash mid-migration rolls back cleanly and the migration is
+            // retried as a whole. Migration 004 drops and rebuilds `postings`;
+            // without the transaction a partial apply would leave the schema in a
+            // state the migration cannot be re-run against. Both SQLite and
+            // PostgreSQL support transactional DDL.
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+
             for statement in sql.split(';') {
                 let trimmed = statement.trim();
                 if !trimmed.is_empty() {
                     sqlx::query(trimmed)
-                        .execute(&self.pool)
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| StoreError::Internal(e.to_string()))?;
                 }
@@ -137,7 +149,11 @@ impl SqlStore {
 
             sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
                 .bind(*name)
-                .execute(&self.pool)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+            tx.commit()
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
         }
@@ -173,9 +189,11 @@ fn deserialize_json<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, StoreE
 /// opaque saga bytes are stored as hex `TEXT` so a row is legible in any SQL
 /// client and matches the hex form used in logs and `Debug` output.
 fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
     }
     s
 }
@@ -288,12 +306,23 @@ fn filter_source(filter: PostingFilter) -> &'static str {
     }
 }
 
+/// Maximum posting ids matched by a single statement. `id_predicate` expands to
+/// an `OR` of `n` equality pairs, so the binding constraint is SQLite's
+/// expression-tree depth limit (`SQLITE_MAX_EXPR_DEPTH`, default 1000), which a
+/// chain of `n` `OR`s reaches at roughly `n` deep. It caps well before the
+/// bind-parameter limits (SQLite 32766, PostgreSQL 65535) that `2 * n (+1)`
+/// parameters would hit. `500` stays comfortably under the expression-depth
+/// limit; callers that pass more ids are chunked, so the id-batch primitives
+/// have no practical ceiling on batch size.
+const MAX_IDS_PER_QUERY: usize = 500;
+
 /// Build a portable predicate matching a set of posting ids:
 /// `(transfer_id = $s AND idx = $s+1) OR (transfer_id = $s+2 AND idx = $s+3) ...`
 /// starting at placeholder `$start`. Row-value `IN ((a, b), ...)` is not
 /// portable across SQLite and PostgreSQL; an `OR` of equality pairs is. The
 /// caller binds each id as `(hex(transfer), idx as i16)` in order, matching the
-/// placeholder sequence. `ids` must be non-empty.
+/// placeholder sequence. `ids` must be non-empty and no longer than
+/// [`MAX_IDS_PER_QUERY`]; larger sets are split into chunks by the caller.
 fn id_predicate(count: usize, start: u32) -> String {
     (0..count)
         .map(|i| {
@@ -524,33 +553,36 @@ impl PostingStore for SqlStore {
             return Ok(Vec::new());
         }
 
-        // One set-based query for the whole batch instead of one probe per id,
-        // reusing the portable `id_predicate` and binding each id in order as
-        // `(hex(transfer), idx as i16)`.
-        let sql = format!(
-            "SELECT * FROM postings WHERE {}",
-            id_predicate(ids.len(), 1)
-        );
-        let mut q = sqlx::query(&sql);
-        for id in ids {
-            q = q
-                .bind(envelope_id_to_hex(&id.transfer))
-                .bind(id.index as i16);
-        }
-        let rows = q
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
-
-        // Index the fetched postings by the same `(hex, idx)` key that was bound.
-        let mut found: HashMap<(String, i16), Posting> = HashMap::with_capacity(rows.len());
-        for row in &rows {
-            let posting = row_to_posting(row)?;
-            let key = (
-                envelope_id_to_hex(&posting.id.transfer),
-                posting.id.index as i16,
+        // Set-based query per chunk instead of one probe per id, reusing the
+        // portable `id_predicate` and binding each id in order as
+        // `(hex(transfer), idx as i16)`. Chunked so a large batch never exceeds
+        // the backend's bind-parameter limit (see `MAX_IDS_PER_QUERY`).
+        let mut found: HashMap<(String, i16), Posting> = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(MAX_IDS_PER_QUERY) {
+            let sql = format!(
+                "SELECT * FROM postings WHERE {}",
+                id_predicate(chunk.len(), 1)
             );
-            found.insert(key, posting);
+            let mut q = sqlx::query(&sql);
+            for id in chunk {
+                q = q
+                    .bind(envelope_id_to_hex(&id.transfer))
+                    .bind(id.index as i16);
+            }
+            let rows = q
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+            // Index the fetched postings by the same `(hex, idx)` key that was bound.
+            for row in &rows {
+                let posting = row_to_posting(row)?;
+                let key = (
+                    envelope_id_to_hex(&posting.id.transfer),
+                    posting.id.index as i16,
+                );
+                found.insert(key, posting);
+            }
         }
 
         // Return in input order, erroring on the first id absent from the batch
@@ -586,6 +618,10 @@ impl PostingStore for SqlStore {
         if asset.is_some() {
             sql.push_str(&format!(" AND asset = ${placeholder}"));
         }
+        // Deterministic order by the posting primary key, matching
+        // `query_postings`, so callers (and pagination built on top) see a
+        // stable sequence.
+        sql.push_str(" ORDER BY transfer_id, idx");
 
         let mut q = sqlx::query(&sql).bind(id);
         if let Some(s) = sub {
@@ -608,48 +644,10 @@ impl PostingStore for SqlStore {
         }
 
         // One set-based query per state table instead of up to three probes per
-        // id. Each reuses the portable `id_predicate` (an OR of equality pairs;
-        // row-value `IN` is not portable across SQLite and PostgreSQL) and binds
-        // every id in order as `(hex(transfer), idx as i16)`.
-        let predicate = id_predicate(ids.len(), 1);
-
-        let active_sql = format!("SELECT transfer_id, idx FROM active_postings WHERE {predicate}");
-        let mut active_q = sqlx::query(&active_sql);
-        for id in ids {
-            active_q = active_q
-                .bind(envelope_id_to_hex(&id.transfer))
-                .bind(id.index as i16);
-        }
-        let active_rows = active_q
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
-
-        let reserved_sql = format!(
-            "SELECT transfer_id, idx, reservation FROM reserved_postings WHERE {predicate}"
-        );
-        let mut reserved_q = sqlx::query(&reserved_sql);
-        for id in ids {
-            reserved_q = reserved_q
-                .bind(envelope_id_to_hex(&id.transfer))
-                .bind(id.index as i16);
-        }
-        let reserved_rows = reserved_q
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
-
-        let spent_sql = format!("SELECT transfer_id, idx FROM postings WHERE {predicate}");
-        let mut spent_q = sqlx::query(&spent_sql);
-        for id in ids {
-            spent_q = spent_q
-                .bind(envelope_id_to_hex(&id.transfer))
-                .bind(id.index as i16);
-        }
-        let spent_rows = spent_q
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        // id, reusing the portable `id_predicate` (an OR of equality pairs;
+        // row-value `IN` is not portable across SQLite and PostgreSQL) and
+        // binding every id in order as `(hex(transfer), idx as i16)`. Chunked so
+        // a large batch never exceeds the bind-parameter limit.
 
         // Key membership by the same `(hex, idx)` values that were bound, so the
         // per-id lookup below matches without decoding transfer ids back.
@@ -663,20 +661,63 @@ impl PostingStore for SqlStore {
             Ok((transfer_id, idx))
         };
 
-        let mut active: HashSet<(String, i16)> = HashSet::with_capacity(active_rows.len());
-        for row in &active_rows {
-            active.insert(row_key(row)?);
-        }
-        let mut reserved: HashMap<(String, i16), i64> = HashMap::with_capacity(reserved_rows.len());
-        for row in &reserved_rows {
-            let rid: i64 = row
-                .try_get("reservation")
+        let mut active: HashSet<(String, i16)> = HashSet::new();
+        let mut reserved: HashMap<(String, i16), i64> = HashMap::new();
+        let mut spent: HashSet<(String, i16)> = HashSet::new();
+
+        for chunk in ids.chunks(MAX_IDS_PER_QUERY) {
+            let predicate = id_predicate(chunk.len(), 1);
+
+            let active_sql =
+                format!("SELECT transfer_id, idx FROM active_postings WHERE {predicate}");
+            let mut active_q = sqlx::query(&active_sql);
+            for id in chunk {
+                active_q = active_q
+                    .bind(envelope_id_to_hex(&id.transfer))
+                    .bind(id.index as i16);
+            }
+            let active_rows = active_q
+                .fetch_all(&self.pool)
+                .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
-            reserved.insert(row_key(row)?, rid);
-        }
-        let mut spent: HashSet<(String, i16)> = HashSet::with_capacity(spent_rows.len());
-        for row in &spent_rows {
-            spent.insert(row_key(row)?);
+            for row in &active_rows {
+                active.insert(row_key(row)?);
+            }
+
+            let reserved_sql = format!(
+                "SELECT transfer_id, idx, reservation FROM reserved_postings WHERE {predicate}"
+            );
+            let mut reserved_q = sqlx::query(&reserved_sql);
+            for id in chunk {
+                reserved_q = reserved_q
+                    .bind(envelope_id_to_hex(&id.transfer))
+                    .bind(id.index as i16);
+            }
+            let reserved_rows = reserved_q
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            for row in &reserved_rows {
+                let rid: i64 = row
+                    .try_get("reservation")
+                    .map_err(|e| StoreError::Internal(e.to_string()))?;
+                reserved.insert(row_key(row)?, rid);
+            }
+
+            let spent_sql = format!("SELECT transfer_id, idx FROM postings WHERE {predicate}");
+            let mut spent_q = sqlx::query(&spent_sql);
+            for id in chunk {
+                spent_q = spent_q
+                    .bind(envelope_id_to_hex(&id.transfer))
+                    .bind(id.index as i16);
+            }
+            let spent_rows = spent_q
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            for row in &spent_rows {
+                spent.insert(row_key(row)?);
+            }
         }
 
         // Reconstruct each id's state in input order, preserving the active >
@@ -712,7 +753,13 @@ impl PostingStore for SqlStore {
             let c = format!("SELECT COUNT(*) as cnt FROM {source} {w}");
             let limit = query.limit.unwrap_or(u32::MAX);
             let offset = query.offset.unwrap_or(0);
-            w.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
+            // Order by the posting primary key so pagination is deterministic:
+            // without it LIMIT/OFFSET could skip or repeat rows across pages,
+            // especially for `Live`, whose source is a `UNION ALL` with no
+            // inherent order.
+            w.push_str(&format!(
+                " ORDER BY transfer_id, idx LIMIT {limit} OFFSET {offset}"
+            ));
             (format!("SELECT * FROM {source} {w}"), c)
         };
 
@@ -773,43 +820,49 @@ impl PostingStore for SqlStore {
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
 
-        // Reservation is $1; each id pair follows starting at $2.
-        let insert_sql = format!(
-            "INSERT INTO reserved_postings (transfer_id, idx, owner, subaccount, asset, value, reservation) \
-             SELECT transfer_id, idx, owner, subaccount, asset, value, $1 FROM active_postings WHERE {} \
-             ON CONFLICT (transfer_id, idx) DO NOTHING",
-            id_predicate(ids.len(), 2)
-        );
-        let mut insert_q = sqlx::query(&insert_sql).bind(reservation.0);
-        for id in ids {
-            insert_q = insert_q
-                .bind(envelope_id_to_hex(&id.transfer))
-                .bind(id.index as i16);
-        }
-        insert_q
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        // Chunked so a large id set stays under the bind-parameter limit; all
+        // chunks share one transaction so the whole claim is atomic.
+        let mut claimed: u64 = 0;
+        for chunk in ids.chunks(MAX_IDS_PER_QUERY) {
+            // Reservation is $1; each id pair follows starting at $2.
+            let insert_sql = format!(
+                "INSERT INTO reserved_postings (transfer_id, idx, owner, subaccount, asset, value, reservation) \
+                 SELECT transfer_id, idx, owner, subaccount, asset, value, $1 FROM active_postings WHERE {} \
+                 ON CONFLICT (transfer_id, idx) DO NOTHING",
+                id_predicate(chunk.len(), 2)
+            );
+            let mut insert_q = sqlx::query(&insert_sql).bind(reservation.0);
+            for id in chunk {
+                insert_q = insert_q
+                    .bind(envelope_id_to_hex(&id.transfer))
+                    .bind(id.index as i16);
+            }
+            insert_q
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
 
-        let delete_sql = format!(
-            "DELETE FROM active_postings WHERE {}",
-            id_predicate(ids.len(), 1)
-        );
-        let mut delete_q = sqlx::query(&delete_sql);
-        for id in ids {
-            delete_q = delete_q
-                .bind(envelope_id_to_hex(&id.transfer))
-                .bind(id.index as i16);
+            let delete_sql = format!(
+                "DELETE FROM active_postings WHERE {}",
+                id_predicate(chunk.len(), 1)
+            );
+            let mut delete_q = sqlx::query(&delete_sql);
+            for id in chunk {
+                delete_q = delete_q
+                    .bind(envelope_id_to_hex(&id.transfer))
+                    .bind(id.index as i16);
+            }
+            let del = delete_q
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            claimed += del.rows_affected();
         }
-        let del = delete_q
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         tx.commit()
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
-        Ok(del.rows_affected())
+        Ok(claimed)
     }
 
     async fn release_postings(
@@ -830,43 +883,49 @@ impl PostingStore for SqlStore {
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
 
-        // Reservation is $1; each id pair follows starting at $2.
-        let insert_sql = format!(
-            "INSERT INTO active_postings (transfer_id, idx, owner, subaccount, asset, value) \
-             SELECT transfer_id, idx, owner, subaccount, asset, value FROM reserved_postings \
-             WHERE ({}) AND reservation = $1 ON CONFLICT (transfer_id, idx) DO NOTHING",
-            id_predicate(ids.len(), 2)
-        );
-        let mut insert_q = sqlx::query(&insert_sql).bind(reservation.0);
-        for id in ids {
-            insert_q = insert_q
-                .bind(envelope_id_to_hex(&id.transfer))
-                .bind(id.index as i16);
-        }
-        insert_q
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        // Chunked so a large id set stays under the bind-parameter limit; all
+        // chunks share one transaction.
+        let mut released: u64 = 0;
+        for chunk in ids.chunks(MAX_IDS_PER_QUERY) {
+            // Reservation is $1; each id pair follows starting at $2.
+            let insert_sql = format!(
+                "INSERT INTO active_postings (transfer_id, idx, owner, subaccount, asset, value) \
+                 SELECT transfer_id, idx, owner, subaccount, asset, value FROM reserved_postings \
+                 WHERE ({}) AND reservation = $1 ON CONFLICT (transfer_id, idx) DO NOTHING",
+                id_predicate(chunk.len(), 2)
+            );
+            let mut insert_q = sqlx::query(&insert_sql).bind(reservation.0);
+            for id in chunk {
+                insert_q = insert_q
+                    .bind(envelope_id_to_hex(&id.transfer))
+                    .bind(id.index as i16);
+            }
+            insert_q
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
 
-        let delete_sql = format!(
-            "DELETE FROM reserved_postings WHERE ({}) AND reservation = $1",
-            id_predicate(ids.len(), 2)
-        );
-        let mut delete_q = sqlx::query(&delete_sql).bind(reservation.0);
-        for id in ids {
-            delete_q = delete_q
-                .bind(envelope_id_to_hex(&id.transfer))
-                .bind(id.index as i16);
+            let delete_sql = format!(
+                "DELETE FROM reserved_postings WHERE ({}) AND reservation = $1",
+                id_predicate(chunk.len(), 2)
+            );
+            let mut delete_q = sqlx::query(&delete_sql).bind(reservation.0);
+            for id in chunk {
+                delete_q = delete_q
+                    .bind(envelope_id_to_hex(&id.transfer))
+                    .bind(id.index as i16);
+            }
+            let del = delete_q
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            released += del.rows_affected();
         }
-        let del = delete_q
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         tx.commit()
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
-        Ok(del.rows_affected())
+        Ok(released)
     }
 
     async fn deactivate_postings(
@@ -874,44 +933,58 @@ impl PostingStore for SqlStore {
         ids: &[PostingId],
         reservation: Option<ReservationId>,
     ) -> Result<u64, StoreError> {
-        // Dumb instruction over the whole id set: a single DELETE removes the
-        // ids from an index so they become spent (present only in the immutable
-        // table). `rows_affected` is the count; the caller interprets a shortfall.
+        // Dumb instruction over the whole id set: a DELETE removes the ids from
+        // an index so they become spent (present only in the immutable table).
+        // `rows_affected` is the count; the caller interprets a shortfall.
+        // Chunked under one transaction so a large id set stays within the
+        // bind-parameter limit while the removal stays atomic.
         if ids.is_empty() {
             return Ok(0);
         }
-        let (sql, rid) = match reservation {
-            // Raw path: remove from the active index.
-            None => (
-                format!(
-                    "DELETE FROM active_postings WHERE {}",
-                    id_predicate(ids.len(), 1)
-                ),
-                None,
-            ),
-            // Saga path: remove only the rows reserved by `rid`.
-            Some(rid) => (
-                format!(
-                    "DELETE FROM reserved_postings WHERE ({}) AND reservation = $1",
-                    id_predicate(ids.len(), 2)
-                ),
-                Some(rid),
-            ),
-        };
-        let mut q = sqlx::query(&sql);
-        if let Some(rid) = rid {
-            q = q.bind(rid.0);
-        }
-        for id in ids {
-            q = q
-                .bind(envelope_id_to_hex(&id.transfer))
-                .bind(id.index as i16);
-        }
-        let res = q
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
-        Ok(res.rows_affected())
+        let mut removed: u64 = 0;
+        for chunk in ids.chunks(MAX_IDS_PER_QUERY) {
+            let (sql, rid) = match reservation {
+                // Raw path: remove from the active index.
+                None => (
+                    format!(
+                        "DELETE FROM active_postings WHERE {}",
+                        id_predicate(chunk.len(), 1)
+                    ),
+                    None,
+                ),
+                // Saga path: remove only the rows reserved by `rid`.
+                Some(rid) => (
+                    format!(
+                        "DELETE FROM reserved_postings WHERE ({}) AND reservation = $1",
+                        id_predicate(chunk.len(), 2)
+                    ),
+                    Some(rid),
+                ),
+            };
+            let mut q = sqlx::query(&sql);
+            if let Some(rid) = rid {
+                q = q.bind(rid.0);
+            }
+            for id in chunk {
+                q = q
+                    .bind(envelope_id_to_hex(&id.transfer))
+                    .bind(id.index as i16);
+            }
+            let res = q
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            removed += res.rows_affected();
+        }
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(removed)
     }
 
     async fn insert_postings(&self, postings: &[Posting]) -> Result<u64, StoreError> {
