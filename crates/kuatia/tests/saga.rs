@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use kuatia::error::LedgerError;
 use kuatia::ledger::Ledger;
 use kuatia::mem_store::InMemoryStore;
 use kuatia::saga::*;
@@ -54,7 +55,7 @@ async fn setup_ledger() -> Arc<Ledger> {
 
 // Define a two-step saga: deposit then pay
 legend! {
-    FundAndPay<LedgerCtx, SagaError> {
+    FundAndPay<LedgerCtx, LedgerError> {
         deposit: DepositMovementStep,
         pay: PayMovementStep,
     }
@@ -105,7 +106,7 @@ async fn saga_happy_path() {
 
 // Define a saga that will fail on the second step and trigger compensation
 legend! {
-    DepositAndOverspend<LedgerCtx, SagaError> {
+    DepositAndOverspend<LedgerCtx, LedgerError> {
         deposit: DepositMovementStep,
         pay: PayMovementStep,
     }
@@ -135,7 +136,17 @@ async fn saga_compensation_on_failure() {
     let execution = saga.build(ctx);
 
     match execution.start().await {
-        ExecutionResult::Failed(_, _err) => {
+        ExecutionResult::Failed(_, err) => {
+            // The saga carries the typed `LedgerError` across its step seam, so
+            // the overspend surfaces as `Selection(InsufficientFunds)` rather
+            // than a stringified `Store(Internal)`.
+            assert!(
+                matches!(
+                    err,
+                    LedgerError::Selection(SelectionError::InsufficientFunds { .. })
+                ),
+                "expected typed InsufficientFunds, got {err:?}"
+            );
             // The deposit should have been compensated (reversed)
             // Note: balances won't be exactly 0 because the deposit reversal
             // creates new postings, but the net effect should be zero
@@ -154,7 +165,7 @@ async fn saga_compensation_on_failure() {
 
 // Three-step saga
 legend! {
-    ThreeStepFlow<LedgerCtx, SagaError> {
+    ThreeStepFlow<LedgerCtx, LedgerError> {
         deposit: DepositMovementStep,
         pay_ab: PayMovementStep,
         pay_bc: PayMovementStep,

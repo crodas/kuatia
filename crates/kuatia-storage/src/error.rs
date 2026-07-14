@@ -7,7 +7,7 @@ use kuatia_types::AccountId;
 /// The store is a dumb instruction follower: writes report affected-row counts,
 /// not semantic verdicts, so there are no "posting not active"/"reservation
 /// mismatch"/"cas conflict" variants — the saga derives those from counts.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum StoreError {
     /// The requested entity was not found.
     NotFound(String),

@@ -1,7 +1,7 @@
 use super::*;
 
 legend! {
-    EnvelopeSaga<LedgerCtx, SagaError> {
+    EnvelopeSaga<LedgerCtx, LedgerError> {
         reserve: ReservePostingsStep,
         finalize: FinalizeTransferStep,
     }

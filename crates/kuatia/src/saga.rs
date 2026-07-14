@@ -37,7 +37,16 @@ use kuatia_core::{
 
 use crate::error::LedgerError;
 use crate::ledger::Ledger;
+use kuatia_storage::error::StoreError;
 use kuatia_storage::store::Store;
+
+/// A saga-internal plumbing fault (missing context, a short row-count that the
+/// end-state does not explain). These are genuine internal invariants, distinct
+/// from the typed domain errors ([`LedgerError::Validation`], overdraft, frozen)
+/// that flow through unchanged, so they map to [`StoreError::Internal`].
+fn internal(message: impl Into<String>) -> LedgerError {
+    LedgerError::Store(StoreError::Internal(message.into()))
+}
 
 /// Interpret a dumb primitive's affected-row `count` against the `ids` it
 /// targeted. `count == ids.len()` is success. A short count is acceptable only if
@@ -51,50 +60,21 @@ async fn verify_postings(
     count: u64,
     ok: impl Fn(&PostingState) -> bool,
     what: &str,
-) -> Result<(), SagaError> {
+) -> Result<(), LedgerError> {
     if count == ids.len() as u64 {
         return Ok(());
     }
     let states = store
         .get_posting_states(ids)
         .await
-        .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
+        .map_err(LedgerError::Store)?;
     if states.len() == ids.len() && states.iter().all(&ok) {
         return Ok(());
     }
-    Err(SagaError {
-        message: format!(
-            "{what}: storage applied {count}/{} rows and the end-state is not satisfied",
-            ids.len()
-        ),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Saga error -- serializable + cloneable wrapper
-// ---------------------------------------------------------------------------
-
-/// Serializable error wrapper used across saga steps.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SagaError {
-    /// Human-readable error description.
-    pub message: String,
-}
-
-impl std::fmt::Display for SagaError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for SagaError {}
-
-impl From<LedgerError> for SagaError {
-    fn from(e: LedgerError) -> Self {
-        Self {
-            message: e.to_string(),
-        }
-    }
+    Err(internal(format!(
+        "{what}: storage applied {count}/{} rows and the end-state is not satisfied",
+        ids.len()
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -166,16 +146,16 @@ impl LedgerCtx {
     }
 
     /// Borrow the ledger, returning an error if not injected.
-    pub fn ledger(&self) -> Result<&Ledger, SagaError> {
-        self.ledger.as_ref().map(|l| l.as_ref()).ok_or(SagaError {
-            message: "ledger not injected -- call inject_ledger() after deserializing".into(),
+    pub fn ledger(&self) -> Result<&Ledger, LedgerError> {
+        self.ledger.as_ref().map(|l| l.as_ref()).ok_or_else(|| {
+            internal("ledger not injected -- call inject_ledger() after deserializing")
         })
     }
 
     /// Clone the ledger `Arc`, returning an error if not injected.
-    pub fn ledger_arc(&self) -> Result<Arc<Ledger>, SagaError> {
-        self.ledger.clone().ok_or(SagaError {
-            message: "ledger not injected -- call inject_ledger() after deserializing".into(),
+    pub fn ledger_arc(&self) -> Result<Arc<Ledger>, LedgerError> {
+        self.ledger.clone().ok_or_else(|| {
+            internal("ledger not injected -- call inject_ledger() after deserializing")
         })
     }
 }
@@ -200,17 +180,18 @@ pub struct ReserveInput;
 pub struct ReservePostingsStep;
 
 #[async_trait]
-impl Step<LedgerCtx, SagaError> for ReservePostingsStep {
+impl Step<LedgerCtx, LedgerError> for ReservePostingsStep {
     type Input = ReserveInput;
 
-    async fn execute(ctx: &mut LedgerCtx, _input: &ReserveInput) -> Result<StepOutcome, SagaError> {
+    async fn execute(
+        ctx: &mut LedgerCtx,
+        _input: &ReserveInput,
+    ) -> Result<StepOutcome, LedgerError> {
         async {
             let posting_ids: Vec<PostingId> = ctx
                 .envelope
                 .as_ref()
-                .ok_or(SagaError {
-                    message: "no envelope in context -- resolve step must run first".into(),
-                })?
+                .ok_or_else(|| internal("no envelope in context -- resolve step must run first"))?
                 .consumes()
                 .to_vec();
             let rid = ctx.reservation;
@@ -220,7 +201,7 @@ impl Step<LedgerCtx, SagaError> for ReservePostingsStep {
             let reserved = store
                 .reserve_postings(&posting_ids, rid)
                 .await
-                .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
+                .map_err(LedgerError::Store)?;
             // Storage reports the count; the saga decides. A short count is fine
             // only if the shortfall is already reserved by us (idempotent replay).
             verify_postings(
@@ -241,12 +222,12 @@ impl Step<LedgerCtx, SagaError> for ReservePostingsStep {
     async fn compensate(
         ctx: &mut LedgerCtx,
         _input: &ReserveInput,
-    ) -> Result<CompensationOutcome, SagaError> {
+    ) -> Result<CompensationOutcome, LedgerError> {
         ctx.ledger()?
             .store()
             .release_postings(&ctx.reserved_postings, ctx.reservation)
             .await
-            .map_err(|e| SagaError::from(LedgerError::Store(e)))?;
+            .map_err(LedgerError::Store)?;
         ctx.reserved_postings.clear();
         Ok(CompensationOutcome::Completed)
     }
@@ -271,27 +252,26 @@ pub struct FinalizeInput;
 pub struct FinalizeTransferStep;
 
 #[async_trait]
-impl Step<LedgerCtx, SagaError> for FinalizeTransferStep {
+impl Step<LedgerCtx, LedgerError> for FinalizeTransferStep {
     type Input = FinalizeInput;
 
     async fn execute(
         ctx: &mut LedgerCtx,
         _input: &FinalizeInput,
-    ) -> Result<StepOutcome, SagaError> {
+    ) -> Result<StepOutcome, LedgerError> {
         async {
-            let envelope = ctx.envelope.clone().ok_or(SagaError {
-                message: "no envelope in context -- resolve step must run first".into(),
-            })?;
+            let envelope = ctx
+                .envelope
+                .clone()
+                .ok_or_else(|| internal("no envelope in context -- resolve step must run first"))?;
             let rid = ctx.reservation;
             let ledger = ctx.ledger_arc()?;
 
             // All commit work (re-validate, mark Finalizing, deactivate/insert/
             // store/event with end-state verification) lives in `finalize_envelope`
-            // so recovery uses exactly the same path.
-            let receipt = ledger
-                .finalize_envelope(&envelope, rid)
-                .await
-                .map_err(SagaError::from)?;
+            // so recovery uses exactly the same path. Its typed error (validation,
+            // overdraft, frozen) reaches the caller unchanged.
+            let receipt = ledger.finalize_envelope(&envelope, rid).await?;
 
             ctx.receipts.push(receipt);
             ctx.reserved_postings.clear();
@@ -304,7 +284,7 @@ impl Step<LedgerCtx, SagaError> for FinalizeTransferStep {
     async fn compensate(
         ctx: &mut LedgerCtx,
         _input: &FinalizeInput,
-    ) -> Result<CompensationOutcome, SagaError> {
+    ) -> Result<CompensationOutcome, LedgerError> {
         if let Some(receipt) = ctx.receipts.pop() {
             ctx.ledger_arc()?.reverse(&receipt.transfer_id).await?;
         }
@@ -350,10 +330,11 @@ pub struct DepositInput {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn compensate_last_receipt(ctx: &mut LedgerCtx) -> Result<CompensationOutcome, SagaError> {
-    let receipt = ctx.receipts.pop().ok_or(SagaError {
-        message: "no receipt to compensate".into(),
-    })?;
+async fn compensate_last_receipt(ctx: &mut LedgerCtx) -> Result<CompensationOutcome, LedgerError> {
+    let receipt = ctx
+        .receipts
+        .pop()
+        .ok_or_else(|| internal("no receipt to compensate"))?;
     ctx.ledger_arc()?.reverse(&receipt.transfer_id).await?;
     Ok(CompensationOutcome::Completed)
 }
@@ -366,10 +347,10 @@ async fn compensate_last_receipt(ctx: &mut LedgerCtx) -> Result<CompensationOutc
 pub struct PayMovementStep;
 
 #[async_trait]
-impl Step<LedgerCtx, SagaError> for PayMovementStep {
+impl Step<LedgerCtx, LedgerError> for PayMovementStep {
     type Input = PayInput;
 
-    async fn execute(ctx: &mut LedgerCtx, input: &PayInput) -> Result<StepOutcome, SagaError> {
+    async fn execute(ctx: &mut LedgerCtx, input: &PayInput) -> Result<StepOutcome, LedgerError> {
         let ledger = ctx.ledger_arc()?;
         let transfer = TransferBuilder::new()
             .pay(input.from, input.to, input.asset, input.amount)
@@ -382,7 +363,7 @@ impl Step<LedgerCtx, SagaError> for PayMovementStep {
     async fn compensate(
         ctx: &mut LedgerCtx,
         _input: &PayInput,
-    ) -> Result<CompensationOutcome, SagaError> {
+    ) -> Result<CompensationOutcome, LedgerError> {
         compensate_last_receipt(ctx).await
     }
 }
@@ -391,14 +372,17 @@ impl Step<LedgerCtx, SagaError> for PayMovementStep {
 pub struct DepositMovementStep;
 
 #[async_trait]
-impl Step<LedgerCtx, SagaError> for DepositMovementStep {
+impl Step<LedgerCtx, LedgerError> for DepositMovementStep {
     type Input = DepositInput;
 
-    async fn execute(ctx: &mut LedgerCtx, input: &DepositInput) -> Result<StepOutcome, SagaError> {
+    async fn execute(
+        ctx: &mut LedgerCtx,
+        input: &DepositInput,
+    ) -> Result<StepOutcome, LedgerError> {
         let ledger = ctx.ledger_arc()?;
         let transfer = TransferBuilder::new()
             .deposit(input.to, input.asset, input.amount, input.external)
-            .map_err(|e| SagaError::from(LedgerError::from(e)))?
+            .map_err(LedgerError::from)?
             .build();
         let receipt = ledger.commit(transfer).await?;
         ctx.receipts.push(receipt);
@@ -408,7 +392,7 @@ impl Step<LedgerCtx, SagaError> for DepositMovementStep {
     async fn compensate(
         ctx: &mut LedgerCtx,
         _input: &DepositInput,
-    ) -> Result<CompensationOutcome, SagaError> {
+    ) -> Result<CompensationOutcome, LedgerError> {
         compensate_last_receipt(ctx).await
     }
 }

@@ -4,13 +4,20 @@
 //! and from storage, so callers get a single error type from every API.
 
 use kuatia_core::{
-    AccountId, AssetId, BookId, EnvelopeId, OverflowError, PostingId, SelectionError,
+    AccountId, AssetId, BookId, EnvelopeId, OverflowError, PostingId, ResolveError, SelectionError,
     ValidationError,
 };
 use kuatia_storage::error::StoreError;
 
 /// Unified error type for the async ledger API.
-#[derive(Debug)]
+///
+/// `Clone` so the saga engine can carry a typed error across its step seam and
+/// return the real variant to the caller (an [`OverdraftExceeded`] detected
+/// during commit stays an [`OverdraftExceeded`], not a stringified internal
+/// fault).
+///
+/// [`OverdraftExceeded`]: ValidationError::OverdraftExceeded
+#[derive(Debug, Clone)]
 pub enum LedgerError {
     /// A transfer invariant was violated.
     Validation(ValidationError),
@@ -124,6 +131,15 @@ impl From<StoreError> for LedgerError {
 impl From<SelectionError> for LedgerError {
     fn from(e: SelectionError) -> Self {
         LedgerError::Selection(e)
+    }
+}
+
+impl From<ResolveError> for LedgerError {
+    fn from(e: ResolveError) -> Self {
+        match e {
+            ResolveError::Selection(s) => LedgerError::Selection(s),
+            ResolveError::Overflow => LedgerError::Overflow,
+        }
     }
 }
 

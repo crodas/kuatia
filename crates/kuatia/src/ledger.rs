@@ -9,8 +9,8 @@ use tracing::instrument;
 use kuatia_core::{
     AccountId, AccountPolicy, AccountSnapshotId, AssetId, Book, Cent, DEFAULT_BOOK, Envelope,
     EnvelopeBuilder, EnvelopeId, NewPosting, PlanInput, Posting, PostingFilter, PostingId,
-    PostingState, Receipt, SelectionError, Transfer, account_snapshot_id, envelope_id,
-    select_postings, validate_and_plan,
+    PostingState, Receipt, ResolveInput, Transfer, account_snapshot_id, draft_movements,
+    envelope_id, resolve_envelope, validate_and_plan,
 };
 
 use crate::error::LedgerError;
@@ -23,7 +23,7 @@ pub(crate) fn now_millis() -> Result<i64, LedgerError> {
         .as_millis() as i64)
 }
 use crate::saga::{
-    FinalizeInput, FinalizeTransferStep, LedgerCtx, ReserveInput, ReservePostingsStep, SagaError,
+    FinalizeInput, FinalizeTransferStep, LedgerCtx, ReserveInput, ReservePostingsStep,
 };
 use kuatia_storage::error::StoreError;
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
@@ -164,105 +164,42 @@ impl Ledger {
     /// Convert a [`Transfer`] intent into a concrete [`Envelope`] by selecting
     /// postings for each movement and computing change.
     ///
-    /// Pass 1: create output postings and aggregate net debits per (account, asset).
-    /// Pass 2: for each pair with a positive net debit, select postings and compute change.
+    /// The decision is pure ([`kuatia_core::draft_movements`] +
+    /// [`kuatia_core::resolve_envelope`]); this method only loads the state those
+    /// functions need. Pass 1 aggregates net debits and tells us which postings
+    /// and account policies to load; pass 2 selects postings, computes change,
+    /// and covers any overdraft shortfall.
     #[instrument(skip(self, transfer), name = "ledger.resolve")]
     pub async fn resolve(&self, transfer: &Transfer) -> Result<Envelope, LedgerError> {
-        let mut consumes: Vec<PostingId> = Vec::new();
-        let mut creates: Vec<NewPosting> = Vec::new();
-        let mut net_debits: HashMap<(AccountId, AssetId), Cent> = HashMap::new();
+        let draft = draft_movements(transfer)?;
 
-        // Pass 1: output postings + debit aggregation
-        for m in &transfer.movements {
-            let payer = if m.from != m.to { Some(m.from) } else { None };
-            creates.push(NewPosting {
-                owner: m.to,
-                asset: m.asset,
-                value: m.amount,
-                payer,
-            });
-            let entry = net_debits.entry((m.from, m.asset)).or_insert(Cent::ZERO);
-            *entry = entry.checked_add(m.amount)?;
-        }
-
-        // Pass 2: posting selection for accounts with positive net debit
-        for ((account, asset), net_debit) in &net_debits {
-            if !net_debit.is_positive() {
-                continue;
-            }
-            let available = self
+        // Load the active postings and account policy for each debit. A deposit
+        // nets to zero on the system account, so it produces no debit and loads
+        // nothing here.
+        let mut available: HashMap<(AccountId, AssetId), Vec<Posting>> = HashMap::new();
+        let mut policies: HashMap<AccountId, AccountPolicy> = HashMap::new();
+        for debit in &draft.debits {
+            let postings = self
                 .store
                 .get_postings_by_account(
-                    account.id,
-                    Some(account.sub),
-                    Some(asset),
+                    debit.account.id,
+                    Some(debit.account.sub),
+                    Some(&debit.asset),
                     PostingFilter::Active,
                 )
                 .await?;
-            let total_positive = Cent::checked_sum(
-                available
-                    .iter()
-                    .filter(|p| p.value.is_positive())
-                    .map(|p| p.value),
-            )?;
-
-            if total_positive >= *net_debit {
-                // Enough positive postings: select a subset and compute change.
-                let selected = select_postings(&available, *asset, *net_debit)?;
-                let consumed_sum = Cent::checked_sum(
-                    available
-                        .iter()
-                        .filter(|p| selected.contains(&p.id))
-                        .map(|p| p.value),
-                )?;
-                let change = consumed_sum.checked_sub(*net_debit)?;
-
-                consumes.extend_from_slice(&selected);
-                if change.is_positive() {
-                    creates.push(NewPosting {
-                        owner: *account,
-                        asset: *asset,
-                        value: change,
-                        payer: None,
-                    });
-                }
-            } else {
-                // Not enough positive postings. Overdraft accounts cover the
-                // shortfall with a negative posting (an offset position); the
-                // floor is enforced later in validation. Any other policy fails.
-                let policy = self.store.get_account(account).await?.policy;
-                match policy {
-                    AccountPolicy::CappedOverdraft { .. } | AccountPolicy::UncappedOverdraft => {
-                        let positives: Vec<PostingId> = available
-                            .iter()
-                            .filter(|p| p.value.is_positive())
-                            .map(|p| p.id)
-                            .collect();
-                        consumes.extend_from_slice(&positives);
-                        let shortfall = net_debit.checked_sub(total_positive)?;
-                        creates.push(NewPosting {
-                            owner: *account,
-                            asset: *asset,
-                            value: shortfall.checked_neg()?,
-                            payer: None,
-                        });
-                    }
-                    _ => {
-                        return Err(LedgerError::Selection(SelectionError::InsufficientFunds {
-                            available: total_positive,
-                            requested: *net_debit,
-                        }));
-                    }
-                }
+            available.insert((debit.account, debit.asset), postings);
+            if let std::collections::hash_map::Entry::Vacant(slot) = policies.entry(debit.account) {
+                slot.insert(self.store.get_account(&debit.account).await?.policy);
             }
         }
 
-        let mut envelope = EnvelopeBuilder::new()
-            .consumes(consumes)
-            .creates(creates)
-            .book(transfer.book)
-            .metadata(transfer.metadata.clone())
-            .build();
+        let mut envelope = resolve_envelope(ResolveInput {
+            transfer,
+            draft,
+            available: &available,
+            policies: &policies,
+        })?;
 
         // Resolve account snapshots for optimistic concurrency
         let ids = envelope.referenced_accounts();
@@ -355,20 +292,17 @@ impl Ledger {
                     LedgerError::Store(StoreError::Internal("saga completed but no receipt".into()))
                 })
             }
-            ExecutionResult::Failed(_, err) => {
-                Err(LedgerError::Store(StoreError::Internal(err.message)))
-            }
+            // The saga's error type is `LedgerError`, so a validation / overdraft
+            // / frozen failure detected during commit reaches the caller as the
+            // real typed variant instead of a stringified internal fault.
+            ExecutionResult::Failed(_, err) => Err(err),
             ExecutionResult::CompensationFailed {
                 original_error,
                 compensation_error,
                 ..
             } => Err(LedgerError::CompensationFailed {
-                original: Box::new(LedgerError::Store(StoreError::Internal(
-                    original_error.message,
-                ))),
-                compensation: Box::new(LedgerError::Store(StoreError::Internal(
-                    compensation_error.message,
-                ))),
+                original: Box::new(original_error),
+                compensation: Box::new(compensation_error),
             }),
             ExecutionResult::Paused(_) => Err(LedgerError::Store(StoreError::Internal(
                 "saga paused unexpectedly".into(),
