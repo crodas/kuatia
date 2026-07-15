@@ -202,7 +202,7 @@ pub fn resolve_envelope(input: ResolveInput<'_>) -> Result<Envelope, ResolveErro
             // shortfall with a negative posting (an offset position); any other
             // policy — or an unknown one — fails.
             match policies.get(&debit.account) {
-                Some(AccountPolicy::CappedOverdraft { .. } | AccountPolicy::UncappedOverdraft) => {
+                Some(policy) if policy.covers_shortfall_with_offset() => {
                     let positives: Vec<PostingId> = avail
                         .iter()
                         .filter(|p| p.value.is_positive())

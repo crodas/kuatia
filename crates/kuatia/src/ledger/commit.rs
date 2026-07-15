@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use legend::ExecutionResult;
 use tracing::instrument;
 
 use kuatia_core::{
@@ -23,10 +22,8 @@ use kuatia_storage::error::StoreError;
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
 use kuatia_storage::store::EnvelopeRecord;
 
-use super::envelope_saga::*;
 use super::{Ledger, now_millis};
 use crate::error::LedgerError;
-use crate::saga::{FinalizeInput, LedgerCtx, ReserveInput};
 
 /// Phase of an in-flight commit, persisted with the write-ahead record so
 /// recovery knows whether validation has completed.
@@ -61,6 +58,29 @@ pub struct LoadedState {
     pub balances: HashMap<(AccountId, AssetId), Cent>,
     /// The book gating this transfer, if one is loaded (`None` = unrestricted default).
     pub book: Option<Book>,
+}
+
+/// Number of times a commit phase is retried before it fails. Matches the
+/// former per-step `RetryPolicy::retries(3)`: one initial attempt plus three
+/// retries.
+const COMMIT_STEP_RETRIES: u8 = 3;
+
+/// Run an idempotent commit phase, retrying up to [`COMMIT_STEP_RETRIES`] times
+/// on error. No backoff: the reserve CAS and the idempotent finalize either
+/// converge on an immediate retry or fail deterministically.
+async fn retry<T, F, Fut>(mut phase: F) -> Result<T, LedgerError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, LedgerError>>,
+{
+    let mut attempt = 0u8;
+    loop {
+        match phase().await {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt >= COMMIT_STEP_RETRIES => return Err(error),
+            Err(_) => attempt += 1,
+        }
+    }
 }
 
 impl Ledger {
@@ -251,43 +271,69 @@ impl Ledger {
         result
     }
 
-    /// Build and run the envelope saga (reserve → finalize) to a terminal
+    /// Drive the two-phase envelope commit (`reserve → finalize`) to a terminal
     /// outcome, returning the resulting receipt.
+    ///
+    /// This is the single-commit pipeline. It is a plain function, not a `legend`
+    /// saga: the durability engine is the phase-tracked write-ahead record plus
+    /// `recover()` (ADR-0003), and multi-transfer composition happens one level
+    /// up, where `PayMovementStep`/`DepositMovementStep` wrap `commit()`. The two
+    /// phases and their failure handling mirror the former saga exactly:
+    ///
+    /// - **reserve** (retried): CAS the consumed postings into the reserved
+    ///   index and verify the end-state. A failure after retries leaves nothing
+    ///   to roll back here — recovery re-runs the still-`Reserving` saga.
+    /// - **finalize** (retried): re-validate, mark `Finalizing`, then run the
+    ///   dumb primitives. A failure after retries compensates the reserve phase
+    ///   by releasing the reservation (a no-op once the postings are `Spent`,
+    ///   i.e. past the point of no return, where recovery rolls forward). If the
+    ///   release itself fails, the two errors surface as `CompensationFailed`.
     async fn drive_envelope_saga(
         self: &Arc<Self>,
         envelope: Envelope,
         reservation: kuatia_core::ReservationId,
     ) -> Result<Receipt, LedgerError> {
-        let saga = EnvelopeSaga::new(EnvelopeSagaInputs {
-            reserve: ReserveInput,
-            finalize: FinalizeInput,
-        });
-        let ctx = LedgerCtx::for_envelope(Arc::clone(self), envelope, reservation);
-        let execution = saga.build(ctx);
+        let consumes = envelope.consumes().to_vec();
 
-        match execution.start().await {
-            ExecutionResult::Completed(e) => {
-                let ctx = e.into_context();
-                ctx.receipts.last().cloned().ok_or_else(|| {
-                    LedgerError::Store(StoreError::Internal("saga completed but no receipt".into()))
-                })
+        retry(|| self.reserve_and_verify(&consumes, reservation)).await?;
+
+        match retry(|| self.finalize_envelope(&envelope, reservation)).await {
+            Ok(receipt) => Ok(receipt),
+            Err(finalize_error) => {
+                match self.store.release_postings(&consumes, reservation).await {
+                    Ok(_) => Err(finalize_error),
+                    Err(release_error) => Err(LedgerError::CompensationFailed {
+                        original: Box::new(finalize_error),
+                        compensation: Box::new(LedgerError::Store(release_error)),
+                    }),
+                }
             }
-            // The saga's error type is `LedgerError`, so a validation / overdraft
-            // / frozen failure detected during commit reaches the caller as the
-            // real typed variant instead of a stringified internal fault.
-            ExecutionResult::Failed(_, err) => Err(err),
-            ExecutionResult::CompensationFailed {
-                original_error,
-                compensation_error,
-                ..
-            } => Err(LedgerError::CompensationFailed {
-                original: Box::new(original_error),
-                compensation: Box::new(compensation_error),
-            }),
-            ExecutionResult::Paused(_) => Err(LedgerError::Store(StoreError::Internal(
-                "saga paused unexpectedly".into(),
-            ))),
         }
+    }
+
+    /// Reserve `consumes` for this saga: CAS each consumed posting from the
+    /// active index into the reserved index under `reservation`, then confirm the
+    /// end-state (all reserved by us) via the dumb-storage count contract. A short
+    /// count is tolerated only when the shortfall is already reserved by us (an
+    /// idempotent replay); anything else is a genuine failure.
+    async fn reserve_and_verify(
+        &self,
+        consumes: &[PostingId],
+        reservation: kuatia_core::ReservationId,
+    ) -> Result<(), LedgerError> {
+        let reserved = self
+            .store
+            .reserve_postings(consumes, reservation)
+            .await
+            .map_err(LedgerError::Store)?;
+        crate::saga::verify_postings(
+            self.store.as_ref(),
+            consumes,
+            reserved,
+            |s| matches!(s, PostingState::Reserved(r) if *r == reservation),
+            "reserve",
+        )
+        .await
     }
 
     /// Complete every pending saga left by a crash. Call on startup; returns how
@@ -408,12 +454,13 @@ impl Ledger {
             .deactivate_postings(consumes, Some(reservation))
             .await?;
         if !consumes.is_empty() {
-            let after = self.store.get_posting_states(consumes).await?;
-            if after.len() != consumes.len() || after.iter().any(|s| *s != PostingState::Spent) {
-                return Err(LedgerError::Store(StoreError::Internal(
-                    "finalize: consumed postings not all spent (contended or not reserved by this saga)".into(),
-                )));
-            }
+            crate::saga::verify_posting_states(
+                self.store.as_ref(),
+                consumes,
+                |s| *s == PostingState::Spent,
+                "finalize: consumed postings not all spent (contended or not reserved by this saga)",
+            )
+            .await?;
         }
 
         // Created postings, derived deterministically from the envelope.
@@ -436,11 +483,10 @@ impl Ledger {
         self.store.insert_postings(&created).await?;
         if !created.is_empty() {
             let ids: Vec<PostingId> = created.iter().map(|p| p.id).collect();
-            if self.store.get_postings(&ids).await?.len() != created.len() {
-                return Err(LedgerError::Store(StoreError::Internal(
-                    "finalize: created postings missing after insert".into(),
-                )));
-            }
+            crate::saga::ensure(
+                self.store.get_postings(&ids).await?.len() == created.len(),
+                "finalize: created postings missing after insert",
+            )?;
         }
 
         // Index both created and consumed owners.
@@ -460,11 +506,10 @@ impl Ledger {
                 &involved,
             )
             .await?;
-        if self.store.get_transfer(&tid).await?.is_none() {
-            return Err(LedgerError::Store(StoreError::Internal(
-                "finalize: transfer record missing after store".into(),
-            )));
-        }
+        crate::saga::ensure(
+            self.store.get_transfer(&tid).await?.is_some(),
+            "finalize: transfer record missing after store",
+        )?;
 
         self.append_committed_event(tid).await?;
         Ok(receipt)
@@ -919,5 +964,43 @@ mod recovery_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn retry_gives_up_after_max_attempts() {
+        let calls = Cell::new(0u8);
+        let result: Result<(), LedgerError> = retry(|| {
+            calls.set(calls.get() + 1);
+            async { Err(LedgerError::Overflow) }
+        })
+        .await;
+        assert!(result.is_err());
+        // One initial attempt plus COMMIT_STEP_RETRIES retries.
+        assert_eq!(calls.get(), COMMIT_STEP_RETRIES + 1);
+    }
+
+    #[tokio::test]
+    async fn retry_returns_the_first_success() {
+        let calls = Cell::new(0u8);
+        let result: Result<u8, LedgerError> = retry(|| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move {
+                if n >= 2 {
+                    Ok(n)
+                } else {
+                    Err(LedgerError::Overflow)
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(calls.get(), 2);
     }
 }

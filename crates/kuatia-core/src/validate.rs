@@ -370,18 +370,12 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
                 .accounts
                 .get(&np.owner)
                 .ok_or(ValidationError::AccountNotFound(np.owner))?;
-            match account.policy {
-                AccountPolicy::SystemAccount
-                | AccountPolicy::ExternalAccount
-                | AccountPolicy::UncappedOverdraft
-                | AccountPolicy::CappedOverdraft { .. } => {}
-                AccountPolicy::NoOverdraft => {
-                    return Err(ValidationError::NegativePostingOnNonSystemAccount {
-                        account: np.owner,
-                        asset: np.asset,
-                        value: np.value,
-                    });
-                }
+            if !account.policy.permits_negative_posting() {
+                return Err(ValidationError::NegativePostingOnNonSystemAccount {
+                    account: np.owner,
+                    asset: np.asset,
+                    value: np.value,
+                });
             }
         }
     }
@@ -409,31 +403,14 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
         let projected = current_balance.checked_add(*delta)?;
 
         let account = &input.accounts[account_id];
-        match &account.policy {
-            AccountPolicy::NoOverdraft => {
-                if projected.is_negative() {
-                    return Err(ValidationError::OverdraftExceeded {
-                        account: *account_id,
-                        asset: *asset_id,
-                        floor: Cent::ZERO,
-                        projected,
-                    });
-                }
-            }
-            AccountPolicy::CappedOverdraft { floor } => {
-                if projected < *floor {
-                    return Err(ValidationError::OverdraftExceeded {
-                        account: *account_id,
-                        asset: *asset_id,
-                        floor: *floor,
-                        projected,
-                    });
-                }
-            }
-            AccountPolicy::UncappedOverdraft
-            | AccountPolicy::SystemAccount
-            | AccountPolicy::ExternalAccount => {
-                // No floor check
+        if let Some(floor) = account.policy.balance_floor() {
+            if projected < floor {
+                return Err(ValidationError::OverdraftExceeded {
+                    account: *account_id,
+                    asset: *asset_id,
+                    floor,
+                    projected,
+                });
             }
         }
     }

@@ -573,6 +573,39 @@ pub enum AccountPolicy {
     ExternalAccount,
 }
 
+impl AccountPolicy {
+    /// During posting selection, may an account with this policy cover a
+    /// shortfall by creating a negative offset posting?
+    ///
+    /// Only the two overdraft policies grant this. System and external accounts
+    /// *hold* negative postings (the offset side of deposits, created via
+    /// canceling movements) but are never auto-overdrawn by the resolver's
+    /// selection pass, so they are excluded here.
+    pub fn covers_shortfall_with_offset(&self) -> bool {
+        matches!(self, Self::CappedOverdraft { .. } | Self::UncappedOverdraft)
+    }
+
+    /// May an account with this policy own a negative posting at all? Every
+    /// policy except [`NoOverdraft`](Self::NoOverdraft) permits it (the two
+    /// overdraft policies plus system and external accounts).
+    pub fn permits_negative_posting(&self) -> bool {
+        !matches!(self, Self::NoOverdraft)
+    }
+
+    /// The minimum balance an account with this policy may reach, if bounded.
+    ///
+    /// `NoOverdraft` floors at zero and `CappedOverdraft` at its configured
+    /// floor; the unbounded policies (uncapped overdraft, system, external)
+    /// return `None`.
+    pub fn balance_floor(&self) -> Option<Cent> {
+        match self {
+            Self::NoOverdraft => Some(Cent::ZERO),
+            Self::CappedOverdraft { floor } => Some(*floor),
+            Self::UncappedOverdraft | Self::SystemAccount | Self::ExternalAccount => None,
+        }
+    }
+}
+
 bitflags::bitflags! {
     /// Lifecycle and user-defined flags for an [`Account`].
     ///
