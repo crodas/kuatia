@@ -48,33 +48,54 @@ fn internal(message: impl Into<String>) -> LedgerError {
     LedgerError::Store(StoreError::Internal(message.into()))
 }
 
-/// Interpret a dumb primitive's affected-row `count` against the `ids` it
-/// targeted. `count == ids.len()` is success. A short count is acceptable only if
-/// the shortfall is already in the desired end-state — a prior attempt (or this
-/// saga, replayed by recovery) already applied it — verified by reading the
-/// postings and checking `ok`. Otherwise it is a genuine failure (contended or
-/// concurrently modified) and the saga compensates.
-async fn verify_postings(
+/// The single home of the ADR-0003 affected-row count contract, used after every
+/// dumb write primitive in the commit path.
+///
+/// Interpret a primitive's affected-row `count` against the number of rows it
+/// `target`ed. `count == target` is success. A short count is acceptable only if
+/// the desired end-state already holds (a prior attempt, or this saga replayed by
+/// recovery, already applied it), which `verify` re-reads and reports as a bool.
+/// Otherwise it is a genuine failure (contended or concurrently modified) and the
+/// caller compensates.
+pub(crate) async fn apply_and_verify<F, Fut>(
+    count: u64,
+    target: usize,
+    what: &str,
+    verify: F,
+) -> Result<(), LedgerError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<bool, LedgerError>>,
+{
+    if count == target as u64 {
+        return Ok(());
+    }
+    if verify().await? {
+        return Ok(());
+    }
+    Err(internal(format!(
+        "{what}: storage applied {count}/{target} rows and the end-state is not satisfied"
+    )))
+}
+
+/// Apply the count contract to a posting primitive whose end-state is a property
+/// of the targeted postings: a short count is idempotent-safe only when every
+/// targeted posting already satisfies `ok`.
+pub(crate) async fn verify_postings(
     store: &dyn Store,
     ids: &[PostingId],
     count: u64,
     ok: impl Fn(&PostingState) -> bool,
     what: &str,
 ) -> Result<(), LedgerError> {
-    if count == ids.len() as u64 {
-        return Ok(());
-    }
-    let states = store
-        .get_posting_states(ids)
-        .await
-        .map_err(LedgerError::Store)?;
-    if states.len() == ids.len() && states.iter().all(&ok) {
-        return Ok(());
-    }
-    Err(internal(format!(
-        "{what}: storage applied {count}/{} rows and the end-state is not satisfied",
-        ids.len()
-    )))
+    apply_and_verify(count, ids.len(), what, || async {
+        let states = store
+            .get_posting_states(ids)
+            .await
+            .map_err(LedgerError::Store)?;
+        Ok(states.len() == ids.len() && states.iter().all(&ok))
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -394,5 +415,56 @@ impl Step<LedgerCtx, LedgerError> for DepositMovementStep {
         _input: &DepositInput,
     ) -> Result<CompensationOutcome, LedgerError> {
         compensate_last_receipt(ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn full_count_is_ok_without_re_reading() {
+        let verified = Cell::new(false);
+        let result = apply_and_verify(3, 3, "reserve", || {
+            verified.set(true);
+            async { Ok(true) }
+        })
+        .await;
+        assert!(result.is_ok());
+        assert!(
+            !verified.get(),
+            "a full count must not re-read the end-state"
+        );
+    }
+
+    #[tokio::test]
+    async fn short_count_is_ok_when_end_state_already_holds() {
+        // Idempotent replay: a prior attempt applied the shortfall.
+        let result = apply_and_verify(2, 3, "reserve", || async { Ok(true) }).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn short_count_is_internal_error_when_end_state_missing() {
+        let result = apply_and_verify(2, 3, "reserve", || async { Ok(false) }).await;
+        assert!(matches!(
+            result,
+            Err(LedgerError::Store(StoreError::Internal(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_error_propagates() {
+        let result = apply_and_verify(0, 1, "store", || async {
+            Err(LedgerError::Store(StoreError::Internal(
+                "read failed".into(),
+            )))
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(LedgerError::Store(StoreError::Internal(_)))
+        ));
     }
 }

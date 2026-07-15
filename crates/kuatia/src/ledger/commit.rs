@@ -26,7 +26,7 @@ use kuatia_storage::store::EnvelopeRecord;
 use super::envelope_saga::*;
 use super::{Ledger, now_millis};
 use crate::error::LedgerError;
-use crate::saga::{FinalizeInput, LedgerCtx, ReserveInput};
+use crate::saga::{FinalizeInput, LedgerCtx, ReserveInput, apply_and_verify, verify_postings};
 
 /// Phase of an in-flight commit, persisted with the write-ahead record so
 /// recovery knows whether validation has completed.
@@ -404,17 +404,18 @@ impl Ledger {
         // guard: `deactivate_postings(Some(rid))` only removes rows we reserved,
         // so any consumed id still active or reserved by another saga leaves the
         // "all spent" check failing.
-        self.store
+        let spent = self
+            .store
             .deactivate_postings(consumes, Some(reservation))
             .await?;
-        if !consumes.is_empty() {
-            let after = self.store.get_posting_states(consumes).await?;
-            if after.len() != consumes.len() || after.iter().any(|s| *s != PostingState::Spent) {
-                return Err(LedgerError::Store(StoreError::Internal(
-                    "finalize: consumed postings not all spent (contended or not reserved by this saga)".into(),
-                )));
-            }
-        }
+        verify_postings(
+            self.store.as_ref(),
+            consumes,
+            spent,
+            |s| *s == PostingState::Spent,
+            "finalize: consume reserved postings",
+        )
+        .await?;
 
         // Created postings, derived deterministically from the envelope.
         let created: Vec<Posting> = envelope
@@ -433,15 +434,16 @@ impl Ledger {
                 )
             })
             .collect();
-        self.store.insert_postings(&created).await?;
-        if !created.is_empty() {
-            let ids: Vec<PostingId> = created.iter().map(|p| p.id).collect();
-            if self.store.get_postings(&ids).await?.len() != created.len() {
-                return Err(LedgerError::Store(StoreError::Internal(
-                    "finalize: created postings missing after insert".into(),
-                )));
-            }
-        }
+        let inserted = self.store.insert_postings(&created).await?;
+        let created_ids: Vec<PostingId> = created.iter().map(|p| p.id).collect();
+        verify_postings(
+            self.store.as_ref(),
+            &created_ids,
+            inserted,
+            |s| *s != PostingState::Missing,
+            "finalize: insert created postings",
+        )
+        .await?;
 
         // Index both created and consumed owners.
         let mut involved: Vec<AccountId> = created.iter().map(|p| p.owner).collect();
@@ -450,7 +452,8 @@ impl Ledger {
         involved.dedup();
 
         let receipt = Receipt { transfer_id: tid };
-        self.store
+        let stored = self
+            .store
             .store_transfer(
                 EnvelopeRecord {
                     envelope: envelope.clone(),
@@ -460,11 +463,10 @@ impl Ledger {
                 &involved,
             )
             .await?;
-        if self.store.get_transfer(&tid).await?.is_none() {
-            return Err(LedgerError::Store(StoreError::Internal(
-                "finalize: transfer record missing after store".into(),
-            )));
-        }
+        apply_and_verify(stored, 1, "finalize: store transfer record", || async {
+            Ok(self.store.get_transfer(&tid).await?.is_some())
+        })
+        .await?;
 
         self.append_committed_event(tid).await?;
         Ok(receipt)
