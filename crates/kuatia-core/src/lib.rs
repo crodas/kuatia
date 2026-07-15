@@ -18,5 +18,5 @@ pub use hash::{
 pub use posting_resolution::{
     Debit, MovementDraft, ResolveError, ResolveInput, draft_movements, resolve_envelope,
 };
-pub use posting_selection::{SelectionError, select_postings};
+pub use posting_selection::SelectionError;
 pub use validate::{Plan, PlanInput, ValidationError, validate_and_plan};

@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use crate::posting_selection::{SelectionError, select_postings};
+use crate::posting_selection::SelectionError;
 use kuatia_types::{
     AccountId, AccountPolicy, AssetId, Cent, Envelope, EnvelopeBuilder, NewPosting, OverflowError,
     Posting, PostingId, Transfer,
@@ -178,17 +178,23 @@ pub fn resolve_envelope(input: ResolveInput<'_>) -> Result<Envelope, ResolveErro
         )?;
 
         if total_positive >= debit.amount {
-            // Enough positive postings: select a subset and compute change.
-            let selected = select_postings(avail, debit.asset, debit.amount)?;
-            let consumed_sum = Cent::checked_sum(
-                avail
-                    .iter()
-                    .filter(|p| selected.contains(&p.id))
-                    .map(|p| p.value),
-            )?;
-            let change = consumed_sum.checked_sub(debit.amount)?;
+            // Enough positive postings: greedily take them largest-first to
+            // minimise the number consumed (and therefore the change postings
+            // created), summing as we go so we stop once the debit is covered.
+            let mut candidates: Vec<&Posting> =
+                avail.iter().filter(|p| p.value.is_positive()).collect();
+            candidates.sort_by_key(|p| std::cmp::Reverse(p.value));
 
-            consumes.extend_from_slice(&selected);
+            let mut consumed_sum = Cent::ZERO;
+            for posting in candidates {
+                consumes.push(posting.id);
+                consumed_sum = consumed_sum.checked_add(posting.value)?;
+                if consumed_sum >= debit.amount {
+                    break;
+                }
+            }
+
+            let change = consumed_sum.checked_sub(debit.amount)?;
             if change.is_positive() {
                 creates.push(NewPosting {
                     owner: debit.account,
@@ -341,6 +347,38 @@ mod tests {
             .collect();
         assert_eq!(change.len(), 1);
         assert_eq!(change[0].value, Cent::from(70));
+    }
+
+    #[test]
+    fn selects_largest_first_to_minimise_consumed() {
+        // With 10, 90 and 50 available, a debit of 80 is covered by the single
+        // 90 posting rather than several smaller ones — one consumed, 10 change.
+        let transfer = pay(acct(1), acct(2), 80);
+        let draft = draft_movements(&transfer).unwrap();
+        let available = HashMap::from([(
+            (acct(1), AssetId::new(1)),
+            vec![
+                posting(acct(1), 0, 10),
+                posting(acct(1), 1, 90),
+                posting(acct(1), 2, 50),
+            ],
+        )]);
+        let policies = HashMap::new();
+        let env = resolve_envelope(ResolveInput {
+            transfer: &transfer,
+            draft,
+            available: &available,
+            policies: &policies,
+        })
+        .unwrap();
+        assert_eq!(env.consumes().len(), 1);
+        let change: Vec<_> = env
+            .creates()
+            .iter()
+            .filter(|p| p.owner == acct(1))
+            .collect();
+        assert_eq!(change.len(), 1);
+        assert_eq!(change[0].value, Cent::from(10));
     }
 
     #[test]
