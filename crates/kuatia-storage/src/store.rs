@@ -189,9 +189,12 @@ pub trait TransferStore: Send + Sync {
     async fn get_transfer(&self, id: &EnvelopeId) -> Result<Option<EnvelopeRecord>, StoreError>;
     /// Persist a transfer record if absent (idempotent) and index it under every
     /// account in `involved` (both created and consumed owners — the caller
-    /// supplies the set so storage computes nothing). A dumb instruction:
-    /// returns **1** if the transfer row was newly inserted, **0** if it already
-    /// existed. The caller decides what `0` means.
+    /// supplies the set so storage computes nothing). Every backend indexes the
+    /// transfer under exactly these accounts and derives participation from
+    /// nowhere else, so `get_transfers_for_account` returns the same set of
+    /// transfers regardless of backend. A dumb instruction: returns **1** if the
+    /// transfer row was newly inserted, **0** if it already existed. The caller
+    /// decides what `0` means.
     async fn store_transfer(
         &self,
         record: EnvelopeRecord,

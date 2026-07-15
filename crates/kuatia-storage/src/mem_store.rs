@@ -37,6 +37,10 @@ pub struct InMemoryStore {
     postings: RwLock<PostingTables>,
     accounts: RwLock<HashMap<AccountId, Vec<Account>>>,
     transfers: RwLock<HashMap<EnvelopeId, EnvelopeRecord>>,
+    /// Transfer-participation index: the `involved` set the caller passed to
+    /// `store_transfer`, mirroring the SQL `transfer_accounts` table so both
+    /// backends resolve `get_transfers_for_account` from the same instruction.
+    transfer_accounts: RwLock<HashMap<EnvelopeId, Vec<AccountId>>>,
     sagas: RwLock<HashMap<i64, Vec<u8>>>,
     events: RwLock<Vec<LedgerEvent>>,
     books: RwLock<HashMap<BookId, Book>>,
@@ -56,6 +60,7 @@ impl InMemoryStore {
             postings: RwLock::new(PostingTables::default()),
             accounts: RwLock::new(HashMap::new()),
             transfers: RwLock::new(HashMap::new()),
+            transfer_accounts: RwLock::new(HashMap::new()),
             sagas: RwLock::new(HashMap::new()),
             events: RwLock::new(Vec::new()),
             books: RwLock::new(HashMap::new()),
@@ -312,17 +317,22 @@ impl TransferStore for InMemoryStore {
     async fn store_transfer(
         &self,
         record: EnvelopeRecord,
-        _involved: &[AccountId],
+        involved: &[AccountId],
     ) -> Result<u64, StoreError> {
-        // `_involved` is ignored here: `get_transfers_for_account` derives the
-        // involved accounts from the stored envelope (creates owners + consumed
-        // posting owners), which matches the set the caller passes. The SQL
-        // backend instead persists `involved` into its `transfer_accounts` index.
+        // Index the transfer under exactly the accounts the caller supplied,
+        // deriving nothing — the same instruction the SQL backend follows into
+        // its `transfer_accounts` table. Idempotent: a replay writes the same
+        // set. The returned count reflects only whether the transfer row was
+        // newly inserted; the caller decides what `0` means.
+        let tid = record.receipt.transfer_id;
+        // Lock order transfers → transfer_accounts, matching every other reader.
         let mut transfers = self.transfers.write().await;
-        if transfers.contains_key(&record.receipt.transfer_id) {
+        let mut transfer_accounts = self.transfer_accounts.write().await;
+        transfer_accounts.insert(tid, involved.to_vec());
+        if transfers.contains_key(&tid) {
             return Ok(0);
         }
-        transfers.insert(record.receipt.transfer_id, record);
+        transfers.insert(tid, record);
         Ok(1)
     }
 
@@ -331,27 +341,16 @@ impl TransferStore for InMemoryStore {
         id: i64,
         sub: Option<i64>,
     ) -> Result<Vec<EnvelopeRecord>, StoreError> {
-        // Acquire postings → transfers in a consistent order to avoid an AB–BA
-        // deadlock with any reader that takes both.
-        let postings = self.postings.read().await;
+        // Resolve participation from the `involved` index, not from postings, so
+        // this backend answers exactly what `store_transfer` was told — matching
+        // the SQL `transfer_accounts` join. Lock order transfers → index.
         let transfers = self.transfers.read().await;
+        let transfer_accounts = self.transfer_accounts.read().await;
         let matches = |owner: &AccountId| owner.id == id && sub.is_none_or(|s| owner.sub == s);
-        let mut result: Vec<EnvelopeRecord> = transfers
-            .values()
-            .filter(|record| {
-                record
-                    .envelope
-                    .creates()
-                    .iter()
-                    .any(|np| matches(&np.owner))
-                    || record.envelope.consumes().iter().any(|pid| {
-                        postings
-                            .immutable
-                            .get(pid)
-                            .is_some_and(|p| matches(&p.owner))
-                    })
-            })
-            .cloned()
+        let mut result: Vec<EnvelopeRecord> = transfer_accounts
+            .iter()
+            .filter(|(_, accounts)| accounts.iter().any(matches))
+            .filter_map(|(tid, _)| transfers.get(tid).cloned())
             .collect();
         result.sort_by_key(|r| r.created_at);
         Ok(result)

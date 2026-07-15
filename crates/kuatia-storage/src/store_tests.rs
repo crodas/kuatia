@@ -818,6 +818,50 @@ pub async fn store_transfer_counts(store: &(impl Store + 'static)) {
     );
 }
 
+/// `store_transfer` indexes the transfer under exactly the `involved` set the
+/// caller supplies and derives participation from nowhere else. A consumed
+/// posting's owner (account 7) is distinct from every created owner (account 8),
+/// and that consumed posting is deliberately never seeded into the store, so the
+/// transfer can be found for account 7 only if the backend trusts `involved`.
+/// This is the case where a derive-from-postings backend and a trust-`involved`
+/// backend would disagree; both must return the transfer for both accounts.
+pub async fn store_transfer_indexes_involved(store: &(impl Store + 'static)) {
+    let consumed = PostingId {
+        transfer: EnvelopeId([9; 32]),
+        index: 0,
+    };
+    let tid = EnvelopeId([7; 32]);
+    let envelope = EnvelopeBuilder::new()
+        .consumes(vec![consumed])
+        .creates(vec![NewPosting {
+            owner: AccountId::new(8),
+            asset: AssetId::new(1),
+            value: Cent::from(100),
+            payer: None,
+        }])
+        .build();
+    let record = EnvelopeRecord {
+        envelope,
+        receipt: Receipt { transfer_id: tid },
+        created_at: 2000,
+    };
+    // Full participation set: created owner 8 plus consumed owner 7. Account 7's
+    // posting is never inserted, so only `involved` can surface the transfer.
+    let involved = [AccountId::new(8), AccountId::new(7)];
+
+    assert_eq!(store.store_transfer(record, &involved).await.unwrap(), 1);
+
+    // Consumed-owner branch: found purely because `involved` said so.
+    let for_consumed = store.get_transfers_for_account(7, None).await.unwrap();
+    assert_eq!(for_consumed.len(), 1);
+    assert_eq!(for_consumed[0].receipt.transfer_id, tid);
+
+    // The created owner is indexed identically.
+    let for_created = store.get_transfers_for_account(8, None).await.unwrap();
+    assert_eq!(for_created.len(), 1);
+    assert_eq!(for_created[0].receipt.transfer_id, tid);
+}
+
 // ---------------------------------------------------------------------------
 // Reservation / double-spend regressions (sequential — the conformance harness
 // holds a single `&store`; the second attempt is what must report zero).
@@ -1177,6 +1221,7 @@ macro_rules! store_tests {
             spent_posting_remains_in_immutable_table,
             get_postings_by_account_live_filter,
             store_transfer_counts,
+            store_transfer_indexes_involved,
             // Reservation / double-spend regressions
             reserve_twice_second_zero,
             deactivate_twice_second_zero,
