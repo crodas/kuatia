@@ -170,15 +170,12 @@ pub trait PostingStore: Send + Sync {
     /// Query postings with filtering and pagination.
     async fn query_postings(&self, query: &PostingQuery) -> Result<Page<Posting>, StoreError> {
         // `get_postings_by_account` returns a deterministic id-ordered sequence,
-        // so LIMIT/OFFSET here paginate stably without an extra sort.
+        // so paginating here is stable without an extra sort. A backend that can
+        // push the window into its query (e.g. SQL `LIMIT`) overrides this.
         let all = self
             .get_postings_by_account(query.account, query.sub, query.asset.as_ref(), query.filter)
             .await?;
-        let total = all.len() as u64;
-        let offset = query.offset.unwrap_or(0) as usize;
-        let limit = query.limit.unwrap_or(u32::MAX) as usize;
-        let items = all.into_iter().skip(offset).take(limit).collect();
-        Ok(Page { items, total })
+        Ok(crate::query::paginate(all, query.offset, query.limit))
     }
 }
 
@@ -209,48 +206,18 @@ pub trait TransferStore: Send + Sync {
     ) -> Result<Vec<EnvelopeRecord>, StoreError>;
 
     /// Query transfers with filtering and pagination.
+    ///
+    /// A backend loads the candidate records, then hands them to
+    /// [`filter_transfers`](crate::query::filter_transfers) and
+    /// [`paginate`](crate::query::paginate) for the shared time-window/book and
+    /// page cut. There is no default because loading candidates differs by
+    /// backend and, crucially, an `account == None` query must be answered the
+    /// same way everywhere: a store-wide scan, not an error. Every backend does
+    /// exactly that.
     async fn query_transfers(
         &self,
         query: &TransferQuery,
-    ) -> Result<Page<EnvelopeRecord>, StoreError> {
-        // Default in-memory implementation
-        let all = if let Some(account) = query.account {
-            self.get_transfers_for_account(account, query.sub).await?
-        } else {
-            return Err(StoreError::Internal(
-                "query_transfers requires account filter in default implementation".into(),
-            ));
-        };
-
-        let filtered: Vec<EnvelopeRecord> = all
-            .into_iter()
-            .filter(|r| {
-                if let Some(from) = query.from_ts
-                    && r.created_at < from
-                {
-                    return false;
-                }
-                if let Some(to) = query.to_ts
-                    && r.created_at >= to
-                {
-                    return false;
-                }
-                if let Some(book) = query.book
-                    && r.envelope.book() != book
-                {
-                    return false;
-                }
-                true
-            })
-            .collect();
-
-        let total = filtered.len() as u64;
-        let offset = query.offset.unwrap_or(0) as usize;
-        let limit = query.limit.unwrap_or(u32::MAX) as usize;
-        let items = filtered.into_iter().skip(offset).take(limit).collect();
-
-        Ok(Page { items, total })
-    }
+    ) -> Result<Page<EnvelopeRecord>, StoreError>;
 }
 
 /// Saga state persistence for crash recovery.

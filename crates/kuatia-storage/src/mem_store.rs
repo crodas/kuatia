@@ -14,8 +14,10 @@ use kuatia_types::{
 
 use crate::error::StoreError;
 use crate::events::{EventStore, LedgerEvent};
+use crate::query::{filter_transfers, paginate};
 use crate::store::{
-    AccountStore, BookStore, EnvelopeRecord, PostingStore, SagaStore, TransferStore,
+    AccountStore, BookStore, EnvelopeRecord, Page, PostingStore, SagaStore, TransferQuery,
+    TransferStore,
 };
 
 /// Postings held as an immutable record table plus two index maps that carry
@@ -354,6 +356,30 @@ impl TransferStore for InMemoryStore {
             .collect();
         result.sort_by_key(|r| r.created_at);
         Ok(result)
+    }
+
+    async fn query_transfers(
+        &self,
+        query: &TransferQuery,
+    ) -> Result<Page<EnvelopeRecord>, StoreError> {
+        // Load candidates: narrow by the participation index when an account is
+        // given, otherwise scan every stored transfer (the same store-wide
+        // answer the SQL backend gives for `account == None`). Then apply the
+        // shared time-window/book filter and page cut.
+        let candidates = match query.account {
+            Some(account) => self.get_transfers_for_account(account, query.sub).await?,
+            None => {
+                let transfers = self.transfers.read().await;
+                let mut all: Vec<EnvelopeRecord> = transfers.values().cloned().collect();
+                all.sort_by_key(|r| r.created_at);
+                all
+            }
+        };
+        Ok(paginate(
+            filter_transfers(candidates, query),
+            query.offset,
+            query.limit,
+        ))
     }
 }
 

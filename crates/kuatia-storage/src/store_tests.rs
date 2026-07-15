@@ -1052,6 +1052,36 @@ pub async fn query_transfers_by_book(store: &(impl Store + 'static)) {
     assert_eq!(page.items[0].envelope.book(), BookId(5));
 }
 
+/// An `account == None` query is a store-wide scan on every backend: it returns
+/// all transfers regardless of participation, and the time-window/book filters
+/// still apply. This pins the account-optional contract that used to diverge
+/// (in-memory errored, SQL scanned).
+pub async fn query_transfers_store_wide(store: &(impl Store + 'static)) {
+    let (e1, t1) = make_envelope_with_book(BookId(1));
+    commit_envelope(store, e1, t1, 1000).await;
+
+    let (e2, t2) = make_envelope_with_book(BookId(2));
+    commit_envelope(store, e2, t2, 2000).await;
+
+    // No account filter: both transfers come back, newest bound honored.
+    let page = store
+        .query_transfers(&TransferQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(page.total, 2);
+
+    // The shared book filter still narrows a store-wide scan.
+    let page = store
+        .query_transfers(&TransferQuery {
+            book: Some(BookId(2)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].created_at, 2000);
+}
+
 // ---------------------------------------------------------------------------
 // SagaStore tests
 // ---------------------------------------------------------------------------
@@ -1235,6 +1265,7 @@ macro_rules! store_tests {
             query_transfers_by_date_range,
             query_transfers_pagination,
             query_transfers_by_book,
+            query_transfers_store_wide,
             // SagaStore
             save_and_list_sagas,
             delete_saga,

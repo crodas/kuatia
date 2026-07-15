@@ -19,6 +19,7 @@ use sqlx::{Any, Pool, Row};
 
 use kuatia_storage::error::StoreError;
 use kuatia_storage::events::{EventStore, LedgerEvent};
+use kuatia_storage::query::{filter_transfers, paginate};
 use kuatia_storage::store::*;
 use kuatia_types::*;
 
@@ -1194,35 +1195,14 @@ impl TransferStore for SqlStore {
             records
         };
 
-        // Filter in memory for remaining conditions.
-        let filtered: Vec<EnvelopeRecord> = base_records
-            .into_iter()
-            .filter(|r| {
-                if let Some(from) = query.from_ts
-                    && r.created_at < from
-                {
-                    return false;
-                }
-                if let Some(to) = query.to_ts
-                    && r.created_at >= to
-                {
-                    return false;
-                }
-                if let Some(book) = query.book
-                    && r.envelope.book() != book
-                {
-                    return false;
-                }
-                true
-            })
-            .collect();
-
-        let total = filtered.len() as u64;
-        let offset = query.offset.unwrap_or(0) as usize;
-        let limit = query.limit.unwrap_or(u32::MAX) as usize;
-        let items = filtered.into_iter().skip(offset).take(limit).collect();
-
-        Ok(Page { items, total })
+        // The account/subaccount narrowing happened in the load above; the
+        // shared filter covers the time-window and book predicates, then the
+        // shared page cut applies `offset`/`limit`.
+        Ok(paginate(
+            filter_transfers(base_records, query),
+            query.offset,
+            query.limit,
+        ))
     }
 }
 

@@ -6,5 +6,6 @@
 pub mod error;
 pub mod events;
 pub mod mem_store;
+pub mod query;
 pub mod store;
 pub mod store_tests;
