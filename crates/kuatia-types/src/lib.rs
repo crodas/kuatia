@@ -576,9 +576,15 @@ pub enum AccountPolicy {
 bitflags::bitflags! {
     /// Lifecycle and user-defined flags for an [`Account`].
     ///
-    /// Bits 0–7 are reserved for system flags. Bits 8–31 are available for
-    /// user-defined flags, which can be used with [`BookPolicy::allowed_flags`]
-    /// to scope which accounts may participate in a book.
+    /// Bits 0–7 are the system range: bits 0–2 carry lifecycle meaning
+    /// (`FROZEN`, `CLOSED`, `INFLIGHT`) and bits 3–7 (`RESERVED_3..RESERVED_7`)
+    /// are held for future system flags. Bits 8–31 are the user range
+    /// (`USER_0..USER_23`), meant to be combined with
+    /// [`BookPolicy::allowed_flags`] to scope which accounts may participate in
+    /// a book.
+    ///
+    /// Every bit has a named constant so `from_bits_truncate` never discards a
+    /// set bit on the storage read path.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AccountFlags: u32 {
         /// Account may not be the source or destination of any transfer.
@@ -588,8 +594,16 @@ bitflags::bitflags! {
         /// Holding account for an inflight (authorize/confirm/void) transaction.
         /// Parks funds between authorize and settlement; closed once drained.
         const INFLIGHT = 1 << 2;
-        // Bits 3–7: reserved for future system flags.
-        // Bits 8–31: user-defined.
+        /// Reserved for a future system flag; not for user assignment.
+        const RESERVED_3 = 1 << 3;
+        /// Reserved for a future system flag; not for user assignment.
+        const RESERVED_4 = 1 << 4;
+        /// Reserved for a future system flag; not for user assignment.
+        const RESERVED_5 = 1 << 5;
+        /// Reserved for a future system flag; not for user assignment.
+        const RESERVED_6 = 1 << 6;
+        /// Reserved for a future system flag; not for user assignment.
+        const RESERVED_7 = 1 << 7;
         /// User-defined flag 0.
         const USER_0 = 1 << 8;
         /// User-defined flag 1.
@@ -606,6 +620,38 @@ bitflags::bitflags! {
         const USER_6 = 1 << 14;
         /// User-defined flag 7.
         const USER_7 = 1 << 15;
+        /// User-defined flag 8.
+        const USER_8 = 1 << 16;
+        /// User-defined flag 9.
+        const USER_9 = 1 << 17;
+        /// User-defined flag 10.
+        const USER_10 = 1 << 18;
+        /// User-defined flag 11.
+        const USER_11 = 1 << 19;
+        /// User-defined flag 12.
+        const USER_12 = 1 << 20;
+        /// User-defined flag 13.
+        const USER_13 = 1 << 21;
+        /// User-defined flag 14.
+        const USER_14 = 1 << 22;
+        /// User-defined flag 15.
+        const USER_15 = 1 << 23;
+        /// User-defined flag 16.
+        const USER_16 = 1 << 24;
+        /// User-defined flag 17.
+        const USER_17 = 1 << 25;
+        /// User-defined flag 18.
+        const USER_18 = 1 << 26;
+        /// User-defined flag 19.
+        const USER_19 = 1 << 27;
+        /// User-defined flag 20.
+        const USER_20 = 1 << 28;
+        /// User-defined flag 21.
+        const USER_21 = 1 << 29;
+        /// User-defined flag 22.
+        const USER_22 = 1 << 30;
+        /// User-defined flag 23.
+        const USER_23 = 1 << 31;
     }
 }
 
@@ -791,5 +837,42 @@ impl TransferBuilder {
     /// Consume the builder and return the [`Transfer`].
     pub fn build(self) -> Transfer {
         self.transfer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_flags_cover_every_bit() {
+        // Every one of the 32 bits has a named constant, so `all()` fills the
+        // whole `u32` and `from_bits_truncate` can never discard a set bit.
+        assert_eq!(AccountFlags::all().bits(), u32::MAX);
+    }
+
+    #[test]
+    fn account_flags_bit_positions() {
+        assert_eq!(AccountFlags::FROZEN.bits(), 1 << 0);
+        assert_eq!(AccountFlags::INFLIGHT.bits(), 1 << 2);
+        assert_eq!(AccountFlags::RESERVED_7.bits(), 1 << 7);
+        assert_eq!(AccountFlags::USER_0.bits(), 1 << 8);
+        assert_eq!(AccountFlags::USER_8.bits(), 1 << 16);
+        assert_eq!(AccountFlags::USER_23.bits(), 1 << 31);
+    }
+
+    #[test]
+    fn account_flags_high_bit_survives_signed_storage_roundtrip() {
+        // The SQL backend persists flags via `bits() as i32` and reloads via
+        // `from_bits_truncate(bits as u32)`. Bit 31 makes the stored i32
+        // negative; this pins that the reinterpret cast is bit-preserving.
+        let flags = AccountFlags::USER_23 | AccountFlags::FROZEN;
+        let stored = flags.bits() as i32;
+        assert!(
+            stored < 0,
+            "USER_23 should set the sign bit when cast to i32"
+        );
+        let loaded = AccountFlags::from_bits_truncate(stored as u32);
+        assert_eq!(loaded, flags);
     }
 }
