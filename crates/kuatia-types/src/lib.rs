@@ -554,32 +554,14 @@ impl EnvelopeBuilder {
 // Account
 // ---------------------------------------------------------------------------
 
-/// Controls how much an account can spend beyond its posting-backed balance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AccountPolicy {
-    /// Balance must stay >= 0.
-    NoOverdraft,
-    /// Balance must stay >= `floor` (floor < 0).
-    CappedOverdraft {
-        /// Minimum allowed balance (must be negative).
-        floor: Cent,
-    },
-    /// No floor — the account can go arbitrarily negative.
-    UncappedOverdraft,
-    /// Fees, settlement, market-making, minting. No balance constraints.
-    SystemAccount,
-    /// Boundary account representing value entering/leaving the ledger; holds
-    /// the offset (negative) side of deposits.
-    ExternalAccount,
-}
-
 bitflags::bitflags! {
-    /// Lifecycle and user-defined flags for an [`Account`].
+    /// Lifecycle and balance-constraint flags for an [`Account`].
     ///
     /// Bits 0–7 are the system range: bits 0–2 carry lifecycle meaning
-    /// (`FROZEN`, `CLOSED`, `INFLIGHT`) and bits 3–7 (`RESERVED_3..RESERVED_7`)
-    /// are held for future system flags. Bits 8–31 are the user range
-    /// (`USER_0..USER_23`), meant to be combined with
+    /// (`FROZEN`, `CLOSED`, `INFLIGHT`), bit 3 is the balance constraint
+    /// (`DEBIT_MUST_NOT_EXCEED_CREDIT`), and bits 4–7
+    /// (`RESERVED_4..RESERVED_7`) are held for future system flags. Bits 8–31
+    /// are the user range (`USER_0..USER_23`), meant to be combined with
     /// [`BookPolicy::allowed_flags`] to scope which accounts may participate in
     /// a book.
     ///
@@ -594,8 +576,12 @@ bitflags::bitflags! {
         /// Holding account for an inflight (authorize/confirm/void) transaction.
         /// Parks funds between authorize and settlement; closed once drained.
         const INFLIGHT = 1 << 2;
-        /// Reserved for a future system flag; not for user assignment.
-        const RESERVED_3 = 1 << 3;
+        /// The account's debits may never exceed its credits: its balance may
+        /// not go negative and it may not hold a negative posting. When unset
+        /// (the default), the account may overdraw without bound: a shortfall is
+        /// covered by a negative offset posting, and the ledger records the
+        /// transfer as long as it conserves value per asset.
+        const DEBIT_MUST_NOT_EXCEED_CREDIT = 1 << 3;
         /// Reserved for a future system flag; not for user assignment.
         const RESERVED_4 = 1 << 4;
         /// Reserved for a future system flag; not for user assignment.
@@ -662,9 +648,8 @@ pub struct Account {
     pub id: AccountId,
     /// Monotonically increasing version, starts at 1 on creation.
     pub version: u64,
-    /// Overdraft / balance policy.
-    pub policy: AccountPolicy,
-    /// Lifecycle flags (frozen, closed).
+    /// Lifecycle and balance-constraint flags. The balance constraint lives in
+    /// [`AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT`].
     pub flags: AccountFlags,
     /// Book this entity belongs to.
     pub book: BookId,
@@ -673,23 +658,44 @@ pub struct Account {
 }
 
 impl Account {
-    /// Create a version-1 main-subaccount account with the given policy: no flags,
-    /// the default book, and empty metadata. Convenience for the common case; set
-    /// the other fields explicitly when you need them.
-    pub fn new(id: AccountId, policy: AccountPolicy) -> Self {
-        Self::new_ref(id, policy)
+    /// Create a version-1 main-subaccount account: no flags, the default book,
+    /// and empty metadata. With no flags the account may overdraw without bound
+    /// (a shortfall becomes a negative offset posting); set
+    /// [`AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT`] to forbid that, or use
+    /// [`Account::debit_must_not_exceed_credit`]. Set the other fields
+    /// explicitly when you need them.
+    pub fn new(id: AccountId) -> Self {
+        Self::new_ref(id)
     }
 
-    /// Like [`Account::new`] but for a specific subaccount reference.
-    pub fn new_ref(id: AccountId, policy: AccountPolicy) -> Self {
+    /// Like [`Account::new`] but named for the subaccount-reference case; the
+    /// signature is identical.
+    pub fn new_ref(id: AccountId) -> Self {
         Self {
             id,
             version: 1,
-            policy,
             flags: AccountFlags::empty(),
             book: DEFAULT_BOOK,
             metadata: Metadata::new(),
         }
+    }
+
+    /// A version-1 account whose debits may never exceed its credits: its
+    /// balance may not go negative and it may not hold a negative posting.
+    /// Equivalent to `Account::new(id)` with
+    /// [`AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT`] set.
+    pub fn debit_must_not_exceed_credit(id: AccountId) -> Self {
+        let mut account = Self::new(id);
+        account.flags |= AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT;
+        account
+    }
+
+    /// Whether this account forbids overdraft, i.e. carries the
+    /// [`AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT`] flag. When `false` (the
+    /// default) the account may overdraw without bound.
+    pub fn forbids_overdraft(&self) -> bool {
+        self.flags
+            .contains(AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT)
     }
 
     /// Returns `true` if the account has the `FROZEN` flag set.
@@ -874,5 +880,35 @@ mod tests {
         );
         let loaded = AccountFlags::from_bits_truncate(stored as u32);
         assert_eq!(loaded, flags);
+    }
+
+    #[test]
+    fn debit_must_not_exceed_credit_sets_the_flag() {
+        let id = AccountId::new(100);
+        let acc = Account::debit_must_not_exceed_credit(id);
+        assert!(acc.forbids_overdraft());
+        assert!(
+            acc.flags
+                .contains(AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT)
+        );
+        // It differs from the default only by that one flag.
+        let mut expected = Account::new(id);
+        expected.flags |= AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT;
+        assert_eq!(acc, expected);
+    }
+
+    #[test]
+    fn new_account_allows_overdraft_by_default() {
+        let acc = Account::new(AccountId::new(101));
+        assert!(!acc.forbids_overdraft());
+        assert_eq!(acc.version, 1);
+        assert_eq!(acc.flags, AccountFlags::empty());
+        assert_eq!(acc.book, DEFAULT_BOOK);
+        assert!(acc.metadata.is_empty());
+    }
+
+    #[test]
+    fn debit_must_not_exceed_credit_bit_is_bit_3() {
+        assert_eq!(AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT.bits(), 1 << 3);
     }
 }

@@ -25,17 +25,17 @@ reconstructs every balance, so the ledger is auditable by construction. See
 ┌─────────────────────────────────────────────────────┐
 │                   kuatia (async)                    │
 │                                                     │
-│  Intent layer:  TransferBuilder + commit · balance   │
-│  Saga pipeline: resolve → reserve → validate → fin.  │
+│  Intent layer:  TransferBuilder + commit · balance  │
+│  Saga pipeline: resolve → reserve → validate → fin. │
 │  Raw pipeline:  load  →  plan  →  apply             │
-│  Saga steps:    legend step adapters                 │
+│  Saga steps:    legend step adapters                │
 ├─────────────────────────────────────────────────────┤
 │               kuatia-core (pure)                    │
 │                                                     │
 │  Types:         Account · Transfer · Posting · Cent │
 │  Validation:    validate_and_plan()                 │
 │  Hashing:       double-SHA256, content-addressed    │
-│  Selection:     greedy posting selection             │
+│  Selection:     greedy posting selection            │
 └─────────────────────────────────────────────────────┘
 ```
 

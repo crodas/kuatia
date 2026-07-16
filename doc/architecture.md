@@ -112,8 +112,8 @@ idempotent. The saga sequences them and interprets their counts; a crash
 mid-sequence is completed by roll-forward recovery (see below).
 
 The store only persists and reads. All domain logic (balance computation,
-validation, policy enforcement, and the interpretation of primitive counts)
-lives in the Ledger/saga and `kuatia-core`.
+validation, balance-constraint enforcement, and the interpretation of primitive
+counts) lives in the Ledger/saga and `kuatia-core`.
 
 ## Saga Commit Pipeline
 
@@ -211,7 +211,7 @@ using big-endian encoding with a version prefix (`CANONICAL_VERSION = 4`).
 ## Append-Only Account Versioning
 
 Accounts are never modified in place. Each account mutation (freeze, unfreeze,
-close, or a policy/flags change) appends a new snapshot with an incremented
+close, or a flags change) appends a new snapshot with an incremented
 `version` field (starts at 1 on creation). Note that transfers do **not** bump
 account versions: balances are derived from postings, not stored on the
 account.
@@ -244,29 +244,33 @@ and accounts is a transfer policy scope (which accounts/assets may
 participate). It does not affect conservation enforcement, and it does not
 partition balances.
 
-## Account Policies
+## Account Balance Constraint
 
-Each account has a policy controlling its balance floor and whether it may hold
-negative postings:
+The single per-account balance constraint is the `AccountFlags` bit
+`DEBIT_MUST_NOT_EXCEED_CREDIT`:
 
-| Policy | Balance floor | Negative postings |
-|--------|--------------|-------------------|
-| `NoOverdraft` | `>= 0` | No |
-| `CappedOverdraft { floor }` | `>= floor` | Yes (down to floor) |
-| `UncappedOverdraft` | None | Yes (unbounded) |
-| `SystemAccount` | None | Yes |
-| `ExternalAccount` | None | Yes |
+| Flag | Balance | Negative postings |
+|------|---------|-------------------|
+| unset (default) | may go negative, unbounded | Yes (unbounded) |
+| `DEBIT_MUST_NOT_EXCEED_CREDIT` | `>= 0` | No |
 
-An overdraft is a **negative posting** assigned to the account to cover a
-shortfall. Only `NoOverdraft` forbids negative postings; validation rejects a
-negative posting on a `NoOverdraft` account. `CappedOverdraft`'s floor (checked
-in validation) bounds the negative balance; the other policies are unbounded.
+By default overdraft is allowed. An overdraft is a **negative posting** assigned
+to the account to cover a shortfall; a debit short of the account's positive
+postings is covered by a negative offset posting, and the transfer is recorded
+as long as it conserves value per asset. Credit-line limits are an application
+concern, not ledger-enforced.
 
-## The CappedOverdraft Floor Under Concurrency
+With the flag set the account's debits may not exceed its credits: its balance
+may not go negative and it may not hold a negative posting. Validation rejects a
+negative posting on such an account. Use
+`Account::debit_must_not_exceed_credit(id)` to set it and
+`Account::forbids_overdraft()` to query it.
 
-`CappedOverdraft` accounts have a balance floor that is not backed by the UTXO
-model alone: two concurrent transfers could each pass validation but together
-push the balance below the floor (write-skew).
+## The Debit-Must-Not-Exceed-Credit Constraint Under Concurrency
+
+An account that forbids overdraft has a balance floor at zero that is not backed
+by the UTXO model alone: two concurrent transfers could each pass validation but
+together push the balance negative (write-skew).
 
 Under the dumb-storage model the floor (and the freeze/close snapshot check) is
 re-validated **as the last thing the finalize step does before it writes**: the
@@ -280,12 +284,11 @@ can still slip through. Double-spend safety is unaffected and holds
 unconditionally: the reservation protocol (`reserve_postings` is a single
 atomic conditional update, so two sagas cannot both claim the same posting)
 prevents
-consuming a posting twice. Only the floor on a `CappedOverdraft` account is
-best-effort. This tradeoff is recorded in
+consuming a posting twice. Only the floor on an account that forbids overdraft
+is best-effort. This tradeoff is recorded in
 [doc/adr/0003-dumb-storage-saga-recovery.md](adr/0003-dumb-storage-saga-recovery.md).
 
-`NoOverdraft` is fully UTXO-backed (you can only spend postings you own), and
-the unconstrained policies have no floor to violate.
+An overdraft-permitting account has no floor to violate.
 
 ## No Sequential Hash Chain
 

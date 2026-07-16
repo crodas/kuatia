@@ -33,9 +33,8 @@ dependencies (`sha2`, `serde`, `bitflags`).
 | `NewPosting` | Posting to be created (no id yet, assigned during validation) |
 | `Transfer` | Atomic unit: consumes postings + creates postings + metadata |
 | `EnvelopeBuilder` | Fluent builder for `Transfer` construction |
-| `Account` | Versioned entity with policy, flags, book, metadata |
-| `AccountPolicy` | Balance floor rule: `NoOverdraft`, `CappedOverdraft`, `UncappedOverdraft`, `SystemAccount`, `ExternalAccount` |
-| `AccountFlags` | Bitflags: `FROZEN`, `CLOSED` |
+| `Account` | Versioned entity with flags, book, metadata. `Account::new(id)` allows overdraft by default; `Account::debit_must_not_exceed_credit(id)` forbids it; `Account::forbids_overdraft()` queries the constraint |
+| `AccountFlags` | Bitflags: `FROZEN`, `CLOSED`, `DEBIT_MUST_NOT_EXCEED_CREDIT` (when set, the account's debits may not exceed its credits: balance stays `>= 0`, no negative postings) |
 | `Metadata` | `BTreeMap<String, Vec<u8>>` for free-form key-value data |
 | `Receipt` | Confirmation of a committed transfer (contains `transfer_id`) |
 | `AutoId` | Snowflake-inspired i64 ID generator: `[0][40-bit ms][23-bit CRC32 or counter]`. The ms field counts from `KUATIA_EPOCH_MS` (2026-01-01T00:00:00Z), giving ~34.8 years forward. Lives in `kuatia-types::autoid` |
@@ -54,7 +53,7 @@ graph TD
     F --> BP[7. Book policy]
     BP --> G[8. Per-asset conservation]
     G --> H[9. Negative posting restriction]
-    H --> J[10. Policy enforcement]
+    H --> J[10. Balance-constraint enforcement]
     J --> I[Plan]
     style I fill:#e8f5e9
 ```
@@ -72,8 +71,10 @@ graph TD
    must be allowed by the book
 8. **Per-asset conservation**: `sum(consumed) == sum(created)` for each asset
 9. **Negative posting restriction**: negative postings forbidden only on
-   `NoOverdraft` (allowed on overdraft/system/external)
-10. **Policy enforcement**: projected balance satisfies account's floor
+   accounts that forbid overdraft (the `DEBIT_MUST_NOT_EXCEED_CREDIT` flag is
+   set); allowed on overdraft-permitting accounts
+10. **Balance-constraint enforcement**: for an account that forbids overdraft,
+    the projected balance stays `>= 0`
 
 Output is a `Plan` containing `transfer_id`, `postings_to_deactivate`, and
 `postings_to_create`.

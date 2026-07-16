@@ -22,12 +22,11 @@ fn external() -> AccountId {
     AccountId::new(99)
 }
 
-fn make_account(id: i64, policy: AccountPolicy) -> Account {
+fn make_account(id: i64, flags: AccountFlags) -> Account {
     Account {
         id: AccountId::new(id),
         version: 1,
-        policy,
-        flags: AccountFlags::empty(),
+        flags,
         book: BookId(0),
         metadata: BTreeMap::new(),
     }
@@ -38,10 +37,10 @@ async fn setup_ledger() -> Arc<Ledger> {
     let ledger = Arc::new(Ledger::new(store));
 
     for (id, policy) in [
-        (1, AccountPolicy::NoOverdraft),
-        (2, AccountPolicy::NoOverdraft),
-        (3, AccountPolicy::NoOverdraft),
-        (99, AccountPolicy::ExternalAccount),
+        (1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+        (2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+        (3, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+        (99, AccountFlags::empty()),
     ] {
         ledger
             .store()

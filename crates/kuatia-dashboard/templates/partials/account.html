@@ -1,8 +1,5 @@
 <div class="detail-meta">
   <span class="policy {{ account.policy_kind }}">{{ account.policy_kind }}</span>
-  {% if account.floor %}
-    <span class="muted">floor <span class="money neg">{{ account.floor.text }}</span></span>
-  {% endif %}
   <span class="muted">version {{ account.version }}</span>
   {% if account.frozen %}<span class="flag frozen">frozen</span>{% endif %}
   {% if account.closed %}<span class="flag closed">closed</span>{% endif %}

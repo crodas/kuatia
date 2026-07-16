@@ -13,8 +13,8 @@
 //! and [`Account`](crate::Account) preimages begin with [`CANONICAL_VERSION`].
 
 use crate::{
-    Account, AccountFlags, AccountId, AccountPolicy, AccountSnapshotId, AssetId, BookId, Cent,
-    Envelope, EnvelopeId, NewPosting, Posting, PostingId, Receipt,
+    Account, AccountFlags, AccountId, AccountSnapshotId, AssetId, BookId, Cent, Envelope,
+    EnvelopeId, NewPosting, Posting, PostingId, Receipt,
 };
 
 /// Deterministic binary serialization. Every domain type can produce its
@@ -104,23 +104,6 @@ impl ToBytes for PostingId {
     }
 }
 
-impl ToBytes for AccountPolicy {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(9);
-        match self {
-            Self::NoOverdraft => buf.push(0),
-            Self::CappedOverdraft { floor } => {
-                buf.push(1);
-                buf.extend(floor.to_bytes());
-            }
-            Self::UncappedOverdraft => buf.push(2),
-            Self::SystemAccount => buf.push(3),
-            Self::ExternalAccount => buf.push(4),
-        }
-        buf
-    }
-}
-
 impl ToBytes for AccountFlags {
     fn to_bytes(&self) -> Vec<u8> {
         self.bits().to_be_bytes().to_vec()
@@ -202,7 +185,6 @@ impl ToBytes for Account {
         buf.push(CANONICAL_VERSION);
         buf.extend(self.id.to_bytes());
         write_u64(&mut buf, self.version);
-        buf.extend(self.policy.to_bytes());
         buf.extend(self.flags.to_bytes());
         buf.extend(self.book.to_bytes());
 

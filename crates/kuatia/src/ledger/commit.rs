@@ -6,17 +6,17 @@
 //! lets [`Ledger::recover`] complete or safely abandon a commit interrupted by a
 //! crash.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use legend::ExecutionResult;
 use tracing::instrument;
 
 use kuatia_core::{
-    AccountId, AccountPolicy, AccountSnapshotId, AssetId, Book, Cent, DEFAULT_BOOK, Envelope,
-    EnvelopeBuilder, EnvelopeId, NewPosting, PlanInput, Posting, PostingFilter, PostingId,
-    PostingState, Receipt, ResolveInput, Transfer, account_snapshot_id, draft_movements,
-    envelope_id, resolve_envelope, validate_and_plan,
+    AccountId, AccountSnapshotId, AssetId, Book, Cent, DEFAULT_BOOK, Envelope, EnvelopeBuilder,
+    EnvelopeId, NewPosting, PlanInput, Posting, PostingFilter, PostingId, PostingState, Receipt,
+    ResolveInput, Transfer, account_snapshot_id, draft_movements, envelope_id, resolve_envelope,
+    validate_and_plan,
 };
 
 use kuatia_storage::error::StoreError;
@@ -147,17 +147,18 @@ impl Ledger {
     /// The decision is pure ([`kuatia_core::draft_movements`] +
     /// [`kuatia_core::resolve_envelope`]); this method only loads the state those
     /// functions need. Pass 1 aggregates net debits and tells us which postings
-    /// and account policies to load; pass 2 selects postings, computes change,
-    /// and covers any overdraft shortfall.
+    /// to load and which accounts permit overdraft; pass 2 selects postings,
+    /// computes change, and covers any overdraft shortfall.
     #[instrument(skip(self, transfer), name = "ledger.resolve")]
     pub async fn resolve(&self, transfer: &Transfer) -> Result<Envelope, LedgerError> {
         let draft = draft_movements(transfer)?;
 
-        // Load the active postings and account policy for each debit. A deposit
-        // nets to zero on the system account, so it produces no debit and loads
-        // nothing here.
+        // Load the active postings for each debit, and note which debit accounts
+        // permit overdraft. A deposit nets to zero on the system account, so it
+        // produces no debit and loads nothing here.
         let mut available: HashMap<(AccountId, AssetId), Vec<Posting>> = HashMap::new();
-        let mut policies: HashMap<AccountId, AccountPolicy> = HashMap::new();
+        let mut overdraft_allowed: HashSet<AccountId> = HashSet::new();
+        let mut checked: HashSet<AccountId> = HashSet::new();
         for debit in &draft.debits {
             let postings = self
                 .store
@@ -169,8 +170,14 @@ impl Ledger {
                 )
                 .await?;
             available.insert((debit.account, debit.asset), postings);
-            if let std::collections::hash_map::Entry::Vacant(slot) = policies.entry(debit.account) {
-                slot.insert(self.store.get_account(&debit.account).await?.policy);
+            if checked.insert(debit.account)
+                && !self
+                    .store
+                    .get_account(&debit.account)
+                    .await?
+                    .forbids_overdraft()
+            {
+                overdraft_allowed.insert(debit.account);
             }
         }
 
@@ -178,7 +185,7 @@ impl Ledger {
             transfer,
             draft,
             available: &available,
-            policies: &policies,
+            overdraft_allowed: &overdraft_allowed,
         })?;
 
         // Resolve account snapshots for optimistic concurrency
@@ -590,12 +597,11 @@ mod recovery_tests {
     use kuatia_storage::mem_store::InMemoryStore;
     use std::collections::BTreeMap;
 
-    fn acct(id: i64, policy: AccountPolicy) -> Account {
+    fn acct(id: i64, flags: AccountFlags) -> Account {
         Account {
             id: AccountId::new(id),
             version: 1,
-            policy,
-            flags: AccountFlags::empty(),
+            flags,
             book: kuatia_core::BookId(0),
             metadata: BTreeMap::new(),
         }
@@ -604,10 +610,10 @@ mod recovery_tests {
     async fn funded_ledger() -> Arc<Ledger> {
         let ledger = Arc::new(Ledger::new(InMemoryStore::new()));
         for (id, p) in [
-            (1, AccountPolicy::NoOverdraft),
-            (2, AccountPolicy::NoOverdraft),
-            (3, AccountPolicy::NoOverdraft),
-            (99, AccountPolicy::ExternalAccount),
+            (1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+            (2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+            (3, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+            (99, AccountFlags::empty()),
         ] {
             ledger.store().create_account(acct(id, p)).await.unwrap();
         }

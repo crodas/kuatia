@@ -16,30 +16,26 @@ use kuatia_storage_sql::SqlStore;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ledger = connect().await?;
 
-    // The common case is one line: a version-1 account with the given policy.
+    // The common case is one line: a version-1 account.
     ledger
-        .create_account(Account::new(AccountId::new(1), AccountPolicy::NoOverdraft))
+        .create_account(Account::debit_must_not_exceed_credit(AccountId::new(1)))
         .await?;
     ledger
-        .create_account(Account::new(AccountId::new(2), AccountPolicy::NoOverdraft))
+        .create_account(Account::debit_must_not_exceed_credit(AccountId::new(2)))
         .await?;
     // A system account (fees, settlement, market-making) — no balance floor.
     ledger
-        .create_account(Account::new(
-            AccountId::new(50),
-            AccountPolicy::SystemAccount,
-        ))
+        .create_account(Account::new(AccountId::new(50)))
         .await?;
 
     // The same thing spelled out, so you can see every field of an `Account`.
     // This boundary account is where value enters/leaves the ledger.
     let external = Account {
         id: AccountId::new(99),
-        version: 1,                             // accounts always start at version 1
-        policy: AccountPolicy::ExternalAccount, // boundary for deposits/withdrawals
-        flags: AccountFlags::empty(),           // not frozen, not closed
-        book: DEFAULT_BOOK,                     // the implicit default book
-        metadata: BTreeMap::new(),              // free-form key/value metadata
+        version: 1,                   // accounts always start at version 1
+        flags: AccountFlags::empty(), // not frozen, not closed
+        book: DEFAULT_BOOK,           // the implicit default book
+        metadata: BTreeMap::new(),    // free-form key/value metadata
     };
     ledger.create_account(external).await?;
 
@@ -48,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut accounts = ledger.list_accounts().await?;
     accounts.sort_by_key(|a| (a.id.id, a.id.sub));
     for a in &accounts {
-        println!("  {:?}  policy={:?}  v{}", a.id, a.policy, a.version);
+        println!("  {:?}  flags={:?}  v{}", a.id, a.flags, a.version);
     }
 
     Ok(())

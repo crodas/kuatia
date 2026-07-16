@@ -21,11 +21,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let money = Amount::new(2);
 
     ledger
-        .create_account(Account::new(alice, AccountPolicy::NoOverdraft))
+        .create_account(Account::debit_must_not_exceed_credit(alice))
         .await?;
-    ledger
-        .create_account(Account::new(external, AccountPolicy::ExternalAccount))
-        .await?;
+    ledger.create_account(Account::new(external)).await?;
 
     // Fund Alice with $100.00.
     ledger

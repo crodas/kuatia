@@ -14,8 +14,7 @@ the immutable table, are excluded.
 |-------|------|-------------|
 | `id` | `AccountId { id: i64, sub: i64 }` | Stable identity: a base id plus a subaccount (`sub = 0` is the main account) |
 | `version` | `u64` | Starts at 1, increments on every mutation |
-| `policy` | `AccountPolicy` | Balance floor rule (see below) |
-| `flags` | `AccountFlags` | Lifecycle flags (`FROZEN`, `CLOSED`) + user-defined (`USER_0` to `USER_7`) |
+| `flags` | `AccountFlags` | Lifecycle (`FROZEN`, `CLOSED`, `INFLIGHT`), the balance constraint (`DEBIT_MUST_NOT_EXCEED_CREDIT`), and user-defined bits |
 | `book` | `BookId` | Book this account belongs to |
 | `metadata` | `Metadata` | `BTreeMap<String, Vec<u8>>` for free-form data |
 
@@ -23,10 +22,10 @@ the immutable table, are excluded.
 
 An `AccountId` is a base `id` plus a `sub`. `sub = 0` is the account's main
 account; a non-zero `sub` is a subaccount of the same base id. Each `(id, sub)`
-is a full account record with its own policy, flags, book, version, and
+is a full account record with its own flags, book, version, and
 lifecycle, created, versioned, frozen, and closed exactly like any other
-account. A subaccount can be `NoOverdraft` while its base account is not, or the
-reverse, because every check keys on the full `AccountId`.
+account. A subaccount can forbid overdraft while its base account does not, or
+the reverse, because every check keys on the full `AccountId`.
 
 Subaccounts partition one owner's holdings into several individually addressable
 balances (sub-ledgers, earmarks, reservations) without minting unrelated
@@ -60,35 +59,35 @@ optional subaccount filter (`get_postings_by_account`,
 account admits all of that account's subaccounts. See
 [adr/0012-subaccounts.md](adr/0012-subaccounts.md).
 
-## Policies
+## Balance constraint
 
-Each account has a policy that controls what balance constraints apply:
+An account carries one balance rule, held in its flags:
 
-| Policy | Balance floor | Negative postings | CAS guard |
-|--------|--------------|-------------------|-----------|
-| `NoOverdraft` | `>= 0` | No | No |
-| `CappedOverdraft { floor }` | `>= floor` | Yes (down to floor) | Yes |
-| `UncappedOverdraft` | None | Yes (unbounded) | No |
-| `SystemAccount` | None | Yes | No |
-| `ExternalAccount` | None | Yes | No |
+| State | Balance floor | Negative postings |
+|-------|--------------|-------------------|
+| default (no flag) | none | yes (overdraft allowed, unbounded) |
+| `DEBIT_MUST_NOT_EXCEED_CREDIT` | `>= 0` | no |
 
-An overdraft is represented as a negative posting (an offset position)
-assigned to the account to cover a shortfall. When an account's positive
-postings are insufficient for a debit, the resolve step consumes them all
-and creates a negative posting for the remainder. `NoOverdraft` accounts
-forbid this; validation rejects any transfer that would create a negative
-posting on a `NoOverdraft` account. `CappedOverdraft`'s floor bounds how
-negative the balance may go; `UncappedOverdraft`, `SystemAccount`, and
-`ExternalAccount` are unbounded.
+By default an account may overdraw without bound. An overdraft is a negative
+posting (an offset position) assigned to the account to cover a shortfall: when
+the account's positive postings are insufficient for a debit, the resolve step
+consumes them all and creates a negative posting for the remainder. The transfer
+is recorded as long as it conserves value per asset.
 
-`CappedOverdraft`'s floor is re-validated as the last step before finalize
-writes (the finalize step re-loads balances and account versions and
-re-runs validation just before deactivating). This is the tightest
-best-effort: the check-to-write window is one step, not the whole saga. It
-is not strictly atomic. A concurrent commit in that last gap can still
-breach the floor (write-skew). Double-spend safety is unaffected. The
-reservation protocol (an atomic conditional `reserve_postings`) guarantees
-a posting cannot be consumed twice. See
+Setting `DEBIT_MUST_NOT_EXCEED_CREDIT` forbids this: the account's debits may
+never exceed its credits, so its balance may not go negative and it may not hold
+a negative posting. Validation rejects any transfer that would create a negative
+posting on such an account or project its balance below zero. The convenience
+constructor `Account::debit_must_not_exceed_credit(id)` names the invariant
+directly, and `Account::forbids_overdraft()` reports it. There is no bounded
+"credit line" floor between the two: a credit-line limit, if needed, is enforced
+by the application above the ledger.
+
+The zero-floor check is re-validated as the last step before finalize writes
+(the finalize step re-loads balances and account versions and re-runs validation
+just before deactivating). Double-spend safety is exact regardless: the
+reservation protocol (an atomic conditional `reserve_postings`) guarantees a
+posting cannot be consumed twice. See
 [accounting-mapping.md](accounting-mapping.md) and the ADR at
 [adr/0003-dumb-storage-saga-recovery.md](adr/0003-dumb-storage-saga-recovery.md).
 
@@ -117,9 +116,9 @@ Created (v1) → Frozen (v2) → Unfrozen (v3) → Closed (v4)
 Accounts are never modified in place. Each mutation appends a new version:
 
 ```
-Version 1: { policy: NoOverdraft, flags: ∅ }         ← created
-Version 2: { policy: NoOverdraft, flags: FROZEN }     ← frozen
-Version 3: { policy: NoOverdraft, flags: ∅ }         ← unfrozen
+Version 1: { flags: DEBIT_MUST_NOT_EXCEED_CREDIT }          ← created
+Version 2: { flags: DEBIT_MUST_NOT_EXCEED_CREDIT | FROZEN } ← frozen
+Version 3: { flags: DEBIT_MUST_NOT_EXCEED_CREDIT }          ← unfrozen
 ```
 
 The store enforces `version_new == version_current + 1`, preventing gaps or
@@ -141,7 +140,7 @@ The saga `commit()` path auto-populates snapshots when none are provided.
 
 An account is identified by a base id plus an `i64` **subaccount**, written
 `AccountId { id, sub }`; `sub = 0` is the main account. Each `(id,
-sub)` is its own record with its own policy, flags, book, and version, so a
+sub)` is its own record with its own flags, book, and version, so a
 subaccount is a full account that happens to share a base id. Subaccounts are how
 one account holds many concurrent inflights: an inflight hold is a subaccount of
 its destination, keyed by a value derived from the trade (see
@@ -172,29 +171,27 @@ and the underlying postings.
 
 ## Account Types in Practice
 
-### Regular user accounts (`NoOverdraft`)
+The single flag divides accounts into two kinds. Intent (wallet vs. boundary
+vs. system) is a matter of how you use the account, not a distinct type.
+
+### Overdraft-forbidding accounts (`DEBIT_MUST_NOT_EXCEED_CREDIT`)
 
 Hold positive postings only. Cannot go negative. Used for end-user wallets,
-merchant accounts, etc.
+merchant accounts, and any account that must never spend value it does not hold.
+Construct with `Account::debit_must_not_exceed_credit(id)`.
 
-### System accounts (`SystemAccount`)
+### Overdraft-permitting accounts (default)
 
-Operational accounts representing issuance, sink, revenue, COGS, fees, or
-internal balancing. Can hold negative postings (offset positions, e.g. a
-liability when the account is the deposit counterparty). Used as the
-counterparty in deposits: the system account takes on a negative balance to
-offset the value credited elsewhere.
+An ordinary `Account::new(id)` may go negative without bound. This covers:
 
-### External accounts (`ExternalAccount`)
+- **Issuance / system balancing**: revenue, COGS, fees, or internal balancing
+  accounts that hold offset positions.
+- **Ledger boundary**: the counterparty in deposits and withdrawals, where value
+  enters or leaves the ledger. It takes on a negative balance to offset the value
+  credited elsewhere; this is normal, not a bug.
+- **Credit-like accounts**: where the balance is allowed below zero. The ledger
+  enforces no upper bound on the overdraft; a specific credit limit is the
+  application's responsibility.
 
-Boundary accounts representing the outside world (banks, payment
-processors). They represent value entering and leaving the ledger boundary,
-and like system accounts they can hold negative postings (offset positions).
-
-### Credit accounts (`CappedOverdraft`)
-
-Accounts with a negative floor (e.g. credit lines). The floor is the maximum
-allowed overdraft. When the account's positive postings are insufficient for
-a debit, a negative posting is created to cover the shortfall, down to the
-floor. The floor is re-validated as the last step before finalize and is
-best-effort under concurrency (see above).
+When such an account's positive postings are insufficient for a debit, a negative
+posting covers the shortfall.

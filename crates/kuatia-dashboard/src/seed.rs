@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use kuatia::ledger::Ledger;
-use kuatia_core::{Account, AccountId, AccountPolicy, Amount, AssetId, Cent, TransferBuilder};
+use kuatia_core::{Account, AccountId, Amount, AssetId, Cent, TransferBuilder};
 use kuatia_storage_sql::SqlStore;
 
 use crate::assets::{BTC, EUR, USD};
@@ -87,21 +87,16 @@ pub async fn populate(ledger: &Arc<Ledger>) -> Result<(), Box<dyn std::error::Er
     let fiat = Amount::new(2);
     let btc = Amount::new(8);
 
-    create(ledger, TREASURY, AccountPolicy::SystemAccount).await?;
-    create(ledger, EXTERNAL, AccountPolicy::ExternalAccount).await?;
-    create(ledger, ALICE, AccountPolicy::NoOverdraft).await?;
-    create(ledger, ALICE_SAVINGS, AccountPolicy::NoOverdraft).await?;
-    create(ledger, BOB, AccountPolicy::NoOverdraft).await?;
-    // Carol may overdraw down to -$500.00.
-    create(
-        ledger,
-        CAROL,
-        AccountPolicy::CappedOverdraft {
-            floor: fiat.parse("-500.00")?,
-        },
-    )
-    .await?;
-    create(ledger, MERCHANT, AccountPolicy::NoOverdraft).await?;
+    // Treasury and the external boundary permit overdraft (they hold the
+    // negative side of issuance/deposits); the user accounts forbid it.
+    create(ledger, TREASURY, false).await?;
+    create(ledger, EXTERNAL, false).await?;
+    create(ledger, ALICE, true).await?;
+    create(ledger, ALICE_SAVINGS, true).await?;
+    create(ledger, BOB, true).await?;
+    // Carol may overdraw (no floor under the single-flag model).
+    create(ledger, CAROL, false).await?;
+    create(ledger, MERCHANT, true).await?;
 
     // Fund accounts from the external boundary.
     deposit(ledger, ALICE, USD, fiat.parse("1000.00")?).await?;
@@ -114,7 +109,7 @@ pub async fn populate(ledger: &Arc<Ledger>) -> Result<(), Box<dyn std::error::Er
     pay(ledger, BOB, MERCHANT, EUR, fiat.parse("80.00")?).await?;
     pay(ledger, ALICE, MERCHANT, BTC, btc.parse("0.10000000")?).await?;
 
-    // Carol spends past her balance, into the capped overdraft.
+    // Carol spends past her balance, into overdraft.
     pay(ledger, CAROL, MERCHANT, USD, fiat.parse("250.00")?).await?;
 
     // Alice earmarks part of her balance into her savings subaccount. The two
@@ -134,9 +129,14 @@ pub async fn populate(ledger: &Arc<Ledger>) -> Result<(), Box<dyn std::error::Er
 async fn create(
     ledger: &Arc<Ledger>,
     id: AccountId,
-    policy: AccountPolicy,
+    debit_must_not_exceed_credit: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    ledger.create_account(Account::new(id, policy)).await?;
+    let account = if debit_must_not_exceed_credit {
+        Account::debit_must_not_exceed_credit(id)
+    } else {
+        Account::new(id)
+    };
+    ledger.create_account(account).await?;
     Ok(())
 }
 

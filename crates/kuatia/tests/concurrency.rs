@@ -31,30 +31,29 @@ fn external() -> AccountId {
     AccountId::new(99)
 }
 
-fn make_account(id: i64, policy: AccountPolicy) -> Account {
+fn make_account(id: i64, flags: AccountFlags) -> Account {
     Account {
         id: AccountId::new(id),
         version: 1,
-        policy,
-        flags: AccountFlags::empty(),
+        flags,
         book: BookId(0),
         metadata: BTreeMap::new(),
     }
 }
 
-/// A ledger with `NoOverdraft` accounts `1..=n` plus an external account.
+/// A ledger with overdraft-forbidding accounts `1..=n` plus an external account.
 async fn ledger_with_accounts(n: i64) -> Arc<Ledger> {
     let ledger = Arc::new(Ledger::new(InMemoryStore::new()));
     for id in 1..=n {
         ledger
             .store()
-            .create_account(make_account(id, AccountPolicy::NoOverdraft))
+            .create_account(make_account(id, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT))
             .await
             .unwrap();
     }
     ledger
         .store()
-        .create_account(make_account(99, AccountPolicy::ExternalAccount))
+        .create_account(make_account(99, AccountFlags::empty()))
         .await
         .unwrap();
     ledger
@@ -331,47 +330,39 @@ async fn disjoint_transfers_all_commit_and_conserve() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Overdraft floor is best-effort under concurrency (documented limitation)
+// 5. Concurrent overdraft conserves value
 // ---------------------------------------------------------------------------
 
-/// Documents a known, accepted limitation: the `CappedOverdraft` floor is
-/// re-checked at the last step before writing, but that check is not atomic
-/// with the write. Two overdrafts that each pass the floor check against the
-/// same pre-transfer balance can both commit and jointly push the account below
-/// its floor. See `doc/transfers.md`.
-///
-/// This test is `#[ignore]`d because the breach is timing-dependent, so it is
-/// executable documentation rather than a CI assertion. What always holds, and
-/// what it does assert, is per-asset conservation: the overdraft's negative
-/// postings are real value owed, never minted. If a run drives the account below
-/// the floor, that is the documented behavior, not a conservation failure.
+/// An overdraft account (no `DEBIT_MUST_NOT_EXCEED_CREDIT` flag) can be spent
+/// past its balance concurrently; every shortfall becomes a real negative
+/// posting, never minted value. This asserts the invariant that always holds:
+/// per-asset conservation, even under concurrent overdraft.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "documents the best-effort overdraft floor; breach is timing-dependent"]
-async fn overdraft_floor_is_best_effort_under_concurrency() {
-    let floor = Cent::from(-100);
-    let mut observed_breach = false;
-
+async fn concurrent_overdraft_conserves_value() {
     const PAYEES: i64 = 8;
     for _ in 0..64 {
         let ledger = Arc::new(Ledger::new(InMemoryStore::new()));
+        // Account 1 permits overdraft (the default); payees forbid it.
         ledger
             .store()
-            .create_account(make_account(1, AccountPolicy::CappedOverdraft { floor }))
+            .create_account(make_account(1, AccountFlags::empty()))
             .await
             .unwrap();
         for payee in 2..=(1 + PAYEES) {
             ledger
                 .store()
-                .create_account(make_account(payee, AccountPolicy::NoOverdraft))
+                .create_account(make_account(
+                    payee,
+                    AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT,
+                ))
                 .await
                 .unwrap();
         }
 
         // One payment of 60 to each distinct payee from an empty overdraft
         // account (distinct payees keep the envelopes distinct, so they are not
-        // collapsed by content-addressed idempotency). Each alone projects to
-        // -60 (within the -100 floor); any two that slip through the last-step
-        // floor check together already breach it.
+        // collapsed by content-addressed idempotency). Each shortfall is covered
+        // by a negative offset posting.
         let mut handles = Vec::new();
         for payee in 2..=(1 + PAYEES) {
             let ledger = Arc::clone(&ledger);
@@ -395,15 +386,7 @@ async fn overdraft_floor_is_best_effort_under_concurrency() {
         assert_eq!(
             total,
             Cent::ZERO,
-            "value is conserved even when the floor is breached"
+            "value is conserved under concurrent overdraft"
         );
-        if ledger.balance(&account(1), &usd()).await.unwrap() < floor {
-            observed_breach = true;
-        }
     }
-
-    eprintln!(
-        "overdraft floor breach observed under concurrency: {observed_breach} \
-         (best-effort by design; see doc/transfers.md)"
-    );
 }

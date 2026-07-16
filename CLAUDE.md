@@ -17,7 +17,7 @@ crates/
 doc/
   architecture.md   Architecture decisions and rationale
   crates.md         Crate reference: modules, types, APIs
-  accounts.md       Account model, policies, lifecycle
+  accounts.md       Account model, balance constraint, lifecycle
   transfers.md      Transfer/Movement API, resolve algorithm
   journaling.md     Journaling: transfers as (compound) journal entries
   glossary.md       Terms, book design, exchange & supermarket examples
@@ -30,7 +30,7 @@ doc/
 - **Movement**: `{ from, to, asset, amount }` — the fundamental unit of intent. All operations (pay, deposit, withdraw) are one or more movements.
 - **Envelope**: concrete postings to consume and create — the resolved form of movements.
 - **Conservation**: for each asset, `sum(consumed) == sum(created)`.
-- **Account policies**: NoOverdraft, CappedOverdraft, UncappedOverdraft, SystemAccount, ExternalAccount. Only `NoOverdraft` forbids negative postings; the other four permit them. An overdraft is a negative posting that covers a shortfall — down to the floor for `CappedOverdraft`, unbounded for `UncappedOverdraft`.
+- **Balance constraint**: one per-account flag, `AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT`. Default (no flag): overdraft allowed, unbounded, a shortfall becomes a negative offset posting and the transfer records if it conserves value. Flag set: balance may not go negative and the account may not hold a negative posting. Construct with `Account::debit_must_not_exceed_credit(id)`; query with `Account::forbids_overdraft()`. There is no bounded floor and no system/external policy label; a boundary/deposit account is just a default overdraft-permitting account.
 - **Dumb storage**: the `Store` is a thin instruction follower. Write methods apply one update and return the **number of affected rows** (or an I/O error) — they never interpret counts, decide state, enforce idempotency, or compensate. The saga owns all of that. There is no monolithic `commit_transfer`; commit is a sequence of dumb primitives (`reserve_postings`, `deactivate_postings`, `insert_postings`, `store_transfer`, `append_event`), each idempotent. See [doc/adr/0003-dumb-storage-saga-recovery.md](doc/adr/0003-dumb-storage-saga-recovery.md).
 
 ## Architecture
@@ -40,14 +40,14 @@ doc/
 - **Count interpretation**: the saga reads each primitive's affected-row count — full = continue; partial = error → compensate; zero = read state and continue only if this same envelope/reservation already applied it (idempotency). `finalize_envelope` additionally verifies every end-state (all consumed postings `Inactive`, created exist, transfer stored).
 - **Durable recovery**: a phase-tracked write-ahead `PendingSaga {envelope, reservation, phase}` is persisted via `SagaStore` before the saga mutates anything (`Reserving`), bumped to `Finalizing` once validation passed and the consumed postings are about to turn `Inactive`. `Ledger::recover()` (call on startup) branches on phase: a `Reserving` saga is **re-run and re-validated** (aborting cleanly if a posting was taken or an account frozen); a `Finalizing` saga is rolled forward through the verified `finalize_envelope`. Roll-forward, not rollback, so there are no orphaned `PendingInactive` postings to reconcile.
 - **Content-addressed transfers**: EnvelopeId = double-SHA-256 of canonical bytes. Provides idempotency and tamper evidence.
-- **Append-only accounts**: versioned, never modified in place. Snapshot pinning (validate-time) prevents TOCTOU races; under the dumb-storage model the overdraft-floor and freeze/close guards are validate-time and best-effort under concurrency.
+- **Append-only accounts**: versioned, never modified in place. Snapshot pinning (validate-time) prevents TOCTOU races; under the dumb-storage model the no-overdraft (zero-floor) and freeze/close guards are validate-time and best-effort under concurrency.
 - **Store uses `Arc<dyn Store>`**: Ledger is non-generic, enabling concrete saga types.
 
 ## Resolve algorithm
 
 Two-pass:
 1. For each movement, create output posting on `to` and accumulate net debit on `from`.
-2. For each (account, asset) with positive net debit, select postings (greedy largest-first) and compute change. If positive postings are insufficient: `CappedOverdraft`/`UncappedOverdraft` accounts consume all positives and create a negative posting for the shortfall (floor enforced in validation); other policies fail with `InsufficientFunds`.
+2. For each (account, asset) with positive net debit, select postings (greedy largest-first) and compute change. If positive postings are insufficient: overdraft-permitting accounts (no `DEBIT_MUST_NOT_EXCEED_CREDIT` flag) consume all positives and create a negative posting for the shortfall; accounts that forbid overdraft fail with `InsufficientFunds`.
 
 Deposit: two movements cancel to zero net debit on the system account — no posting selection needed.
 
@@ -61,8 +61,8 @@ Deposit: two movements cancel to zero net debit on the system account — no pos
 6. Account snapshot pinning
 7. Book policy (if a book is loaded): referenced assets/accounts/flags allowed by the book
 8. Per-asset conservation
-9. Negative postings forbidden only on `NoOverdraft` (allowed on overdraft/system/external)
-10. Policy enforcement (balance floor)
+9. Negative postings forbidden only on accounts with `DEBIT_MUST_NOT_EXCEED_CREDIT` (allowed on overdraft-permitting accounts)
+10. Zero-floor enforcement for accounts that forbid overdraft
 
 ## Testing
 
