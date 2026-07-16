@@ -95,6 +95,15 @@ overdraft. The `policy` column is dropped from the SQL schema (migration
   of zero.
 * Account intent (customer vs. boundary vs. system) is no longer readable from a
   type; it must be inferred from the flag plus context.
+* A former `SystemAccount`/`ExternalAccount` debited past its available postings
+  now absorbs the shortfall as a negative offset posting instead of failing with
+  `InsufficientFunds`. This is moot for deposits (they net to zero on the
+  boundary account) but is a behavior change for a direct over-debit.
+* Removing `policy` from the `Account` canonical preimage bumps
+  `CANONICAL_VERSION` (4 → 5), changing account snapshot hashes. Persisted
+  transfers keep their original `EnvelopeId`s and stay self-consistent; a saga
+  in flight across the upgrade re-validates on recovery and aborts cleanly (or
+  rolls forward) rather than corrupting state, per ADR-0003.
 
 ## Links
 

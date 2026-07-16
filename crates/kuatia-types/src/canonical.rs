@@ -30,7 +30,9 @@ pub trait ToBytes {
 /// canonical bytes (ADR-0012).
 /// Bumped to 4 when the vestigial `UserData` fields were removed from the
 /// `Envelope` and `Account` preimages.
-pub const CANONICAL_VERSION: u8 = 4;
+/// Bumped to 5 when the `policy` field was removed from the `Account` preimage
+/// (ADR-0018): the single balance constraint now lives in `flags`.
+pub const CANONICAL_VERSION: u8 = 5;
 
 /// Append a `u16` in big-endian to `buf`.
 pub fn write_u16(buf: &mut Vec<u8>, v: u16) {

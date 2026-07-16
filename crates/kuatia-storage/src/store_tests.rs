@@ -177,6 +177,8 @@ pub async fn create_and_get_account(store: &(impl Store + 'static)) {
     let got = store.get_account(&AccountId::new(1)).await.unwrap();
     assert_eq!(got.id, acc.id);
     assert_eq!(got.version, 1);
+    // The balance constraint lives in `flags`; it must survive the round-trip.
+    assert_eq!(got.flags, acc.flags);
 }
 
 /// Duplicate account creation fails.
