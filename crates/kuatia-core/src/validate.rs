@@ -1,7 +1,7 @@
 //! Pure, sync validation — the auditable heart of the ledger.
 //!
 //! [`validate_and_plan`] enforces every invariant (conservation, double-spend,
-//! ownership, account policy) and produces a [`Plan`] describing the effects to
+//! ownership, overdraft) and produces a [`Plan`] describing the effects to
 //! apply. It takes no IO, no clock, and no randomness, so it is deterministic
 //! and testable with golden vectors. The caller provides pre-loaded state via
 //! [`PlanInput`]; this module never touches storage.
@@ -82,13 +82,13 @@ pub enum ValidationError {
         /// Total value of created postings for this asset.
         created_sum: Cent,
     },
-    /// Projected balance would fall below the account's floor.
+    /// Projected balance would go negative on an account that forbids overdraft.
     OverdraftExceeded {
         /// The account that would be overdrawn.
         account: AccountId,
         /// The asset involved.
         asset: AssetId,
-        /// The minimum allowed balance.
+        /// The minimum allowed balance (always zero: the overdraft floor).
         floor: Cent,
         /// The balance that would result from this transfer.
         projected: Cent,
@@ -102,7 +102,7 @@ pub enum ValidationError {
         /// The actual current snapshot hash.
         actual: [u8; 32],
     },
-    /// A negative posting targets an account whose policy forbids offset positions.
+    /// A negative posting targets an account that forbids overdraft.
     NegativePostingOnNonSystemAccount {
         /// The account that would receive the negative posting.
         account: AccountId,
@@ -186,7 +186,7 @@ impl std::fmt::Display for ValidationError {
             } => {
                 write!(
                     f,
-                    "negative posting ({value}) on account {account:?}/{asset:?} whose policy forbids offsets"
+                    "negative posting ({value}) on account {account:?}/{asset:?} that forbids overdraft"
                 )
             }
             Self::BookAssetNotAllowed { book, asset } => {
@@ -361,32 +361,26 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
         }
     }
 
-    // 7. Negative postings (offset positions) may target system, external, or
-    //    overdraft accounts. Overdraft floors are enforced separately in step 8.
-    //    Only NoOverdraft forbids holding a negative posting.
+    // 7. A negative posting (offset position) is only allowed on an account
+    //    that permits overdraft. Only DEBIT_MUST_NOT_EXCEED_CREDIT forbids it.
     for np in envelope.creates() {
         if np.value.is_negative() {
             let account = input
                 .accounts
                 .get(&np.owner)
                 .ok_or(ValidationError::AccountNotFound(np.owner))?;
-            match account.policy {
-                AccountPolicy::SystemAccount
-                | AccountPolicy::ExternalAccount
-                | AccountPolicy::UncappedOverdraft
-                | AccountPolicy::CappedOverdraft { .. } => {}
-                AccountPolicy::NoOverdraft => {
-                    return Err(ValidationError::NegativePostingOnNonSystemAccount {
-                        account: np.owner,
-                        asset: np.asset,
-                        value: np.value,
-                    });
-                }
+            if account.forbids_overdraft() {
+                return Err(ValidationError::NegativePostingOnNonSystemAccount {
+                    account: np.owner,
+                    asset: np.asset,
+                    value: np.value,
+                });
             }
         }
     }
 
-    // 8. Policy: projected balance satisfies account's floor
+    // 8. An account that forbids overdraft must not project to a negative
+    //    balance. Accounts that permit overdraft have no floor.
     let mut deltas: HashMap<(AccountId, AssetId), Cent> = HashMap::new();
     for pid in envelope.consumes() {
         let posting = consumed_by_id[pid];
@@ -401,40 +395,23 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
     }
 
     for ((account_id, asset_id), delta) in &deltas {
+        let account = &input.accounts[account_id];
+        if !account.forbids_overdraft() {
+            continue;
+        }
         let current_balance = input
             .balances
             .get(&(*account_id, *asset_id))
             .copied()
             .unwrap_or(Cent::ZERO);
         let projected = current_balance.checked_add(*delta)?;
-
-        let account = &input.accounts[account_id];
-        match &account.policy {
-            AccountPolicy::NoOverdraft => {
-                if projected.is_negative() {
-                    return Err(ValidationError::OverdraftExceeded {
-                        account: *account_id,
-                        asset: *asset_id,
-                        floor: Cent::ZERO,
-                        projected,
-                    });
-                }
-            }
-            AccountPolicy::CappedOverdraft { floor } => {
-                if projected < *floor {
-                    return Err(ValidationError::OverdraftExceeded {
-                        account: *account_id,
-                        asset: *asset_id,
-                        floor: *floor,
-                        projected,
-                    });
-                }
-            }
-            AccountPolicy::UncappedOverdraft
-            | AccountPolicy::SystemAccount
-            | AccountPolicy::ExternalAccount => {
-                // No floor check
-            }
+        if projected.is_negative() {
+            return Err(ValidationError::OverdraftExceeded {
+                account: *account_id,
+                asset: *asset_id,
+                floor: Cent::ZERO,
+                projected,
+            });
         }
     }
 
@@ -472,12 +449,11 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    fn make_account(id: i64, policy: AccountPolicy) -> Account {
+    fn make_account(id: i64, flags: AccountFlags) -> Account {
         Account {
             id: AccountId::new(id),
             version: 1,
-            policy,
-            flags: AccountFlags::empty(),
+            flags,
             book: BookId(0),
             metadata: BTreeMap::new(),
         }
@@ -516,8 +492,8 @@ mod tests {
     fn valid_deposit() {
         let envelope = deposit_envelope();
         let accounts = accounts_map(vec![
-            make_account(1, AccountPolicy::NoOverdraft),
-            make_account(99, AccountPolicy::ExternalAccount),
+            make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+            make_account(99, AccountFlags::empty()),
         ]);
         let balances = HashMap::new();
         let input = PlanInput {
@@ -572,7 +548,10 @@ mod tests {
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
-        let accounts = accounts_map(vec![make_account(1, AccountPolicy::NoOverdraft)]);
+        let accounts = accounts_map(vec![make_account(
+            1,
+            AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT,
+        )]);
         let balances = HashMap::new();
         let input = PlanInput {
             envelope: &envelope,
@@ -620,9 +599,9 @@ mod tests {
     #[test]
     fn account_frozen_rejected() {
         let envelope = deposit_envelope();
-        let mut acc = make_account(1, AccountPolicy::NoOverdraft);
+        let mut acc = make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
         acc.flags = AccountFlags::FROZEN;
-        let accounts = accounts_map(vec![acc, make_account(99, AccountPolicy::ExternalAccount)]);
+        let accounts = accounts_map(vec![acc, make_account(99, AccountFlags::empty())]);
         let balances = HashMap::new();
         let input = PlanInput {
             envelope: &envelope,
@@ -641,9 +620,9 @@ mod tests {
     #[test]
     fn account_closed_rejected() {
         let envelope = deposit_envelope();
-        let mut acc = make_account(1, AccountPolicy::NoOverdraft);
+        let mut acc = make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
         acc.flags = AccountFlags::CLOSED;
-        let accounts = accounts_map(vec![acc, make_account(99, AccountPolicy::ExternalAccount)]);
+        let accounts = accounts_map(vec![acc, make_account(99, AccountFlags::empty())]);
         let balances = HashMap::new();
         let input = PlanInput {
             envelope: &envelope,
@@ -686,8 +665,8 @@ mod tests {
             metadata: BTreeMap::new(),
         };
         let accounts = accounts_map(vec![
-            make_account(1, AccountPolicy::NoOverdraft),
-            make_account(2, AccountPolicy::NoOverdraft),
+            make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+            make_account(2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
         ]);
         // account1 has balance 50, consuming 50 leaves 0, that's fine.
         // Let's test when balance is insufficient: balance=30, consuming 50-value posting
@@ -735,15 +714,11 @@ mod tests {
             metadata: BTreeMap::new(),
         };
         let accounts = accounts_map(vec![
-            make_account(
-                1,
-                AccountPolicy::CappedOverdraft {
-                    floor: Cent::from(-50),
-                },
-            ),
-            make_account(2, AccountPolicy::NoOverdraft),
+            // Overdraft allowed (the default): no floor.
+            make_account(1, AccountFlags::empty()),
+            make_account(2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
         ]);
-        // balance=80, consuming 100 → projected = 80 - 100 = -20 >= -50 → OK
+        // balance=80, consuming 100 → projected = 80 - 100 = -20, allowed with no floor
         let mut balances = HashMap::new();
         balances.insert((AccountId::new(1), AssetId::new(1)), Cent::from(80));
 
@@ -755,13 +730,13 @@ mod tests {
             book: None,
         };
 
-        // A CappedOverdraft spend within the floor validates and produces a plan.
+        // An overdraft account spending into a negative balance validates.
         let plan = validate_and_plan(input).unwrap();
         assert!(!plan.postings_to_create.is_empty());
     }
 
     #[test]
-    fn capped_overdraft_exceeded() {
+    fn debit_must_not_exceed_credit_rejects_negative_projection() {
         let pid = PostingId {
             transfer: EnvelopeId([1; 32]),
             index: 0,
@@ -785,15 +760,10 @@ mod tests {
             metadata: BTreeMap::new(),
         };
         let accounts = accounts_map(vec![
-            make_account(
-                1,
-                AccountPolicy::CappedOverdraft {
-                    floor: Cent::from(-50),
-                },
-            ),
-            make_account(2, AccountPolicy::NoOverdraft),
+            make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+            make_account(2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
         ]);
-        // balance=30, consuming 100 → projected = 30 - 100 = -70 < -50 → FAIL
+        // balance=30, consuming 100 → projected = 30 - 100 = -70 < 0 → FAIL
         let mut balances = HashMap::new();
         balances.insert((AccountId::new(1), AssetId::new(1)), Cent::from(30));
 
@@ -809,7 +779,7 @@ mod tests {
             Err(ValidationError::OverdraftExceeded {
                 floor, projected, ..
             }) => {
-                assert_eq!(floor, Cent::from(-50));
+                assert_eq!(floor, Cent::ZERO);
                 assert_eq!(projected, Cent::from(-70));
             }
             other => panic!("expected OverdraftExceeded, got {other:?}"),
@@ -817,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn uncapped_overdraft_allows_negative() {
+    fn overdraft_allows_negative_balance() {
         let pid = PostingId {
             transfer: EnvelopeId([1; 32]),
             index: 0,
@@ -841,8 +811,8 @@ mod tests {
             metadata: BTreeMap::new(),
         };
         let accounts = accounts_map(vec![
-            make_account(1, AccountPolicy::UncappedOverdraft),
-            make_account(2, AccountPolicy::NoOverdraft),
+            make_account(1, AccountFlags::empty()),
+            make_account(2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
         ]);
         // balance=10, consuming 100 → projected = 10 - 100 = -90 → allowed
         let mut balances = HashMap::new();
@@ -924,8 +894,8 @@ mod tests {
             metadata: BTreeMap::new(),
         };
         let accounts = accounts_map(vec![
-            make_account(1, AccountPolicy::NoOverdraft),
-            make_account(2, AccountPolicy::NoOverdraft),
+            make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+            make_account(2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
         ]);
         let mut balances = HashMap::new();
         balances.insert((AccountId::new(1), AssetId::new(1)), Cent::from(100));
@@ -945,22 +915,21 @@ mod tests {
         // account2 projected: 0 + 60 = 60 >= 0 ✓
     }
 
-    fn make_subaccount(id: i64, sub: i64, policy: AccountPolicy) -> Account {
+    fn make_subaccount(id: i64, sub: i64, flags: AccountFlags) -> Account {
         Account {
             id: AccountId::with_sub(id, sub),
             version: 1,
-            policy,
-            flags: AccountFlags::empty(),
+            flags,
             book: BookId(0),
             metadata: BTreeMap::new(),
         }
     }
 
     #[test]
-    fn subaccount_carries_own_policy() {
-        // Base (1,0) is NoOverdraft but subaccount (1,7) is UncappedOverdraft.
-        // A negative posting on the subaccount is allowed because the check keys
-        // on the full owner and uses the subaccount's own policy.
+    fn subaccount_carries_own_overdraft_flag() {
+        // Base (1,0) forbids overdraft but subaccount (1,7) allows it. A negative
+        // posting on the subaccount is allowed because the check keys on the full
+        // owner and uses the subaccount's own flags.
         let sub = AccountId::with_sub(1, 7);
         let envelope = Envelope {
             consumes: vec![],
@@ -983,9 +952,9 @@ mod tests {
             metadata: BTreeMap::new(),
         };
         let accounts = accounts_map(vec![
-            make_account(1, AccountPolicy::NoOverdraft),
-            make_subaccount(1, 7, AccountPolicy::UncappedOverdraft),
-            make_account(2, AccountPolicy::NoOverdraft),
+            make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+            make_subaccount(1, 7, AccountFlags::empty()),
+            make_account(2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
         ]);
         let balances = HashMap::new();
         let input = PlanInput {
@@ -1002,9 +971,9 @@ mod tests {
 
     #[test]
     fn subaccount_floor_is_segregated_from_base() {
-        // Base (1,0) holds 100, but NoOverdraft subaccount (1,7) holds nothing.
-        // The base's balance must not rescue the subaccount: a negative posting
-        // on the subaccount is rejected on its own policy.
+        // Base (1,0) holds 100, but the overdraft-forbidding subaccount (1,7)
+        // holds nothing. The base's balance must not rescue the subaccount: a
+        // negative posting on the subaccount is rejected on its own flags.
         let sub = AccountId::with_sub(1, 7);
         let envelope = Envelope {
             consumes: vec![],
@@ -1027,9 +996,9 @@ mod tests {
             metadata: BTreeMap::new(),
         };
         let accounts = accounts_map(vec![
-            make_account(1, AccountPolicy::NoOverdraft),
-            make_subaccount(1, 7, AccountPolicy::NoOverdraft),
-            make_account(2, AccountPolicy::NoOverdraft),
+            make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+            make_subaccount(1, 7, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+            make_account(2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
         ]);
         let mut balances = HashMap::new();
         balances.insert((AccountId::new(1), AssetId::new(1)), Cent::from(100));
@@ -1075,7 +1044,7 @@ mod tests {
             metadata: BTreeMap::new(),
         };
         // Only external account exists, account 999 doesn't
-        let accounts = accounts_map(vec![make_account(99, AccountPolicy::ExternalAccount)]);
+        let accounts = accounts_map(vec![make_account(99, AccountFlags::empty())]);
         let balances = HashMap::new();
         let input = PlanInput {
             envelope: &envelope,
@@ -1113,7 +1082,10 @@ mod tests {
             account_snapshots: vec![],
             metadata: BTreeMap::new(),
         };
-        let accounts = accounts_map(vec![make_account(1, AccountPolicy::NoOverdraft)]);
+        let accounts = accounts_map(vec![make_account(
+            1,
+            AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT,
+        )]);
         let balances = HashMap::new();
         let input = PlanInput {
             envelope: &envelope,
@@ -1137,8 +1109,8 @@ mod tests {
     fn negative_posting_allowed_on_system_account() {
         let envelope = deposit_envelope();
         let accounts = accounts_map(vec![
-            make_account(1, AccountPolicy::NoOverdraft),
-            make_account(99, AccountPolicy::SystemAccount),
+            make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+            make_account(99, AccountFlags::empty()),
         ]);
         let balances = HashMap::new();
         let input = PlanInput {

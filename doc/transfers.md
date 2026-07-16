@@ -52,8 +52,10 @@ returns change to A if the selected postings exceed 50.
 
 ### Deposit
 
-Fund an account from a system/external source. Creates an offset posting on
-the source and a credit on the target.
+Fund an account from a boundary source account. The source is an ordinary
+account that permits overdraft (no `DEBIT_MUST_NOT_EXCEED_CREDIT` flag), so it
+can hold the negative offset posting. Creates an offset posting on the source
+and a credit on the target.
 
 ```rust
 TransferBuilder::new()
@@ -127,14 +129,14 @@ For each `(account, asset)` pair where net debit > 0:
    selection, compute change = selected sum − net debit, and (if change > 0)
    create a change posting returning the remainder to the account.
 3. If positive postings are **insufficient**:
-   - For `CappedOverdraft` / `UncappedOverdraft` accounts: consume all positive
-     postings and create a **negative posting** for the shortfall
-     (`net_debit − total_positive`). The `CappedOverdraft` floor is enforced
-     later in validation.
-   - For any other policy: fail with `InsufficientFunds`.
+   - For accounts that allow overdraft (the `DEBIT_MUST_NOT_EXCEED_CREDIT` flag
+     is not set): consume all positive postings and create a **negative
+     posting** for the shortfall (`net_debit − total_positive`).
+   - For accounts that forbid overdraft (the flag is set): fail with
+     `InsufficientFunds`.
 
-Pairs with net debit <= 0 (e.g. the external account in a deposit) are skipped.
-No posting selection needed.
+Pairs with net debit <= 0 (e.g. the overdraft-permitting account in a deposit)
+are skipped. No posting selection needed.
 
 ### Aggregation benefit
 
@@ -224,9 +226,11 @@ validation steps are:
 7. Book policy (if a book is loaded): referenced assets/accounts/flags allowed
    by the book
 8. Per-asset conservation: `sum(consumed) == sum(created)`
-9. Negative postings forbidden only on `NoOverdraft` accounts (allowed on
-   overdraft/system/external)
-10. Policy enforcement: projected balance satisfies account floor
+9. Negative postings forbidden only on accounts that forbid overdraft (the
+   `DEBIT_MUST_NOT_EXCEED_CREDIT` flag is set); allowed on overdraft-permitting
+   accounts
+10. Balance-constraint enforcement: for an account that forbids overdraft, the
+    projected balance stays `>= 0`
 
 Validation runs inside the finalize step, immediately before it writes (the
 last-step floor / freeze-close re-check). The finalize step then applies the
@@ -234,12 +238,12 @@ effects through a sequence of dumb, idempotent store primitives
 (`deactivate_postings` → `insert_postings` → `store_transfer` → `append_event`),
 verifying every end-state. There is no single transaction; crash-safety comes
 from a phase-tracked write-ahead `PendingSaga` record plus `recover()`
-roll-forward. The `CappedOverdraft` floor is re-checked as that last step
-and is best-effort (not strictly atomic) under concurrency: two transfers
-that each pass the floor check against the same pre-transfer balance can
-both commit and jointly push the account below its floor. Per-asset
+roll-forward. The zero floor of an account that forbids overdraft is re-checked
+as that last step and is best-effort (not strictly atomic) under concurrency:
+two transfers that each pass the floor check against the same pre-transfer
+balance can both commit and jointly push the account below zero. Per-asset
 conservation still holds in that case (the negative postings are real
-value owed, not minted). The overdraft floor is the only guard with this
+value owed, not minted). That floor is the only guard with this
 property; double-spend prevention is exact (see
 `crates/kuatia/tests/concurrency.rs`, which asserts the exact guarantees
 and documents the floor race with an ignored test). See

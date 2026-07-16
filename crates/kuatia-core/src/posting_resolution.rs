@@ -5,7 +5,7 @@
 //!
 //! 1. [`draft_movements`] aggregates movements into output postings and
 //!    per-(account, asset) net debits. It tells the async layer exactly which
-//!    postings and account policies to load.
+//!    postings to load and which debit accounts permit overdraft.
 //! 2. [`resolve_envelope`] selects postings for each debit, computes change, and
 //!    covers an overdraft shortfall with a negative offset posting.
 //!
@@ -13,12 +13,12 @@
 //! shortfall branches are the parts most worth property-testing, and living here
 //! they are reachable without standing up a store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::posting_selection::SelectionError;
 use kuatia_types::{
-    AccountId, AccountPolicy, AssetId, Cent, Envelope, EnvelopeBuilder, NewPosting, OverflowError,
-    Posting, PostingId, Transfer,
+    AccountId, AssetId, Cent, Envelope, EnvelopeBuilder, NewPosting, OverflowError, Posting,
+    PostingId, Transfer,
 };
 
 // ---------------------------------------------------------------------------
@@ -130,8 +130,8 @@ pub fn draft_movements(transfer: &Transfer) -> Result<MovementDraft, OverflowErr
 // ---------------------------------------------------------------------------
 
 /// Pre-loaded state for resolution pass 2. The async layer gathers `available`
-/// and `policies` for the debits produced by [`draft_movements`]; this pass is
-/// pure.
+/// and `overdraft_allowed` for the debits produced by [`draft_movements`]; this
+/// pass is pure.
 pub struct ResolveInput<'a> {
     /// The transfer being resolved (for its book and metadata).
     pub transfer: &'a Transfer,
@@ -141,10 +141,13 @@ pub struct ResolveInput<'a> {
     /// Active postings available for each debit's (account, asset). A missing or
     /// empty entry means no positive postings to draw on.
     pub available: &'a HashMap<(AccountId, AssetId), Vec<Posting>>,
-    /// Policy for each debit's account. A missing entry is treated as "no
-    /// overdraft" — the debit fails with [`SelectionError::InsufficientFunds`]
-    /// rather than granting an offset position on unknown terms.
-    pub policies: &'a HashMap<AccountId, AccountPolicy>,
+    /// Accounts that permit overdraft (i.e. that do *not* carry
+    /// `DEBIT_MUST_NOT_EXCEED_CREDIT`). A debit short of positive postings gets a
+    /// negative offset posting only if its account is in this set; otherwise it
+    /// fails with [`SelectionError::InsufficientFunds`]. A missing account is
+    /// treated as forbidding overdraft, so an unknown account never gets an
+    /// offset position on unknown terms.
+    pub overdraft_allowed: &'a HashSet<AccountId>,
 }
 
 /// Pass 2: for each debit, either select postings and compute change, or (for an
@@ -157,7 +160,7 @@ pub fn resolve_envelope(input: ResolveInput<'_>) -> Result<Envelope, ResolveErro
         transfer,
         draft,
         available,
-        policies,
+        overdraft_allowed,
     } = input;
     let MovementDraft {
         mut creates,
@@ -204,31 +207,28 @@ pub fn resolve_envelope(input: ResolveInput<'_>) -> Result<Envelope, ResolveErro
                 });
             }
         } else {
-            // Not enough positive postings. Overdraft accounts cover the
-            // shortfall with a negative posting (an offset position); any other
-            // policy — or an unknown one — fails.
-            match policies.get(&debit.account) {
-                Some(AccountPolicy::CappedOverdraft { .. } | AccountPolicy::UncappedOverdraft) => {
-                    let positives: Vec<PostingId> = avail
-                        .iter()
-                        .filter(|p| p.value.is_positive())
-                        .map(|p| p.id)
-                        .collect();
-                    consumes.extend_from_slice(&positives);
-                    let shortfall = debit.amount.checked_sub(total_positive)?;
-                    creates.push(NewPosting {
-                        owner: debit.account,
-                        asset: debit.asset,
-                        value: shortfall.checked_neg()?,
-                        payer: None,
-                    });
-                }
-                _ => {
-                    return Err(ResolveError::Selection(SelectionError::InsufficientFunds {
-                        available: total_positive,
-                        requested: debit.amount,
-                    }));
-                }
+            // Not enough positive postings. An account that permits overdraft
+            // covers the shortfall with a negative posting (an offset position);
+            // one that forbids it — or an unknown account — fails.
+            if overdraft_allowed.contains(&debit.account) {
+                let positives: Vec<PostingId> = avail
+                    .iter()
+                    .filter(|p| p.value.is_positive())
+                    .map(|p| p.id)
+                    .collect();
+                consumes.extend_from_slice(&positives);
+                let shortfall = debit.amount.checked_sub(total_positive)?;
+                creates.push(NewPosting {
+                    owner: debit.account,
+                    asset: debit.asset,
+                    value: shortfall.checked_neg()?,
+                    payer: None,
+                });
+            } else {
+                return Err(ResolveError::Selection(SelectionError::InsufficientFunds {
+                    available: total_positive,
+                    requested: debit.amount,
+                }));
             }
         }
     }
@@ -310,12 +310,12 @@ mod tests {
             (acct(1), AssetId::new(1)),
             vec![posting(acct(1), 0, 60), posting(acct(1), 1, 40)],
         )]);
-        let policies = HashMap::new();
+        let overdraft_allowed = HashSet::new();
         let env = resolve_envelope(ResolveInput {
             transfer: &transfer,
             draft,
             available: &available,
-            policies: &policies,
+            overdraft_allowed: &overdraft_allowed,
         })
         .unwrap();
         assert_eq!(env.consumes().len(), 2);
@@ -330,12 +330,12 @@ mod tests {
         let draft = draft_movements(&transfer).unwrap();
         let available =
             HashMap::from([((acct(1), AssetId::new(1)), vec![posting(acct(1), 0, 100)])]);
-        let policies = HashMap::new();
+        let overdraft_allowed = HashSet::new();
         let env = resolve_envelope(ResolveInput {
             transfer: &transfer,
             draft,
             available: &available,
-            policies: &policies,
+            overdraft_allowed: &overdraft_allowed,
         })
         .unwrap();
         assert_eq!(env.consumes().len(), 1);
@@ -363,12 +363,12 @@ mod tests {
                 posting(acct(1), 2, 50),
             ],
         )]);
-        let policies = HashMap::new();
+        let overdraft_allowed = HashSet::new();
         let env = resolve_envelope(ResolveInput {
             transfer: &transfer,
             draft,
             available: &available,
-            policies: &policies,
+            overdraft_allowed: &overdraft_allowed,
         })
         .unwrap();
         assert_eq!(env.consumes().len(), 1);
@@ -387,12 +387,12 @@ mod tests {
         let draft = draft_movements(&transfer).unwrap();
         let available =
             HashMap::from([((acct(1), AssetId::new(1)), vec![posting(acct(1), 0, 40)])]);
-        let policies = HashMap::from([(acct(1), AccountPolicy::NoOverdraft)]);
+        let overdraft_allowed = HashSet::new();
         let err = resolve_envelope(ResolveInput {
             transfer: &transfer,
             draft,
             available: &available,
-            policies: &policies,
+            overdraft_allowed: &overdraft_allowed,
         })
         .unwrap_err();
         assert_eq!(
@@ -405,16 +405,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_policy_is_treated_as_no_overdraft() {
+    fn missing_account_is_treated_as_no_overdraft() {
         let transfer = pay(acct(1), acct(2), 100);
         let draft = draft_movements(&transfer).unwrap();
         let available = HashMap::new();
-        let policies = HashMap::new();
+        let overdraft_allowed = HashSet::new();
         let err = resolve_envelope(ResolveInput {
             transfer: &transfer,
             draft,
             available: &available,
-            policies: &policies,
+            overdraft_allowed: &overdraft_allowed,
         })
         .unwrap_err();
         assert_eq!(
@@ -432,12 +432,12 @@ mod tests {
         let draft = draft_movements(&transfer).unwrap();
         let available =
             HashMap::from([((acct(1), AssetId::new(1)), vec![posting(acct(1), 0, 30)])]);
-        let policies = HashMap::from([(acct(1), AccountPolicy::UncappedOverdraft)]);
+        let overdraft_allowed = HashSet::from([acct(1)]);
         let env = resolve_envelope(ResolveInput {
             transfer: &transfer,
             draft,
             available: &available,
-            policies: &policies,
+            overdraft_allowed: &overdraft_allowed,
         })
         .unwrap();
         // The single positive posting is consumed.
@@ -453,23 +453,18 @@ mod tests {
     }
 
     #[test]
-    fn capped_overdraft_covers_shortfall() {
-        // The floor is enforced in validation, not here — resolve still creates
-        // the offset posting for a capped-overdraft account.
+    fn overdraft_covers_full_shortfall_with_no_positives() {
+        // With no positive postings at all, an overdraft account still gets the
+        // full amount as a negative offset posting.
         let transfer = pay(acct(1), acct(2), 100);
         let draft = draft_movements(&transfer).unwrap();
         let available = HashMap::new();
-        let policies = HashMap::from([(
-            acct(1),
-            AccountPolicy::CappedOverdraft {
-                floor: Cent::from(-1000),
-            },
-        )]);
+        let overdraft_allowed = HashSet::from([acct(1)]);
         let env = resolve_envelope(ResolveInput {
             transfer: &transfer,
             draft,
             available: &available,
-            policies: &policies,
+            overdraft_allowed: &overdraft_allowed,
         })
         .unwrap();
         assert!(env.consumes().is_empty());

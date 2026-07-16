@@ -114,6 +114,10 @@ impl SqlStore {
                 "005_account_head",
                 include_str!("migrations/005_account_head.sql"),
             ),
+            (
+                "006_drop_policy",
+                include_str!("migrations/006_drop_policy.sql"),
+            ),
         ];
 
         for (name, sql) in migrations {
@@ -165,15 +169,6 @@ impl SqlStore {
 // ---------------------------------------------------------------------------
 // Serialization helpers
 // ---------------------------------------------------------------------------
-
-fn serialize_policy(policy: &AccountPolicy) -> Result<String, StoreError> {
-    serde_json::to_string(policy)
-        .map_err(|e| StoreError::Internal(format!("policy serialization: {e}")))
-}
-
-fn deserialize_policy(s: &str) -> Result<AccountPolicy, StoreError> {
-    serde_json::from_str(s).map_err(|e| StoreError::Internal(format!("bad policy: {e}")))
-}
 
 /// Serialize a value to a JSON string. Payload columns store JSON as `TEXT` so
 /// the database is directly readable for auditing; the ledger never queries
@@ -234,9 +229,6 @@ fn row_to_account(row: &sqlx::any::AnyRow) -> Result<Account, StoreError> {
     let version: i64 = row
         .try_get("version")
         .map_err(|e| StoreError::Internal(e.to_string()))?;
-    let policy_str: String = row
-        .try_get("policy")
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
     let flags_bits: i32 = row
         .try_get("flags")
         .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -250,7 +242,6 @@ fn row_to_account(row: &sqlx::any::AnyRow) -> Result<Account, StoreError> {
     Ok(Account {
         id: AccountId::with_sub(id, subaccount),
         version: version as u64,
-        policy: deserialize_policy(&policy_str)?,
         flags: AccountFlags::from_bits_truncate(flags_bits as u32),
         book: BookId::new(book),
         metadata: deserialize_json(&metadata_json)?,
@@ -397,12 +388,11 @@ impl AccountStore for SqlStore {
 
         // Append the immutable first version, then point the head at it.
         sqlx::query(
-            "INSERT INTO accounts (id, subaccount, version, policy, flags, book, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id, subaccount, version) DO NOTHING"
+            "INSERT INTO accounts (id, subaccount, version, flags, book, metadata) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id, subaccount, version) DO NOTHING"
         )
             .bind(account.id.id)
             .bind(account.id.sub)
             .bind(account.version as i64)
-            .bind(serialize_policy(&account.policy)?)
             .bind(account.flags.bits() as i32)
             .bind(account.book.0)
             .bind(serialize_json(&account.metadata)?)
@@ -473,12 +463,11 @@ impl AccountStore for SqlStore {
         }
 
         let res = sqlx::query(
-            "INSERT INTO accounts (id, subaccount, version, policy, flags, book, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id, subaccount, version) DO NOTHING"
+            "INSERT INTO accounts (id, subaccount, version, flags, book, metadata) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id, subaccount, version) DO NOTHING"
         )
             .bind(account.id.id)
             .bind(account.id.sub)
             .bind(account.version as i64)
-            .bind(serialize_policy(&account.policy)?)
             .bind(account.flags.bits() as i32)
             .bind(account.book.0)
             .bind(serialize_json(&account.metadata)?)

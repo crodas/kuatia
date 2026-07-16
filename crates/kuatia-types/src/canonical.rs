@@ -13,8 +13,8 @@
 //! and [`Account`](crate::Account) preimages begin with [`CANONICAL_VERSION`].
 
 use crate::{
-    Account, AccountFlags, AccountId, AccountPolicy, AccountSnapshotId, AssetId, BookId, Cent,
-    Envelope, EnvelopeId, NewPosting, Posting, PostingId, Receipt,
+    Account, AccountFlags, AccountId, AccountSnapshotId, AssetId, BookId, Cent, Envelope,
+    EnvelopeId, NewPosting, Posting, PostingId, Receipt,
 };
 
 /// Deterministic binary serialization. Every domain type can produce its
@@ -30,7 +30,9 @@ pub trait ToBytes {
 /// canonical bytes (ADR-0012).
 /// Bumped to 4 when the vestigial `UserData` fields were removed from the
 /// `Envelope` and `Account` preimages.
-pub const CANONICAL_VERSION: u8 = 4;
+/// Bumped to 5 when the `policy` field was removed from the `Account` preimage
+/// (ADR-0018): the single balance constraint now lives in `flags`.
+pub const CANONICAL_VERSION: u8 = 5;
 
 /// Append a `u16` in big-endian to `buf`.
 pub fn write_u16(buf: &mut Vec<u8>, v: u16) {
@@ -100,23 +102,6 @@ impl ToBytes for PostingId {
         let mut buf = Vec::with_capacity(34);
         buf.extend_from_slice(&self.transfer.0);
         write_u16(&mut buf, self.index);
-        buf
-    }
-}
-
-impl ToBytes for AccountPolicy {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(9);
-        match self {
-            Self::NoOverdraft => buf.push(0),
-            Self::CappedOverdraft { floor } => {
-                buf.push(1);
-                buf.extend(floor.to_bytes());
-            }
-            Self::UncappedOverdraft => buf.push(2),
-            Self::SystemAccount => buf.push(3),
-            Self::ExternalAccount => buf.push(4),
-        }
         buf
     }
 }
@@ -202,7 +187,6 @@ impl ToBytes for Account {
         buf.push(CANONICAL_VERSION);
         buf.extend(self.id.to_bytes());
         write_u64(&mut buf, self.version);
-        buf.extend(self.policy.to_bytes());
         buf.extend(self.flags.to_bytes());
         buf.extend(self.book.to_bytes());
 

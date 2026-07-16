@@ -13,10 +13,10 @@ value in the ledger. Postings are immutable once created. Consumed postings
 are marked `Inactive` but never deleted.
 
 - **Positive posting**: value controlled by the account.
-- **Negative posting**: an offset position, allowed on any policy except
-  `NoOverdraft`. It represents issuance, external flow, system balancing
-  (`SystemAccount`, `ExternalAccount`), or an overdraft
-  (`CappedOverdraft`/`UncappedOverdraft`).
+- **Negative posting**: an offset position, allowed on any account that permits
+  overdraft (the `DEBIT_MUST_NOT_EXCEED_CREDIT` flag is not set). It represents
+  issuance, external flow, boundary/system balancing, or an overdraft. An
+  account that forbids overdraft may not hold one.
 
 Lifecycle: `Active` → `PendingInactive` (reserved by a saga, stamped with its
 `ReservationId`) → `Inactive` (consumed). **Ledger balance** sums
@@ -28,13 +28,13 @@ Lifecycle: `Active` → `PendingInactive` (reserved by a saga, stamped with its
 A versioned entity that owns postings. Balance is never stored. It is always
 the sum of non-inactive postings for a given (account, asset) pair.
 
-Accounts have a **policy** (balance floor rule), **flags** (lifecycle +
-user-defined), and a **book** assignment.
+Accounts have **flags** (lifecycle, the `DEBIT_MUST_NOT_EXCEED_CREDIT` balance
+constraint, and user-defined bits) and a **book** assignment.
 
 An account is identified by `AccountId { id: i64, sub: i64 }`: a base `id` plus a
 **subaccount**. `sub = 0` is the main account; a non-zero `sub` is a subaccount
 of the same base id, and each `(id, sub)` is a full account record with its own
-policy and lifecycle. Balances are reported per subaccount and never summed
+flags and lifecycle. Balances are reported per subaccount and never summed
 across them. See the Subaccount entry and
 [adr/0012-subaccounts.md](adr/0012-subaccounts.md).
 
@@ -172,15 +172,17 @@ ledger.create_book(trading_book).await?;
 
 // Accounts — `Account::new` sets version 1, no flags, and the default book;
 // set the other fields explicitly where the common case is not enough.
-let mut bank = Account::new(AccountId::default(), AccountPolicy::ExternalAccount);
+// Boundary account: overdraft allowed by default, so it can hold the offset.
+let mut bank = Account::new(AccountId::default());
 bank.flags = AccountFlags::USER_1; // bank flag
 bank.book = deposits_book.id;
 
-let mut alice = Account::new(AccountId::default(), AccountPolicy::NoOverdraft);
-alice.flags = AccountFlags::USER_0; // wallet flag
+// Wallet: forbids overdraft, so its balance may not go negative.
+let mut alice = Account::debit_must_not_exceed_credit(AccountId::default());
+alice.flags |= AccountFlags::USER_0; // wallet flag
 alice.book = deposits_book.id;
 
-let mut exchange_pool = Account::new(AccountId::default(), AccountPolicy::SystemAccount);
+let mut exchange_pool = Account::new(AccountId::default());
 exchange_pool.book = trading_book.id;
 ```
 
@@ -263,24 +265,24 @@ let banking_book = BookBuilder::new("banking")
     .allow_flags(WAREHOUSE | BANK)
     .build();
 
-// Accounts — start from `Account::new`, then set flags where needed.
-// issuance source: mints product tokens on receipt
-let world = Account::new(AccountId::default(), AccountPolicy::SystemAccount);
+// Accounts — start from a constructor, then set flags where needed.
+// issuance source: mints product tokens on receipt (overdraft allowed)
+let world = Account::new(AccountId::default());
 
-let mut warehouse = Account::new(AccountId::default(), AccountPolicy::NoOverdraft);
-warehouse.flags = WAREHOUSE;
+let mut warehouse = Account::debit_must_not_exceed_credit(AccountId::default());
+warehouse.flags |= WAREHOUSE;
 
-let mut cash_register = Account::new(AccountId::default(), AccountPolicy::NoOverdraft);
-cash_register.flags = WAREHOUSE;
+let mut cash_register = Account::debit_must_not_exceed_credit(AccountId::default());
+cash_register.flags |= WAREHOUSE;
 
-let mut revenue = Account::new(AccountId::default(), AccountPolicy::SystemAccount);
+let mut revenue = Account::new(AccountId::default());
 revenue.flags = REVENUE;
 
-let mut cogs = Account::new(AccountId::default(), AccountPolicy::SystemAccount); // cost of goods sold
+let mut cogs = Account::new(AccountId::default()); // cost of goods sold
 cogs.flags = REVENUE;
 
-let mut bank = Account::new(AccountId::default(), AccountPolicy::NoOverdraft);
-bank.flags = BANK;
+let mut bank = Account::debit_must_not_exceed_credit(AccountId::default());
+bank.flags |= BANK;
 ```
 
 **Receive inventory from supplier (50 units of rice):**

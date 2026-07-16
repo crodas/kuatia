@@ -11,8 +11,9 @@ This page is the usage guide.
 ## Model
 
 An inflight transaction is an ordinary trade whose every destination is
-rewritten to a fresh per-destination **holding account** (`NoOverdraft`, flagged
-`INFLIGHT`). Committing that rewritten transfer parks the funds:
+rewritten to a fresh per-destination **holding account** (forbids overdraft via
+the `DEBIT_MUST_NOT_EXCEED_CREDIT` flag, and flagged `INFLIGHT`). Committing that
+rewritten transfer parks the funds:
 
 ```text
 Confirmed trade            Inflight form
@@ -89,9 +90,10 @@ let open = ledger.list_open_inflights().await?;
 
 ## Guarantees
 
-- **Over-confirmation is impossible.** A hold is `NoOverdraft`, so confirming
-  more than it holds fails validation. The sum of confirmations can never exceed
-  the authorized amount.
+- **Over-confirmation is impossible.** A hold forbids overdraft (the
+  `DEBIT_MUST_NOT_EXCEED_CREDIT` flag is set), so confirming more than it holds
+  fails validation. The sum of confirmations can never exceed the authorized
+  amount.
 - **No double-spend under concurrency.** Concurrent confirmations serialize on
   the shared holding posting via the reservation protocol. On contention, one
   wins and the caller retries the other against the new remaining balance.

@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use kuatia::ledger::Ledger;
-use kuatia_core::{Account, AccountId, AccountPolicy, AssetId, Cent, PostingId, PostingState};
+use kuatia_core::{Account, AccountId, AssetId, Cent, PostingId, PostingState};
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
 use kuatia_storage::store::{EnvelopeRecord, TransferQuery};
 use serde::Serialize;
@@ -47,16 +47,12 @@ pub struct AccountDto {
     pub sub: i64,
     pub label: Option<&'static str>,
     pub version: u64,
-    pub policy: PolicyDto,
+    /// Whether the account carries the `DEBIT_MUST_NOT_EXCEED_CREDIT` flag
+    /// (balance may not go negative). When `false` the account may overdraw.
+    pub debit_must_not_exceed_credit: bool,
     pub frozen: bool,
     pub closed: bool,
     pub balances: Vec<BalanceDto>,
-}
-
-#[derive(Serialize)]
-pub struct PolicyDto {
-    pub kind: &'static str,
-    pub floor: Option<Cent>,
 }
 
 #[derive(Serialize)]
@@ -132,31 +128,6 @@ fn posting_id(id: &PostingId) -> String {
     format!("{}:{}", hex32(&id.transfer.0), id.index)
 }
 
-fn policy_dto(policy: &AccountPolicy) -> PolicyDto {
-    match policy {
-        AccountPolicy::NoOverdraft => PolicyDto {
-            kind: "NoOverdraft",
-            floor: None,
-        },
-        AccountPolicy::CappedOverdraft { floor } => PolicyDto {
-            kind: "CappedOverdraft",
-            floor: Some(*floor),
-        },
-        AccountPolicy::UncappedOverdraft => PolicyDto {
-            kind: "UncappedOverdraft",
-            floor: None,
-        },
-        AccountPolicy::SystemAccount => PolicyDto {
-            kind: "SystemAccount",
-            floor: None,
-        },
-        AccountPolicy::ExternalAccount => PolicyDto {
-            kind: "ExternalAccount",
-            floor: None,
-        },
-    }
-}
-
 async fn account_dto(state: &AppState, account: &Account) -> Result<AccountDto, ApiError> {
     let mut balances = Vec::new();
     for asset in state.assets.iter() {
@@ -175,7 +146,7 @@ async fn account_dto(state: &AppState, account: &Account) -> Result<AccountDto, 
         sub: account.id.sub,
         label: account_label(account.id),
         version: account.version,
-        policy: policy_dto(&account.policy),
+        debit_must_not_exceed_credit: account.forbids_overdraft(),
         frozen: account.is_frozen(),
         closed: account.is_closed(),
         balances,

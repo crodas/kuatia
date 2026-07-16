@@ -35,8 +35,7 @@ async fn columns_store_hex_ids_and_json_text() {
     let account = Account {
         id: AccountId::new(1),
         version: 1,
-        policy: AccountPolicy::NoOverdraft,
-        flags: AccountFlags::empty(),
+        flags: AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT,
         book: BookId(0),
         metadata: std::collections::BTreeMap::new(),
     };
@@ -82,12 +81,12 @@ async fn subaccount_columns_round_trip() {
 
     let sub = AccountId::with_sub(1, 7);
     store
-        .create_account(Account::new(sub, AccountPolicy::NoOverdraft))
+        .create_account(Account::debit_must_not_exceed_credit(sub))
         .await
         .unwrap();
     // The main account (1, 0) is a separate record.
     store
-        .create_account(Account::new(AccountId::new(1), AccountPolicy::NoOverdraft))
+        .create_account(Account::debit_must_not_exceed_credit(AccountId::new(1)))
         .await
         .unwrap();
 

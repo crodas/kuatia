@@ -23,12 +23,11 @@ fn external() -> AccountId {
     AccountId::new(99)
 }
 
-fn make_account(id: i64, policy: AccountPolicy) -> Account {
+fn make_account(id: i64, flags: AccountFlags) -> Account {
     Account {
         id: AccountId::new(id),
         version: 1,
-        policy,
-        flags: AccountFlags::empty(),
+        flags,
         book: BookId(0),
         metadata: BTreeMap::new(),
     }
@@ -40,22 +39,22 @@ async fn setup_ledger() -> Arc<Ledger> {
 
     ledger
         .store()
-        .create_account(make_account(1, AccountPolicy::NoOverdraft))
+        .create_account(make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT))
         .await
         .unwrap();
     ledger
         .store()
-        .create_account(make_account(2, AccountPolicy::NoOverdraft))
+        .create_account(make_account(2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT))
         .await
         .unwrap();
     ledger
         .store()
-        .create_account(make_account(3, AccountPolicy::NoOverdraft))
+        .create_account(make_account(3, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT))
         .await
         .unwrap();
     ledger
         .store()
-        .create_account(make_account(99, AccountPolicy::ExternalAccount))
+        .create_account(make_account(99, AccountFlags::empty()))
         .await
         .unwrap();
 
@@ -326,12 +325,12 @@ async fn frozen_account_rejected() {
     let store = InMemoryStore::new();
     let ledger = Arc::new(Ledger::new(store));
 
-    let mut frozen = make_account(1, AccountPolicy::NoOverdraft);
+    let mut frozen = make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
     frozen.flags = AccountFlags::FROZEN;
     ledger.store().create_account(frozen).await.unwrap();
     ledger
         .store()
-        .create_account(make_account(99, AccountPolicy::ExternalAccount))
+        .create_account(make_account(99, AccountFlags::empty()))
         .await
         .unwrap();
 
@@ -390,9 +389,9 @@ async fn fx_trade_via_market_account() {
 
     // Setup accounts
     for (id, policy) in [
-        (1, AccountPolicy::NoOverdraft),
-        (50, AccountPolicy::SystemAccount), // FX market account
-        (99, AccountPolicy::ExternalAccount),
+        (1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+        (50, AccountFlags::empty()), // FX market account
+        (99, AccountFlags::empty()),
     ] {
         ledger
             .store()
@@ -619,7 +618,7 @@ async fn get_account_by_id() {
 
     let acc = ledger.get_account(&account(1)).await.unwrap();
     assert_eq!(acc.id, account(1));
-    assert_eq!(acc.policy, AccountPolicy::NoOverdraft);
+    assert!(acc.forbids_overdraft());
 }
 
 #[tokio::test]
@@ -725,7 +724,7 @@ async fn stale_snapshot_rejected() {
 
 #[tokio::test]
 async fn account_hash_deterministic() {
-    let acc = make_account(42, AccountPolicy::NoOverdraft);
+    let acc = make_account(42, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
     let h1 = kuatia_core::account_hash(&acc);
     let h2 = kuatia_core::account_hash(&acc);
     assert_eq!(h1, h2);
@@ -733,7 +732,7 @@ async fn account_hash_deterministic() {
 
 #[tokio::test]
 async fn account_hash_changes_with_version() {
-    let mut acc = make_account(42, AccountPolicy::NoOverdraft);
+    let mut acc = make_account(42, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
     let h1 = kuatia_core::account_hash(&acc);
     acc.version = 2;
     acc.flags |= AccountFlags::FROZEN;
@@ -746,22 +745,17 @@ async fn account_hash_changes_with_version() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn capped_overdraft_creates_negative_posting() {
+async fn overdraft_creates_negative_posting() {
     let store = InMemoryStore::new();
     let ledger = Arc::new(Ledger::new(store));
-    for (id, policy) in [
-        (
-            10,
-            AccountPolicy::CappedOverdraft {
-                floor: Cent::from(-200),
-            },
-        ),
-        (2, AccountPolicy::NoOverdraft),
-        (99, AccountPolicy::ExternalAccount),
+    for (id, flags) in [
+        (10, AccountFlags::empty()),
+        (2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+        (99, AccountFlags::empty()),
     ] {
         ledger
             .store()
-            .create_account(make_account(id, policy))
+            .create_account(make_account(id, flags))
             .await
             .unwrap();
     }
@@ -789,27 +783,22 @@ async fn capped_overdraft_creates_negative_posting() {
 }
 
 #[tokio::test]
-async fn capped_overdraft_respects_floor() {
+async fn debit_must_not_exceed_credit_rejects_overspend() {
     let store = InMemoryStore::new();
     let ledger = Arc::new(Ledger::new(store));
-    for (id, policy) in [
-        (
-            10,
-            AccountPolicy::CappedOverdraft {
-                floor: Cent::from(-80),
-            },
-        ),
-        (2, AccountPolicy::NoOverdraft),
-        (99, AccountPolicy::ExternalAccount),
+    for (id, flags) in [
+        (10, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+        (2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+        (99, AccountFlags::empty()),
     ] {
         ledger
             .store()
-            .create_account(make_account(id, policy))
+            .create_account(make_account(id, flags))
             .await
             .unwrap();
     }
 
-    // Paying 100 from an empty account would project to -100, below the -80 floor.
+    // Account 10 forbids overdraft, so paying 100 from an empty balance fails.
     let transfer = TransferBuilder::new()
         .pay(account(10), account(2), usd(), Cent::from(100))
         .build();
@@ -821,17 +810,17 @@ async fn capped_overdraft_respects_floor() {
 }
 
 #[tokio::test]
-async fn uncapped_overdraft_allows_arbitrary_negative() {
+async fn overdraft_allows_arbitrary_negative() {
     let store = InMemoryStore::new();
     let ledger = Arc::new(Ledger::new(store));
-    for (id, policy) in [
-        (10, AccountPolicy::UncappedOverdraft),
-        (2, AccountPolicy::NoOverdraft),
-        (99, AccountPolicy::ExternalAccount),
+    for (id, flags) in [
+        (10, AccountFlags::empty()),
+        (2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT),
+        (99, AccountFlags::empty()),
     ] {
         ledger
             .store()
-            .create_account(make_account(id, policy))
+            .create_account(make_account(id, flags))
             .await
             .unwrap();
     }
@@ -922,7 +911,7 @@ async fn subaccount_balances_are_segregated() {
     // A subaccount is a full account record with its own policy.
     ledger
         .store()
-        .create_account(Account::new(sub, AccountPolicy::NoOverdraft))
+        .create_account(Account::debit_must_not_exceed_credit(sub))
         .await
         .unwrap();
 
@@ -966,7 +955,7 @@ async fn pay_moves_value_between_subaccounts() {
     let sub = AccountId::with_sub(1, 7);
     ledger
         .store()
-        .create_account(Account::new(sub, AccountPolicy::NoOverdraft))
+        .create_account(Account::debit_must_not_exceed_credit(sub))
         .await
         .unwrap();
 
@@ -987,7 +976,7 @@ async fn closed_subaccounts_drop_out_of_aggregate_reads() {
     let sub = AccountId::with_sub(1, 7);
     ledger
         .store()
-        .create_account(Account::new(sub, AccountPolicy::NoOverdraft))
+        .create_account(Account::debit_must_not_exceed_credit(sub))
         .await
         .unwrap();
 

@@ -1,10 +1,16 @@
 # Account policies as the negative-posting and floor gate
 
-* Status: accepted
+* Status: superseded by [ADR-0018](0018-single-debit-must-not-exceed-credit-flag.md)
 * Authors: Cesar Rodas
 * Date: 2026-06-29
 * Targeted modules: `kuatia-types` (`AccountPolicy`), `kuatia-core` (`validate.rs`)
 * Associated tickets/PRs: N/A
+
+> **Superseded.** The closed `AccountPolicy` enum described here was collapsed
+> into a single `AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT` bit, with overdraft
+> allowed by default and the capped floor removed. See
+> [ADR-0018](0018-single-debit-must-not-exceed-credit-flag.md). This document is
+> retained as the historical record of the enum-based model.
 
 ## Context and Problem Statement
 

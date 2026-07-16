@@ -19,12 +19,11 @@ use crate::store::*;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_account(id: i64, policy: AccountPolicy) -> Account {
+fn make_account(id: i64, flags: AccountFlags) -> Account {
     Account {
         id: AccountId::new(id),
         version: 1,
-        policy,
-        flags: AccountFlags::empty(),
+        flags,
         book: BookId(0),
         metadata: BTreeMap::new(),
     }
@@ -173,16 +172,18 @@ async fn commit_envelope(
 
 /// Create an account and retrieve it.
 pub async fn create_and_get_account(store: &(impl Store + 'static)) {
-    let acc = make_account(1, AccountPolicy::NoOverdraft);
+    let acc = make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
     store.create_account(acc.clone()).await.unwrap();
     let got = store.get_account(&AccountId::new(1)).await.unwrap();
     assert_eq!(got.id, acc.id);
     assert_eq!(got.version, 1);
+    // The balance constraint lives in `flags`; it must survive the round-trip.
+    assert_eq!(got.flags, acc.flags);
 }
 
 /// Duplicate account creation fails.
 pub async fn create_duplicate_account_fails(store: &(impl Store + 'static)) {
-    let acc = make_account(1, AccountPolicy::NoOverdraft);
+    let acc = make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
     store.create_account(acc.clone()).await.unwrap();
     let err = store.create_account(acc).await.unwrap_err();
     assert!(matches!(err, StoreError::AlreadyExists(_)));
@@ -197,11 +198,11 @@ pub async fn get_missing_account_fails(store: &(impl Store + 'static)) {
 /// Fetch multiple accounts in one call.
 pub async fn get_accounts_batch(store: &(impl Store + 'static)) {
     store
-        .create_account(make_account(1, AccountPolicy::NoOverdraft))
+        .create_account(make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT))
         .await
         .unwrap();
     store
-        .create_account(make_account(2, AccountPolicy::NoOverdraft))
+        .create_account(make_account(2, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT))
         .await
         .unwrap();
     let accs = store
@@ -213,7 +214,7 @@ pub async fn get_accounts_batch(store: &(impl Store + 'static)) {
 
 /// Append a new version and verify get returns the latest.
 pub async fn append_account_version(store: &(impl Store + 'static)) {
-    let acc = make_account(1, AccountPolicy::NoOverdraft);
+    let acc = make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
     store.create_account(acc.clone()).await.unwrap();
 
     let mut v2 = acc.clone();
@@ -228,7 +229,7 @@ pub async fn append_account_version(store: &(impl Store + 'static)) {
 
 /// Appending with wrong version number fails.
 pub async fn append_version_conflict(store: &(impl Store + 'static)) {
-    let acc = make_account(1, AccountPolicy::NoOverdraft);
+    let acc = make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
     store.create_account(acc.clone()).await.unwrap();
 
     let mut bad = acc.clone();
@@ -241,7 +242,7 @@ pub async fn append_version_conflict(store: &(impl Store + 'static)) {
 /// intact: no gap, no duplicate. Exercises the version guard and the insert
 /// backstop of the locking append.
 pub async fn append_duplicate_version_rejected(store: &(impl Store + 'static)) {
-    let acc = make_account(1, AccountPolicy::NoOverdraft);
+    let acc = make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
     store.create_account(acc.clone()).await.unwrap();
 
     let mut v2 = acc.clone();
@@ -267,7 +268,7 @@ pub async fn append_duplicate_version_rejected(store: &(impl Store + 'static)) {
 
 /// Account history returns all versions.
 pub async fn get_account_history(store: &(impl Store + 'static)) {
-    let acc = make_account(1, AccountPolicy::NoOverdraft);
+    let acc = make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
     store.create_account(acc.clone()).await.unwrap();
 
     let mut v2 = acc.clone();
@@ -283,11 +284,11 @@ pub async fn get_account_history(store: &(impl Store + 'static)) {
 /// List accounts returns latest version of each.
 pub async fn list_accounts(store: &(impl Store + 'static)) {
     store
-        .create_account(make_account(1, AccountPolicy::NoOverdraft))
+        .create_account(make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT))
         .await
         .unwrap();
     store
-        .create_account(make_account(2, AccountPolicy::ExternalAccount))
+        .create_account(make_account(2, AccountFlags::empty()))
         .await
         .unwrap();
     let list = store.list_accounts().await.unwrap();

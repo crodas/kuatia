@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use kuatia_core::{
-    Account, AccountFlags, AccountId, AccountPolicy, AssetId, BookId, Cent, EnvelopeId, Metadata,
-    Receipt, SelectionError, Transfer, TransferBuilder, hash::double_sha256,
+    Account, AccountFlags, AccountId, AssetId, BookId, Cent, EnvelopeId, Metadata, Receipt,
+    SelectionError, Transfer, TransferBuilder, hash::double_sha256,
 };
 use kuatia_storage::error::StoreError;
 use kuatia_storage::store::EnvelopeRecord;
@@ -206,8 +206,10 @@ impl Ledger {
         // trade is already inflight, so different trades (different subs) can hold
         // against the same destination at once.
         for (dest, hold) in &dest_to_hold {
-            let mut acct = Account::new_ref(*hold, AccountPolicy::NoOverdraft);
-            acct.flags = AccountFlags::INFLIGHT;
+            let mut acct = Account::new_ref(*hold);
+            // A hold parks funds between authorize and settlement; it forbids
+            // overdraft so it can never go negative.
+            acct.flags = AccountFlags::INFLIGHT | AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT;
             acct.book = transfer.book;
             acct.metadata = meta_map(&InflightMeta::Hold { destination: *dest })?;
             match self.create_account(acct).await {

@@ -123,7 +123,6 @@ struct AccountView {
     name: String,
     version: u64,
     policy_kind: &'static str,
-    floor: Option<MoneyView>,
     frozen: bool,
     closed: bool,
     balances: Vec<BalanceView>,
@@ -257,16 +256,6 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// The symbol/decimals to render an overdraft floor, which carries no asset.
-/// Use the first two-decimal asset (fiat) if present.
-fn floor_style(assets: &[AssetMeta]) -> (u8, &str) {
-    assets
-        .iter()
-        .find(|a| a.decimals == 2)
-        .map(|a| (a.decimals, a.symbol))
-        .unwrap_or((2, ""))
-}
-
 // ---------------------------------------------------------------------------
 // View builders — DTO -> view model.
 // ---------------------------------------------------------------------------
@@ -283,7 +272,6 @@ fn acct_link(id: kuatia_core::AccountId) -> String {
 }
 
 fn account_view(dto: &AccountDto, assets: &[AssetMeta]) -> AccountView {
-    let (floor_dec, floor_sym) = floor_style(assets);
     let display_id = acct_display(dto.id);
     let link = acct_link(dto.id);
     AccountView {
@@ -297,8 +285,11 @@ fn account_view(dto: &AccountDto, assets: &[AssetMeta]) -> AccountView {
             .unwrap_or_else(|| display_id.clone()),
         display_id,
         version: dto.version,
-        policy_kind: dto.policy.kind,
-        floor: dto.policy.floor.map(|f| fmt(f, floor_dec, floor_sym)),
+        policy_kind: if dto.debit_must_not_exceed_credit {
+            "DebitMustNotExceedCredit"
+        } else {
+            "Overdraft"
+        },
         frozen: dto.frozen,
         closed: dto.closed,
         balances: dto

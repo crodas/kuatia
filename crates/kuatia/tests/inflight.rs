@@ -37,12 +37,11 @@ fn ext() -> AccountId {
     AccountId::new(99)
 }
 
-fn make_account(id: i64, policy: AccountPolicy) -> Account {
+fn make_account(id: i64, flags: AccountFlags) -> Account {
     Account {
         id: AccountId::new(id),
         version: 1,
-        policy,
-        flags: AccountFlags::empty(),
+        flags,
         book: BookId(0),
         metadata: BTreeMap::new(),
     }
@@ -63,13 +62,13 @@ async fn setup() -> Arc<Ledger> {
     for id in [1, 2, 3] {
         ledger
             .store()
-            .create_account(make_account(id, AccountPolicy::NoOverdraft))
+            .create_account(make_account(id, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT))
             .await
             .unwrap();
     }
     ledger
         .store()
-        .create_account(make_account(99, AccountPolicy::ExternalAccount))
+        .create_account(make_account(99, AccountFlags::empty()))
         .await
         .unwrap();
     deposit(&ledger, a(), eur(), 100).await;

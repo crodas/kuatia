@@ -30,18 +30,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let money = Amount::new(2); // two-decimal money
 
     ledger
-        .create_account(Account::new(customer, AccountPolicy::NoOverdraft))
+        .create_account(Account::debit_must_not_exceed_credit(customer))
         .await?;
     ledger
-        .create_account(Account::new(merchant, AccountPolicy::NoOverdraft))
+        .create_account(Account::debit_must_not_exceed_credit(merchant))
         .await?;
     // The fee account collects the processing fee; a system account has no floor.
-    ledger
-        .create_account(Account::new(fee, AccountPolicy::SystemAccount))
-        .await?;
-    ledger
-        .create_account(Account::new(external, AccountPolicy::ExternalAccount))
-        .await?;
+    ledger.create_account(Account::new(fee)).await?;
+    ledger.create_account(Account::new(external)).await?;
 
     // Fund the customer with $100.00.
     ledger
