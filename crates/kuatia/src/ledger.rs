@@ -29,10 +29,20 @@ mod envelope_saga;
 mod balance;
 mod commit;
 mod lifecycle;
+mod projection;
 mod query;
 
 pub use balance::SubAccountBalance;
 pub use commit::LoadedState;
+
+/// Default grace window (milliseconds) for the balance projection watermark: how
+/// far behind live a snapshot is allowed to advance, covering commit-to-visibility
+/// lag. See ADR-0019.
+pub const DEFAULT_PROJECTION_GRACE_MS: i64 = 60_000;
+
+/// Default number of credits/debits that must accrue for a `(account, asset)`
+/// since its latest cache point before a read appends a new one. See ADR-0019.
+pub const DEFAULT_SNAPSHOT_INTERVAL: u64 = 128;
 
 /// Return the current time as Unix milliseconds.
 pub(crate) fn now_millis() -> Result<i64, LedgerError> {
@@ -45,6 +55,12 @@ pub(crate) fn now_millis() -> Result<i64, LedgerError> {
 /// Async ledger resource composing the commit pipeline.
 pub struct Ledger {
     store: Arc<dyn Store>,
+    /// Grace window (ms) a cache point keeps behind live when its watermark is
+    /// set (ADR-0019).
+    projection_grace_ms: i64,
+    /// Credits/debits that must accrue since the latest cache point before a read
+    /// appends a new one (ADR-0019).
+    snapshot_interval: u64,
 }
 
 impl Ledger {
@@ -52,7 +68,24 @@ impl Ledger {
     pub fn new(store: impl Store + 'static) -> Self {
         Self {
             store: Arc::new(store),
+            projection_grace_ms: DEFAULT_PROJECTION_GRACE_MS,
+            snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
         }
+    }
+
+    /// Set the cache-point grace window (ms). Larger is safer against
+    /// commit-to-visibility lag but keeps the read tail longer. See ADR-0019.
+    pub fn with_projection_grace_ms(mut self, grace_ms: i64) -> Self {
+        self.projection_grace_ms = grace_ms;
+        self
+    }
+
+    /// Set how many credits/debits accrue before a read appends a new cache
+    /// point. Smaller snapshots more often (shorter tails, more rows); larger
+    /// snapshots less often. See ADR-0019.
+    pub fn with_snapshot_interval(mut self, interval: u64) -> Self {
+        self.snapshot_interval = interval;
+        self
     }
 
     /// Returns a reference to the underlying store.

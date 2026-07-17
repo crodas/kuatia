@@ -241,6 +241,8 @@ impl Ledger {
         self.save_pending(&envelope, reservation, SagaPhase::Reserving)
             .await?;
 
+        // Commit does not touch the balance projection (ADR-0019): cache points
+        // are appended lazily on read, once enough credits/debits have accrued.
         let result = self.drive_envelope_saga(envelope, reservation).await;
 
         // Delete the pending record only when it is safe: on success, or on a
