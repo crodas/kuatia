@@ -195,8 +195,8 @@ graph TB
 - **`TransferStore`**: `get_transfer`,
   `store_transfer(record, involved) -> u64`, `get_transfers_for_account`,
   `query_transfers`
-- **`EventStore`**: `append_event` (idempotent on a per-transfer dedup key),
-  `get_events_since`
+- **`EventStore`**: `append_event` (idempotent on a dedup key: a transfer's id,
+  or a lifecycle transition's `(account, version)`), `get_events_since`
 - **`SagaStore`**: `save_saga`, `list_pending_sagas`, `delete_saga`: the
   write-ahead store the saga and `recover()` use
 - **`BookStore`**: `create_book`, `get_book`, `list_books`

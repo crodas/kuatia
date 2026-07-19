@@ -3,10 +3,15 @@
 //! Accounts are append-only and versioned: each mutation appends a new version
 //! rather than editing in place. Freeze/close guards are validate-time and
 //! best-effort under concurrency (see the dumb-storage ADR).
+//!
+//! Freeze, unfreeze, and close are the same version-bump-plus-event shape; they
+//! delegate it to [`Ledger::transition`](super::transition), which carries the
+//! write-ahead / crash-repair path. Each method here supplies only the flag
+//! mutation, the lifecycle event, and any transition-specific guard.
 
 use tracing::instrument;
 
-use kuatia_core::{AccountId, PostingFilter};
+use kuatia_core::{AccountFlags, AccountId, PostingFilter};
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
 
 use super::{Ledger, now_millis};
@@ -30,82 +35,53 @@ impl Ledger {
     /// Freeze an account, preventing all transfers.
     #[instrument(skip(self), name = "ledger.freeze")]
     pub async fn freeze(&self, id: &AccountId) -> Result<(), LedgerError> {
-        let current = self
-            .store
-            .get_account(id)
-            .await
-            .map_err(|_| LedgerError::AccountNotFound(*id))?;
-        if current.is_closed() {
-            return Err(LedgerError::AccountAlreadyClosed(*id));
-        }
-        let mut next = current.clone();
-        next.version = next.version.checked_add(1).ok_or(LedgerError::Overflow)?;
-        next.flags |= kuatia_core::AccountFlags::FROZEN;
-        self.store.append_account_version(next).await?;
-        self.store
-            .append_event(&LedgerEvent {
-                seq: 0,
-                timestamp: now_millis()?,
-                kind: LedgerEventKind::AccountFrozen { account_id: *id },
-            })
-            .await?;
-        Ok(())
+        self.transition(
+            id,
+            |flags| *flags |= AccountFlags::FROZEN,
+            |account_id, version| LedgerEventKind::AccountFrozen {
+                account_id,
+                version,
+            },
+        )
+        .await
     }
 
     /// Unfreeze a previously frozen account.
     #[instrument(skip(self), name = "ledger.unfreeze")]
     pub async fn unfreeze(&self, id: &AccountId) -> Result<(), LedgerError> {
-        let current = self
-            .store
-            .get_account(id)
-            .await
-            .map_err(|_| LedgerError::AccountNotFound(*id))?;
-        if current.is_closed() {
-            return Err(LedgerError::AccountAlreadyClosed(*id));
-        }
-        let mut next = current.clone();
-        next.version = next.version.checked_add(1).ok_or(LedgerError::Overflow)?;
-        next.flags.remove(kuatia_core::AccountFlags::FROZEN);
-        self.store.append_account_version(next).await?;
-        self.store
-            .append_event(&LedgerEvent {
-                seq: 0,
-                timestamp: now_millis()?,
-                kind: LedgerEventKind::AccountUnfrozen { account_id: *id },
-            })
-            .await?;
-        Ok(())
+        self.transition(
+            id,
+            |flags| flags.remove(AccountFlags::FROZEN),
+            |account_id, version| LedgerEventKind::AccountUnfrozen {
+                account_id,
+                version,
+            },
+        )
+        .await
     }
 
-    /// Close an account. Must have no active postings.
+    /// Close an account. Must have no live postings.
     #[instrument(skip(self), name = "ledger.close")]
     pub async fn close(&self, id: &AccountId) -> Result<(), LedgerError> {
-        let current = self
-            .store
-            .get_account(id)
-            .await
-            .map_err(|_| LedgerError::AccountNotFound(*id))?;
-        if current.is_closed() {
-            return Err(LedgerError::AccountAlreadyClosed(*id));
-        }
-        // Reject if any posting is still live — active or reserved (a transfer
-        // in flight). Only spent postings (or none) permit a close.
+        // Emptiness is close's own guard, checked before the transition's
+        // write-ahead so a non-empty account records nothing. A closed account
+        // holds no live postings, so this ordering still surfaces
+        // `AccountAlreadyClosed` (from `transition`) for a re-close.
         if self.has_live_postings(id).await? {
             return Err(LedgerError::AccountNotEmpty(*id));
         }
-        let mut next = current.clone();
-        next.version = next.version.checked_add(1).ok_or(LedgerError::Overflow)?;
-        next.flags |= kuatia_core::AccountFlags::CLOSED;
-        next.flags.remove(kuatia_core::AccountFlags::FROZEN);
-        self.store.append_account_version(next).await?;
-        self.store
-            .append_event(&LedgerEvent {
-                seq: 0,
-                timestamp: now_millis()?,
-                kind: LedgerEventKind::AccountClosed { account_id: *id },
-            })
-            .await?;
-        Ok(())
+        self.transition(
+            id,
+            |flags| {
+                *flags |= AccountFlags::CLOSED;
+                flags.remove(AccountFlags::FROZEN);
+            },
+            |account_id, version| LedgerEventKind::AccountClosed {
+                account_id,
+                version,
+            },
+        )
+        .await
     }
 
     /// Whether `account` (exact base id and subaccount) has any live posting: one

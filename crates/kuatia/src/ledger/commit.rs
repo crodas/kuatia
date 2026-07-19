@@ -51,6 +51,31 @@ struct PendingSaga {
     phase: SagaPhase,
 }
 
+/// Write-ahead record for an in-flight account-version transition
+/// (freeze/unfreeze/close). The transition appends a new account version and then
+/// its lifecycle event; a crash between the two leaves a version bump with no
+/// event. Persisting this before either write lets [`Ledger::recover`] roll the
+/// transition forward, re-appending the (idempotent) event.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct PendingTransition {
+    /// The next account version to append: version already bumped, flag flipped.
+    pub next: kuatia_core::Account,
+    /// The lifecycle event paired with this version bump. It carries the target
+    /// version, so re-appending it on recovery dedups to the original.
+    pub event: LedgerEventKind,
+}
+
+/// The two kinds of write-ahead record the [`SagaStore`](kuatia_storage::store::SagaStore)
+/// holds, tagged so [`Ledger::recover`] can tell an envelope commit saga from an
+/// account transition and complete each through its own path.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum PendingRecord {
+    /// A two-step envelope commit saga (reserve → finalize).
+    Envelope(PendingSaga),
+    /// A single account-version transition (append version + lifecycle event).
+    Transition(PendingTransition),
+}
+
 /// State loaded in phase 1, passed to the pure validation in phase 2.
 pub struct LoadedState {
     /// Postings being consumed by the envelope.
@@ -314,41 +339,55 @@ impl Ledger {
         let pending = self.store.list_pending_sagas().await?;
         let count = pending.len();
         for (saga_id, blob) in pending {
-            let PendingSaga {
-                envelope,
-                reservation,
-                phase,
-            } = serde_json::from_slice(&blob)
+            let record: PendingRecord = serde_json::from_slice(&blob)
                 .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
 
-            // The transfer record is durable, but a full commit is more than the
-            // transfer row: it also includes the committed event, appended *after*
-            // store_transfer. A crash in that window leaves the record present yet
-            // the event missing, so repair the whole end-state (idempotent) before
-            // clearing the pending record.
-            let tid = envelope_id(&envelope);
-            if self.store.get_transfer(&tid).await?.is_some() {
-                self.append_committed_event(tid).await?;
-                self.store.delete_saga(&saga_id).await?;
-                continue;
-            }
-
-            match phase {
-                SagaPhase::Finalizing => {
-                    // Validation passed and the postings are ours; roll forward.
-                    // Keep the record if completion fails so a later run retries.
-                    if self.finalize_envelope(&envelope, reservation).await.is_ok() {
-                        self.store.delete_saga(&saga_id).await?;
-                    }
+            match record {
+                PendingRecord::Transition(PendingTransition { next, event }) => {
+                    // Roll the account transition forward: append the version if it
+                    // is not yet present, then (re-)append the idempotent event.
+                    // Both steps no-op when already applied, so this is safe to run
+                    // in any crash window.
+                    self.complete_transition(saga_id, next, event).await?;
                 }
-                SagaPhase::Reserving => {
-                    // Re-run the validating saga. On failure, delete only if it did
-                    // not reach finalize (clean abort); otherwise keep for next run.
-                    let result = self.drive_envelope_saga(envelope, reservation).await;
-                    let safe_to_delete = result.is_ok()
-                        || self.read_pending_phase(saga_id).await? != Some(SagaPhase::Finalizing);
-                    if safe_to_delete {
+                PendingRecord::Envelope(PendingSaga {
+                    envelope,
+                    reservation,
+                    phase,
+                }) => {
+                    // The transfer record is durable, but a full commit is more
+                    // than the transfer row: it also includes the committed event,
+                    // appended *after* store_transfer. A crash in that window
+                    // leaves the record present yet the event missing, so repair
+                    // the whole end-state (idempotent) before clearing the record.
+                    let tid = envelope_id(&envelope);
+                    if self.store.get_transfer(&tid).await?.is_some() {
+                        self.append_committed_event(tid).await?;
                         self.store.delete_saga(&saga_id).await?;
+                        continue;
+                    }
+
+                    match phase {
+                        SagaPhase::Finalizing => {
+                            // Validation passed and the postings are ours; roll
+                            // forward. Keep the record if completion fails so a
+                            // later run retries.
+                            if self.finalize_envelope(&envelope, reservation).await.is_ok() {
+                                self.store.delete_saga(&saga_id).await?;
+                            }
+                        }
+                        SagaPhase::Reserving => {
+                            // Re-run the validating saga. On failure, delete only if
+                            // it did not reach finalize (clean abort); otherwise
+                            // keep for next run.
+                            let result = self.drive_envelope_saga(envelope, reservation).await;
+                            let safe_to_delete = result.is_ok()
+                                || self.read_pending_phase(saga_id).await?
+                                    != Some(SagaPhase::Finalizing);
+                            if safe_to_delete {
+                                self.store.delete_saga(&saga_id).await?;
+                            }
+                        }
                     }
                 }
             }
@@ -506,23 +545,46 @@ impl Ledger {
         reservation: kuatia_core::ReservationId,
         phase: SagaPhase,
     ) -> Result<(), LedgerError> {
-        let blob = serde_json::to_vec(&PendingSaga {
+        let blob = serde_json::to_vec(&PendingRecord::Envelope(PendingSaga {
             envelope: envelope.clone(),
             reservation,
             phase,
-        })
+        }))
         .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
         self.store.save_saga(&reservation.0, blob).await?;
         Ok(())
     }
 
-    /// Read the persisted phase of a pending saga, if it still exists.
+    /// Persist the write-ahead record for an account-version transition, keyed by
+    /// a fresh unique id, and return that id so the caller can delete the record
+    /// once the transition is complete. Shares the reservation-id generator so the
+    /// key never collides with an in-flight commit saga's key.
+    pub(super) async fn save_transition(
+        &self,
+        next: &kuatia_core::Account,
+        event: &LedgerEventKind,
+    ) -> Result<i64, LedgerError> {
+        let saga_id = kuatia_core::ReservationId::default().0;
+        let blob = serde_json::to_vec(&PendingRecord::Transition(PendingTransition {
+            next: next.clone(),
+            event: event.clone(),
+        }))
+        .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
+        self.store.save_saga(&saga_id, blob).await?;
+        Ok(saga_id)
+    }
+
+    /// Read the persisted phase of a pending *envelope* saga, if one exists under
+    /// `saga_id`. A transition record (no phase) reads as `None`.
     async fn read_pending_phase(&self, saga_id: i64) -> Result<Option<SagaPhase>, LedgerError> {
         for (id, blob) in self.store.list_pending_sagas().await? {
             if id == saga_id {
-                let pending: PendingSaga = serde_json::from_slice(&blob)
+                let record: PendingRecord = serde_json::from_slice(&blob)
                     .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
-                return Ok(Some(pending.phase));
+                return Ok(match record {
+                    PendingRecord::Envelope(s) => Some(s.phase),
+                    PendingRecord::Transition(_) => None,
+                });
             }
         }
         Ok(None)
@@ -649,11 +711,11 @@ mod recovery_tests {
         rid: ReservationId,
         phase: SagaPhase,
     ) {
-        let blob = serde_json::to_vec(&PendingSaga {
+        let blob = serde_json::to_vec(&PendingRecord::Envelope(PendingSaga {
             envelope: envelope.clone(),
             reservation: rid,
             phase,
-        })
+        }))
         .unwrap();
         ledger.store().save_saga(&rid.0, blob).await.unwrap();
     }
@@ -929,5 +991,220 @@ mod recovery_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Account-version transition recovery (freeze / unfreeze / close)
+    // -----------------------------------------------------------------------
+
+    /// Persist a transition write-ahead record by hand and return its id, so a
+    /// test can simulate a crash mid-transition.
+    async fn save_transition_record(
+        ledger: &Arc<Ledger>,
+        next: &Account,
+        event: &LedgerEventKind,
+    ) -> Result<i64, LedgerError> {
+        let saga_id = ReservationId::default().0;
+        let blob = serde_json::to_vec(&PendingRecord::Transition(PendingTransition {
+            next: next.clone(),
+            event: event.clone(),
+        }))
+        .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
+        ledger.store().save_saga(&saga_id, blob).await?;
+        Ok(saga_id)
+    }
+
+    fn count_frozen(events: &[LedgerEvent], id: AccountId) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    LedgerEventKind::AccountFrozen { account_id, .. } if account_id == id
+                )
+            })
+            .count()
+    }
+
+    fn count_closed(events: &[LedgerEvent], id: AccountId) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    LedgerEventKind::AccountClosed { account_id, .. } if account_id == id
+                )
+            })
+            .count()
+    }
+
+    /// The happy path leaves nothing to recover: a completed freeze deletes its
+    /// write-ahead record and emits exactly one event.
+    #[tokio::test]
+    async fn freeze_leaves_no_pending_record() -> Result<(), LedgerError> {
+        let ledger = funded_ledger().await;
+        ledger.freeze(&AccountId::new(1)).await?;
+
+        assert!(
+            ledger
+                .store()
+                .get_account(&AccountId::new(1))
+                .await?
+                .is_frozen()
+        );
+        let events = ledger.get_events_since(0, 1000).await?;
+        assert_eq!(count_frozen(&events, AccountId::new(1)), 1);
+        assert!(ledger.store().list_pending_sagas().await?.is_empty());
+        Ok(())
+    }
+
+    /// The reported gap: a freeze crashed after the version append but before the
+    /// event append. Recovery appends the missing event (without bumping the
+    /// version again) and clears the record.
+    #[tokio::test]
+    async fn recover_completes_transition_missing_event() -> Result<(), LedgerError> {
+        let ledger = funded_ledger().await;
+        let current = ledger.store().get_account(&AccountId::new(1)).await?;
+        let mut next = current;
+        next.version += 1;
+        next.flags |= AccountFlags::FROZEN;
+        let event = LedgerEventKind::AccountFrozen {
+            account_id: AccountId::new(1),
+            version: next.version,
+        };
+
+        // Replay the transition up to (but not including) the event append.
+        ledger.store().append_account_version(next.clone()).await?;
+        save_transition_record(&ledger, &next, &event).await?;
+
+        // Precondition: version bumped and frozen, but no event yet.
+        assert_eq!(next.version, 2);
+        assert_eq!(
+            count_frozen(&ledger.get_events_since(0, 1000).await?, AccountId::new(1)),
+            0
+        );
+
+        assert_eq!(ledger.recover().await?, 1);
+
+        // The event is appended, the version is not bumped a second time, and the
+        // record is cleared.
+        let account = ledger.store().get_account(&AccountId::new(1)).await?;
+        assert!(account.is_frozen());
+        assert_eq!(account.version, 2);
+        assert_eq!(
+            count_frozen(&ledger.get_events_since(0, 1000).await?, AccountId::new(1)),
+            1
+        );
+        assert!(ledger.store().list_pending_sagas().await?.is_empty());
+        Ok(())
+    }
+
+    /// A freeze that crashed before either write is rolled fully forward: recovery
+    /// appends the version and the event, then clears the record.
+    #[tokio::test]
+    async fn recover_completes_transition_before_any_write() -> Result<(), LedgerError> {
+        let ledger = funded_ledger().await;
+        let current = ledger.store().get_account(&AccountId::new(1)).await?;
+        let mut next = current;
+        next.version += 1;
+        next.flags |= AccountFlags::FROZEN;
+        let event = LedgerEventKind::AccountFrozen {
+            account_id: AccountId::new(1),
+            version: next.version,
+        };
+        save_transition_record(&ledger, &next, &event).await?;
+
+        // Precondition: nothing applied yet.
+        let before = ledger.store().get_account(&AccountId::new(1)).await?;
+        assert_eq!(before.version, 1);
+        assert!(!before.is_frozen());
+
+        assert_eq!(ledger.recover().await?, 1);
+
+        let account = ledger.store().get_account(&AccountId::new(1)).await?;
+        assert!(account.is_frozen());
+        assert_eq!(account.version, 2);
+        assert_eq!(
+            count_frozen(&ledger.get_events_since(0, 1000).await?, AccountId::new(1)),
+            1
+        );
+        assert!(ledger.store().list_pending_sagas().await?.is_empty());
+        Ok(())
+    }
+
+    /// A transition that fully applied but whose record survived (crash before the
+    /// final delete) recovers idempotently: no second version, no duplicate event.
+    #[tokio::test]
+    async fn recover_transition_is_idempotent_when_already_applied() -> Result<(), LedgerError> {
+        let ledger = funded_ledger().await;
+        // A real, completed freeze: version 2, one event, no record.
+        ledger.freeze(&AccountId::new(1)).await?;
+        let next = ledger.store().get_account(&AccountId::new(1)).await?;
+        let event = LedgerEventKind::AccountFrozen {
+            account_id: AccountId::new(1),
+            version: next.version,
+        };
+        // Simulate the record surviving the crash window before delete_saga.
+        save_transition_record(&ledger, &next, &event).await?;
+
+        assert_eq!(ledger.recover().await?, 1);
+
+        let account = ledger.store().get_account(&AccountId::new(1)).await?;
+        assert_eq!(account.version, 2, "no second version bump");
+        assert_eq!(
+            count_frozen(&ledger.get_events_since(0, 1000).await?, AccountId::new(1)),
+            1,
+            "event not duplicated"
+        );
+        assert!(ledger.store().list_pending_sagas().await?.is_empty());
+        Ok(())
+    }
+
+    /// A close crashed after the version append but before the event append is
+    /// rolled forward: recovery appends the `AccountClosed` event without a second
+    /// version bump and clears the record. Account 2 is empty, so it may close.
+    #[tokio::test]
+    async fn recover_completes_close_missing_event() -> Result<(), LedgerError> {
+        let ledger = funded_ledger().await;
+        let current = ledger.store().get_account(&AccountId::new(2)).await?;
+        let mut next = current;
+        next.version += 1;
+        next.flags |= AccountFlags::CLOSED;
+        let event = LedgerEventKind::AccountClosed {
+            account_id: AccountId::new(2),
+            version: next.version,
+        };
+
+        // Replay the transition up to (but not including) the event append.
+        ledger.store().append_account_version(next.clone()).await?;
+        save_transition_record(&ledger, &next, &event).await?;
+        assert_eq!(
+            count_closed(&ledger.get_events_since(0, 1000).await?, AccountId::new(2)),
+            0
+        );
+
+        assert_eq!(ledger.recover().await?, 1);
+
+        let account = ledger.store().get_account(&AccountId::new(2)).await?;
+        assert!(account.is_closed());
+        assert_eq!(account.version, 2);
+        assert_eq!(
+            count_closed(&ledger.get_events_since(0, 1000).await?, AccountId::new(2)),
+            1
+        );
+        assert!(ledger.store().list_pending_sagas().await?.is_empty());
+        Ok(())
+    }
+
+    /// A rejected close records nothing: the emptiness guard runs before the
+    /// write-ahead, so a non-empty account leaves no pending record to recover.
+    #[tokio::test]
+    async fn rejected_close_leaves_no_pending_record() -> Result<(), LedgerError> {
+        let ledger = funded_ledger().await;
+        // Account 1 holds the funded posting, so it is not empty.
+        let result = ledger.close(&AccountId::new(1)).await;
+        assert!(matches!(result, Err(LedgerError::AccountNotEmpty(_))));
+        assert!(ledger.store().list_pending_sagas().await?.is_empty());
+        Ok(())
     }
 }

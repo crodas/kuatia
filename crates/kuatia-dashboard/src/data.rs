@@ -183,11 +183,15 @@ fn event_dto(event: &LedgerEvent) -> EventDto {
         LedgerEventKind::AccountCreated { account_id } => {
             ("AccountCreated", Some(*account_id), None)
         }
-        LedgerEventKind::AccountFrozen { account_id } => ("AccountFrozen", Some(*account_id), None),
-        LedgerEventKind::AccountUnfrozen { account_id } => {
+        LedgerEventKind::AccountFrozen { account_id, .. } => {
+            ("AccountFrozen", Some(*account_id), None)
+        }
+        LedgerEventKind::AccountUnfrozen { account_id, .. } => {
             ("AccountUnfrozen", Some(*account_id), None)
         }
-        LedgerEventKind::AccountClosed { account_id } => ("AccountClosed", Some(*account_id), None),
+        LedgerEventKind::AccountClosed { account_id, .. } => {
+            ("AccountClosed", Some(*account_id), None)
+        }
     };
     EventDto {
         seq: event.seq,
