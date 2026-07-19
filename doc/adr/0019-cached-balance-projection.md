@@ -3,9 +3,10 @@
 * Status: accepted
 * Authors: Cesar Rodas
 * Date: 2026-07-17
-* Targeted modules: `kuatia` (`ledger/balance.rs`, commit path, projector),
-  `kuatia-storage` (`Store`), `kuatia-storage-sql` (a new projection + lease
-  table)
+* Targeted modules: `kuatia` (`ledger/balance.rs`, `ledger/projection.rs`),
+  `kuatia-storage` (`Store`), `kuatia-storage-sql` (a new `balance_projection`
+  table). The chosen outcome leaves the commit path untouched and adds no lease
+  table or projector service (see Decision Outcome).
 * Associated tickets/PRs: N/A
 
 ## Context and Problem Statement

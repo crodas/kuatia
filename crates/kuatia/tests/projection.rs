@@ -46,6 +46,15 @@ async fn deposit(ledger: &Arc<Ledger>, to: i64, amount: i64) {
     ledger.commit(transfer).await.unwrap();
 }
 
+/// Current time as Unix milliseconds, the same clock the ledger stamps commits
+/// and cache-point watermarks with, so a test can pin a watermark to "now".
+fn unix_millis_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
 async fn pay(ledger: &Arc<Ledger>, from: i64, to: i64, amount: i64) {
     let transfer = TransferBuilder::new()
         .pay(account(from), account(to), usd(), Cent::from(amount))
@@ -231,6 +240,63 @@ async fn read_below_interval_appends_nothing() {
     );
 }
 
+/// Snapshot plus a genuinely non-empty tail. A cache point is pinned to the
+/// boundary between two commit batches, then more commits land strictly after
+/// its watermark, so the read must fold `snapshot + tail`: not a whole-history
+/// live sum (no snapshot) and not a snapshot that already holds everything (empty
+/// tail). This is the watermark boundary the grace-0 and no-snapshot tests never
+/// reach; an off-by-one at `watermark + 1` would drop or double-count a
+/// tail transfer here.
+#[tokio::test]
+async fn snapshot_plus_nonempty_tail_matches_live_sum() {
+    let ledger = Arc::new(Ledger::new(InMemoryStore::new()));
+    no_overdraft(&ledger, 1).await;
+    no_overdraft(&ledger, 2).await;
+    overdraft(&ledger, 99).await;
+
+    // Batch 1: the snapshot will cover exactly this.
+    deposit(&ledger, 1, 1000).await;
+    pay(&ledger, 1, 2, 250).await;
+
+    // Pin a cache point at the batch-1/batch-2 boundary. Its balance is the
+    // authoritative batch-1 sum (folded by the ledger, not by hand); its watermark
+    // is a time at or after every batch-1 commit. Appended directly so the
+    // watermark is controlled, independent of the lazy read-path grace.
+    let snapshot = ledger.compute_balance(&account(1), &usd()).await.unwrap();
+    let watermark = unix_millis_now();
+    ledger
+        .store()
+        .append_balance_projection(&account(1), &usd(), snapshot, watermark)
+        .await
+        .unwrap();
+
+    // Cross the millisecond boundary so every batch-2 commit is stamped strictly
+    // after the watermark and lands in the tail, never the snapshot.
+    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+
+    // Batch 2: folded onto the snapshot as a non-empty tail (both credits and
+    // debits for account 1).
+    pay(&ledger, 1, 2, 100).await;
+    pay(&ledger, 2, 1, 40).await;
+    deposit(&ledger, 1, 500).await;
+
+    // The read is snapshot + folded tail, and still equals the live sum.
+    let projected = ledger.balance(&account(1), &usd()).await.unwrap();
+    let authoritative = ledger.compute_balance(&account(1), &usd()).await.unwrap();
+    assert_eq!(
+        projected, authoritative,
+        "snapshot + non-empty tail diverged from the live sum"
+    );
+    // Guard the test itself: the snapshot must have been partial, so the tail
+    // actually carried value. Otherwise this silently degrades to the empty-tail
+    // case the other tests already cover.
+    assert_ne!(
+        snapshot, authoritative,
+        "the snapshot already held the full balance; the tail was empty"
+    );
+    assert_projection_matches(&ledger, &[1, 2]).await;
+}
+
 /// Deterministic xorshift64 PRNG so the property test is reproducible.
 struct Rng(u64);
 impl Rng {
@@ -256,11 +322,13 @@ impl Rng {
 /// produce.
 #[tokio::test]
 async fn projection_matches_live_sum_across_random_utxo_history() {
-    // A low interval so reads append cache points throughout the run, exercising
-    // the append-only cache points and closest-at-or-before selection. The
-    // default grace keeps each watermark safely in the past (so the tail folds
-    // every commit and no same-millisecond commit races an append); the invariant
-    // holds regardless of cache-point state.
+    // Default grace (60s) over a sub-second run keeps every watermark before all
+    // commits, so no cache point is appended and each read folds the full tail
+    // (equal to the live sum). That makes the run deterministic and free of
+    // same-millisecond append races; the invariant holds with or without a cache
+    // point. The snapshot-plus-non-empty-tail path (a real snapshot with commits
+    // folded on top) is covered deterministically by
+    // `snapshot_plus_nonempty_tail_matches_live_sum`.
     let ledger = Arc::new(Ledger::new(InMemoryStore::new()).with_snapshot_interval(4));
 
     // Accounts under test, including two subaccounts and both overdraft kinds.

@@ -96,10 +96,19 @@ async fn fold_tail(
 /// near-duplicate row on every read (`min_new == 0` forces an append). Append-only
 /// and best effort; a stale or duplicate append is harmless because a read takes
 /// the closest-at-or-before cache point.
+///
+/// `debounce_ms` is the storage-based single-flight guard. When the newest cache
+/// point already sits within `debounce_ms` below the target watermark, this
+/// returns before the fold, so a hot account read at high QPS does not fan out a
+/// full fold per read. The guard lives in the shared `balance_projection` rows,
+/// not in process memory, so it dedups across every ledger instance and survives
+/// a restart, and it needs no lease, lock, or CAS (ADR-0019). `debounce_ms == 0`
+/// disables it (the reconcile path forces an append regardless).
 async fn append_cache_point(
     store: &dyn Store,
     grace_ms: i64,
     min_new: u64,
+    debounce_ms: i64,
     account: &AccountId,
     asset: &AssetId,
 ) -> Result<(), LedgerError> {
@@ -108,7 +117,12 @@ async fn append_cache_point(
         .get_closest_balance_projection(account, asset, new_watermark)
         .await?;
     let (snapshot, from_ts) = match closest {
-        // A cache point already covers this watermark: nothing to add.
+        // Storage-based debounce: a cache point within `debounce_ms` below the
+        // target already shortens the tail enough, so skip the fold. This is what
+        // collapses a per-read fan-out into at most one fold per debounce window.
+        Some(p) if new_watermark.saturating_sub(p.watermark) < debounce_ms => return Ok(()),
+        // A cache point already covers this watermark: nothing to add. (Also the
+        // debounce == 0 stop, so an exact-or-newer watermark is never duplicated.)
         Some(p) if p.watermark >= new_watermark => return Ok(()),
         Some(p) => (p.balance, Some(p.watermark.saturating_add(1))),
         None => (Cent::ZERO, None),
@@ -179,24 +193,39 @@ impl Ledger {
     /// Spawn a best-effort background append gated on `snapshot_interval` new
     /// credits/debits. Uses only the store handle and config, so it needs no
     /// `Arc<Self>` and can run from a `&self` read.
+    ///
+    /// Redundant spawns are cheap, not suppressed here: the storage-based debounce
+    /// inside [`append_cache_point`] (keyed on the newest shared cache-point row,
+    /// with `debounce_ms == grace`) returns before the fold when a recent cache
+    /// point already exists, so a hot account read at high QPS does at most one
+    /// fold per grace window, coordinated across every instance rather than in
+    /// this process's memory.
     fn spawn_append(&self, account: AccountId, asset: AssetId) {
         let store = Arc::clone(&self.store);
         let grace = self.projection_grace_ms;
         let min_new = self.snapshot_interval;
         tokio::spawn(async move {
-            let _ = append_cache_point(store.as_ref(), grace, min_new, &account, &asset).await;
+            if let Err(err) =
+                append_cache_point(store.as_ref(), grace, min_new, grace, &account, &asset).await
+            {
+                // Best effort: a failed append only lengthens a later read's tail.
+                // Log it so a projection that silently stops advancing is visible.
+                tracing::warn!(?account, ?asset, error = %err, "balance projection append failed");
+            }
         });
     }
 
     /// Append a cache point for one `(account, asset)` now (folding up to
     /// `now − grace`), unconditionally. The read path appends lazily in the
-    /// background; this forces one, exposed for tests and reconciliation.
-    /// Idempotent and append-only.
+    /// background; this forces one (no debounce), exposed for tests and
+    /// reconciliation. Append-only: a repeat within the same grace-adjusted
+    /// millisecond is a no-op (the watermark is already covered), otherwise it
+    /// adds a fresh row.
     pub async fn append_cache_point(
         &self,
         account: &AccountId,
         asset: &AssetId,
     ) -> Result<(), LedgerError> {
-        append_cache_point(self.store(), self.projection_grace_ms, 0, account, asset).await
+        append_cache_point(self.store(), self.projection_grace_ms, 0, 0, account, asset).await
     }
 }
