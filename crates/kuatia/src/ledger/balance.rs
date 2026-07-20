@@ -21,9 +21,14 @@ pub struct SubAccountBalance {
 }
 
 impl Ledger {
-    /// Compute balance from the live (active or reserved) postings for an
-    /// account/asset pair.
-    pub(crate) async fn compute_balance(
+    /// The authoritative balance: the sum of the live (active or reserved)
+    /// postings for one `(account, asset)`, computed in Rust. This bypasses the
+    /// cached projection and always recomputes from the source of truth, so it is
+    /// what validation reads, what the projector folds into snapshots, and what
+    /// reconciliation checks against. Cost is `O(live postings)`; prefer
+    /// [`balance`](Ledger::balance) for the everyday read.
+    #[instrument(skip(self), name = "ledger.compute_balance")]
+    pub async fn compute_balance(
         &self,
         account: &AccountId,
         asset: &AssetId,
@@ -38,14 +43,6 @@ impl Ledger {
             )
             .await?;
         Ok(Cent::checked_sum(postings.iter().map(|p| p.value))?)
-    }
-
-    /// Query the current balance of one subaccount for a given asset. This reads
-    /// exactly the `account` passed (base id and subaccount) and never rolls up
-    /// other subaccounts.
-    #[instrument(skip(self), name = "ledger.balance")]
-    pub async fn balance(&self, account: &AccountId, asset: &AssetId) -> Result<Cent, LedgerError> {
-        self.compute_balance(account, asset).await
     }
 
     /// Report the per-subaccount balances of a base account for one asset.

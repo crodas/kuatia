@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 
 use kuatia_types::autoid::AutoId;
 use kuatia_types::{
-    Account, AccountId, AssetId, Book, BookId, EnvelopeId, Posting, PostingFilter, PostingId,
+    Account, AccountId, AssetId, Book, BookId, Cent, EnvelopeId, Posting, PostingFilter, PostingId,
     PostingState, ReservationId,
 };
 
@@ -16,8 +16,8 @@ use crate::error::StoreError;
 use crate::events::{EventStore, LedgerEvent};
 use crate::query::{filter_transfers, paginate};
 use crate::store::{
-    AccountStore, BookStore, EnvelopeRecord, Page, PostingStore, SagaStore, TransferQuery,
-    TransferStore,
+    AccountStore, BalanceProjection, BalanceProjectionStore, BookStore, EnvelopeRecord, Page,
+    PostingStore, SagaStore, TransferQuery, TransferStore,
 };
 
 /// Postings held as an immutable record table plus two index maps that carry
@@ -46,6 +46,8 @@ pub struct InMemoryStore {
     sagas: RwLock<HashMap<i64, Vec<u8>>>,
     events: RwLock<Vec<LedgerEvent>>,
     books: RwLock<HashMap<BookId, Book>>,
+    /// Append-only balance cache points keyed by `(account, asset)` (ADR-0019).
+    projections: RwLock<HashMap<(AccountId, AssetId), Vec<BalanceProjection>>>,
     autoid: AutoId,
 }
 
@@ -66,8 +68,54 @@ impl InMemoryStore {
             sagas: RwLock::new(HashMap::new()),
             events: RwLock::new(Vec::new()),
             books: RwLock::new(HashMap::new()),
+            projections: RwLock::new(HashMap::new()),
             autoid: AutoId::new(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BalanceProjectionStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl BalanceProjectionStore for InMemoryStore {
+    async fn append_balance_projection(
+        &self,
+        account: &AccountId,
+        asset: &AssetId,
+        balance: Cent,
+        watermark: i64,
+    ) -> Result<(), StoreError> {
+        let id = self.autoid.next();
+        let mut projections = self.projections.write().await;
+        projections
+            .entry((*account, *asset))
+            .or_default()
+            .push(BalanceProjection {
+                id,
+                account: *account,
+                asset: *asset,
+                balance,
+                watermark,
+            });
+        Ok(())
+    }
+
+    async fn get_closest_balance_projection(
+        &self,
+        account: &AccountId,
+        asset: &AssetId,
+        as_of: i64,
+    ) -> Result<Option<BalanceProjection>, StoreError> {
+        let projections = self.projections.read().await;
+        Ok(projections.get(&(*account, *asset)).and_then(|points| {
+            points
+                .iter()
+                .filter(|p| p.watermark <= as_of)
+                .max_by_key(|p| (p.watermark, p.id))
+                .cloned()
+        }))
     }
 }
 

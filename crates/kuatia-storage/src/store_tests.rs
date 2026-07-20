@@ -1207,6 +1207,89 @@ pub async fn list_books(store: &(impl Store + 'static)) {
 }
 
 // ---------------------------------------------------------------------------
+// BalanceProjectionStore tests
+// ---------------------------------------------------------------------------
+
+/// No cache point yet reads back as `None`.
+pub async fn balance_projection_absent_is_none(store: &(impl Store + 'static)) {
+    let got = store
+        .get_closest_balance_projection(&AccountId::new(1), &AssetId::new(1), i64::MAX)
+        .await
+        .unwrap();
+    assert!(got.is_none());
+}
+
+/// An appended cache point round-trips: value and watermark come back intact and
+/// carry a store-minted id.
+pub async fn balance_projection_append_and_get_closest(store: &(impl Store + 'static)) {
+    store
+        .append_balance_projection(&AccountId::new(1), &AssetId::new(1), Cent::from(1234), 500)
+        .await
+        .unwrap();
+    let got = store
+        .get_closest_balance_projection(&AccountId::new(1), &AssetId::new(1), i64::MAX)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.account, AccountId::new(1));
+    assert_eq!(got.asset, AssetId::new(1));
+    assert_eq!(got.balance, Cent::from(1234));
+    assert_eq!(got.watermark, 500);
+}
+
+/// Append-only cache points: `get_closest` returns the freshest one at or before
+/// `as_of` (largest watermark), never a cache point covering past `as_of`. Ids
+/// increase across appends.
+pub async fn balance_projection_closest_at_or_before_as_of(store: &(impl Store + 'static)) {
+    let acc = AccountId::new(1);
+    let asset = AssetId::new(1);
+    store
+        .append_balance_projection(&acc, &asset, Cent::from(100), 200)
+        .await
+        .unwrap();
+    let first = store
+        .get_closest_balance_projection(&acc, &asset, i64::MAX)
+        .await
+        .unwrap()
+        .unwrap();
+
+    store
+        .append_balance_projection(&acc, &asset, Cent::from(300), 400)
+        .await
+        .unwrap();
+
+    // As of a time at/after both, the freshest (watermark 400) is returned.
+    let latest = store
+        .get_closest_balance_projection(&acc, &asset, 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        latest.id > first.id,
+        "cache-point id must increase on append"
+    );
+    assert_eq!(latest.balance, Cent::from(300));
+    assert_eq!(latest.watermark, 400);
+
+    // As of a time between them, the watermark-400 point is excluded (it would
+    // cover transfers after as_of), so the watermark-200 point is returned.
+    let earlier = store
+        .get_closest_balance_projection(&acc, &asset, 300)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(earlier.balance, Cent::from(100));
+    assert_eq!(earlier.watermark, 200);
+
+    // As of before any cache point, none is returned.
+    let none = store
+        .get_closest_balance_projection(&acc, &asset, 100)
+        .await
+        .unwrap();
+    assert!(none.is_none());
+}
+
+// ---------------------------------------------------------------------------
 // Macro
 // ---------------------------------------------------------------------------
 
@@ -1278,6 +1361,10 @@ macro_rules! store_tests {
             create_duplicate_book_fails,
             get_missing_book_fails,
             list_books,
+            // BalanceProjectionStore
+            balance_projection_absent_is_none,
+            balance_projection_append_and_get_closest,
+            balance_projection_closest_at_or_before_as_of,
         );
     };
 

@@ -10,10 +10,11 @@
 //! - [`SagaStore`] — saga state for crash recovery
 //! - [`EventStore`] — the ledger event log
 //! - [`BookStore`] — book persistence
+//! - [`BalanceProjectionStore`] — the cached balance projection (ADR-0019)
 
 use async_trait::async_trait;
 use kuatia_types::{
-    Account, AccountId, AssetId, Book, BookId, Envelope, EnvelopeId, Posting, PostingFilter,
+    Account, AccountId, AssetId, Book, BookId, Cent, Envelope, EnvelopeId, Posting, PostingFilter,
     PostingId, PostingState, Receipt, ReservationId,
 };
 
@@ -242,17 +243,82 @@ pub trait BookStore: Send + Sync {
     async fn list_books(&self) -> Result<Vec<Book>, StoreError>;
 }
 
+/// One append-only cache point (ADR-0019): a balance snapshot for one
+/// `(account, asset)` and the commit-time watermark it covers, tagged with a
+/// monotonic `id`. Cache points are never updated; a read selects the highest
+/// `id`. A disposable, rebuildable accelerator, never the source of truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BalanceProjection {
+    /// Monotonic cache-point id (a store-minted snowflake). Higher means newer.
+    pub id: i64,
+    /// Account (base id plus subaccount) this cache point is for.
+    pub account: AccountId,
+    /// Asset this cache point is for.
+    pub asset: AssetId,
+    /// Cached balance: the sum of every committed transfer's delta for this
+    /// `(account, asset)` with commit time at or before `watermark`.
+    pub balance: Cent,
+    /// Commit-time cutoff (unix millis) the snapshot covers. A read folds in
+    /// committed transfers with a commit time strictly greater than this.
+    pub watermark: i64,
+}
+
+/// Append-only balance cache points (ADR-0019). A disposable, rebuildable read
+/// accelerator; the append-only postings stay the source of truth, and this is
+/// never consulted for the validate-time overdraft check. Cache points are only
+/// ever appended (never updated), and a read takes the one closest to (at or
+/// before) the target time, so concurrent appends need no lock.
+#[async_trait]
+pub trait BalanceProjectionStore: Send + Sync {
+    /// Append a new cache point for `(account, asset)`, minting a fresh monotonic
+    /// `id`. A dumb instruction: it inserts one row and never updates an existing
+    /// one.
+    async fn append_balance_projection(
+        &self,
+        account: &AccountId,
+        asset: &AssetId,
+        balance: Cent,
+        watermark: i64,
+    ) -> Result<(), StoreError>;
+
+    /// Fetch the cache point for `(account, asset)` closest to `as_of`: the one
+    /// with the largest `watermark` at or before `as_of` (tie-broken by highest
+    /// `id`). This is the freshest snapshot a read as of `as_of` may use without
+    /// covering transfers committed after `as_of`. Returns `None` if no cache
+    /// point is at or before `as_of`. The caller supplies `as_of` (the store has
+    /// no clock); the ledger passes the current time by default.
+    async fn get_closest_balance_projection(
+        &self,
+        account: &AccountId,
+        asset: &AssetId,
+        as_of: i64,
+    ) -> Result<Option<BalanceProjection>, StoreError>;
+}
+
 // ---------------------------------------------------------------------------
 // Composite trait
 // ---------------------------------------------------------------------------
 
 /// Async storage abstraction composing all sub-traits.
 pub trait Store:
-    AccountStore + PostingStore + TransferStore + SagaStore + EventStore + BookStore
+    AccountStore
+    + PostingStore
+    + TransferStore
+    + SagaStore
+    + EventStore
+    + BookStore
+    + BalanceProjectionStore
 {
 }
 
-impl<T: AccountStore + PostingStore + TransferStore + SagaStore + EventStore + BookStore> Store
-    for T
+impl<
+    T: AccountStore
+        + PostingStore
+        + TransferStore
+        + SagaStore
+        + EventStore
+        + BookStore
+        + BalanceProjectionStore,
+> Store for T
 {
 }
