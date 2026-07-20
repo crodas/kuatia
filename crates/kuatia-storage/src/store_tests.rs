@@ -928,6 +928,38 @@ pub async fn append_event_idempotent(store: &(impl Store + 'static)) {
     assert_eq!(store.get_events_since(0, 10).await.unwrap().len(), 1);
 }
 
+/// `append_event` is idempotent on a lifecycle transition's `(account, version)`
+/// key: re-appending the same `AccountFrozen` (the crash-recovery replay) returns
+/// the existing seq and does not duplicate the row, while the same account frozen
+/// at a *different* version is a distinct event.
+pub async fn append_event_transition_idempotent(store: &(impl Store + 'static)) {
+    let frozen_v2 = LedgerEvent {
+        seq: 0,
+        timestamp: 1000,
+        kind: LedgerEventKind::AccountFrozen {
+            account_id: AccountId::new(7),
+            version: 2,
+        },
+    };
+    let seq1 = store.append_event(&frozen_v2).await.unwrap();
+    let seq2 = store.append_event(&frozen_v2).await.unwrap();
+    assert_eq!(seq1, seq2, "same (account, version) collapses to one event");
+    assert_eq!(store.get_events_since(0, 10).await.unwrap().len(), 1);
+
+    // A later freeze of the same account (a new version bump) is not deduped away.
+    let frozen_v4 = LedgerEvent {
+        seq: 0,
+        timestamp: 2000,
+        kind: LedgerEventKind::AccountFrozen {
+            account_id: AccountId::new(7),
+            version: 4,
+        },
+    };
+    let seq3 = store.append_event(&frozen_v4).await.unwrap();
+    assert_ne!(seq3, seq1);
+    assert_eq!(store.get_events_since(0, 10).await.unwrap().len(), 2);
+}
+
 // ---------------------------------------------------------------------------
 // TransferStore tests
 // ---------------------------------------------------------------------------
@@ -1340,6 +1372,7 @@ macro_rules! store_tests {
             reserve_twice_second_zero,
             deactivate_twice_second_zero,
             append_event_idempotent,
+            append_event_transition_idempotent,
             // TransferStore
             commit_and_get_transfer,
             get_missing_transfer,

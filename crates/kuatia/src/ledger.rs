@@ -31,6 +31,7 @@ mod commit;
 mod lifecycle;
 mod projection;
 mod query;
+mod transition;
 
 pub use balance::SubAccountBalance;
 pub use commit::LoadedState;

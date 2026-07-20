@@ -1258,23 +1258,23 @@ impl EventStore for SqlStore {
         let data = serialize_json(event)?;
         let seq = self.autoid.next() as u64;
 
-        // Idempotent on the dedup key: a replayed transfer event conflicts on
-        // `dedup_key` and returns the existing seq instead of a duplicate row.
+        // Idempotent on the dedup key: a replayed transfer or lifecycle-transition
+        // event conflicts on `dedup_key` and returns the existing seq instead of a
+        // duplicate row.
         match kuatia_storage::events::event_dedup_key(&event.kind) {
-            Some(eid) => {
-                let dedup_hex = envelope_id_to_hex(&eid);
+            Some(dedup_key) => {
                 let res = sqlx::query("INSERT INTO events (seq, timestamp, kind, data, dedup_key) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (dedup_key) DO NOTHING")
                     .bind(seq as i64)
                     .bind(event.timestamp)
                     .bind(&kind_str)
                     .bind(&data)
-                    .bind(&dedup_hex)
+                    .bind(&dedup_key)
                     .execute(&self.pool)
                     .await
                     .map_err(|e| StoreError::Internal(e.to_string()))?;
                 if res.rows_affected() == 0 {
                     let row = sqlx::query("SELECT seq FROM events WHERE dedup_key = $1")
-                        .bind(&dedup_hex)
+                        .bind(&dedup_key)
                         .fetch_one(&self.pool)
                         .await
                         .map_err(|e| StoreError::Internal(e.to_string()))?;

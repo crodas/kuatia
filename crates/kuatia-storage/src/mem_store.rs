@@ -463,12 +463,12 @@ impl SagaStore for InMemoryStore {
 impl EventStore for InMemoryStore {
     async fn append_event(&self, event: &LedgerEvent) -> Result<u64, StoreError> {
         let mut events = self.events.write().await;
-        // Idempotent on the dedup key: a replayed transfer event returns the
-        // existing seq instead of inserting a duplicate.
+        // Idempotent on the dedup key: a replayed transfer or lifecycle-transition
+        // event returns the existing seq instead of inserting a duplicate.
         if let Some(key) = crate::events::event_dedup_key(&event.kind)
             && let Some(existing) = events
                 .iter()
-                .find(|e| crate::events::event_dedup_key(&e.kind) == Some(key))
+                .find(|e| crate::events::event_dedup_key(&e.kind).as_deref() == Some(key.as_str()))
         {
             return Ok(existing.seq);
         }

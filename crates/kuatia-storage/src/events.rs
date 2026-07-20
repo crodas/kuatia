@@ -24,16 +24,28 @@ pub enum LedgerEventKind {
     AccountFrozen {
         /// The id of the frozen account.
         account_id: AccountId,
+        /// The account version this transition produced. Pins the event to one
+        /// version bump so a recovered transition re-appends idempotently.
+        #[serde(default)]
+        version: u64,
     },
     /// An account was unfrozen.
     AccountUnfrozen {
         /// The id of the unfrozen account.
         account_id: AccountId,
+        /// The account version this transition produced. Pins the event to one
+        /// version bump so a recovered transition re-appends idempotently.
+        #[serde(default)]
+        version: u64,
     },
     /// An account was closed.
     AccountClosed {
         /// The id of the closed account.
         account_id: AccountId,
+        /// The account version this transition produced. Pins the event to one
+        /// version bump so a recovered transition re-appends idempotently.
+        #[serde(default)]
+        version: u64,
     },
 }
 
@@ -49,17 +61,49 @@ pub struct LedgerEvent {
 }
 
 /// The idempotency key for an event, if it has a natural one. Replayable events
-/// (a committed transfer, re-driven by saga recovery) dedup on their transfer
-/// id; events with no natural identity (account lifecycle) return `None` and may
-/// recur.
-pub fn event_dedup_key(kind: &LedgerEventKind) -> Option<EnvelopeId> {
+/// (re-appended by crash recovery) carry a key so a second append collapses to
+/// the existing row instead of duplicating.
+///
+/// - A committed transfer keys on its content-addressed id (hex).
+/// - An account lifecycle *transition* (freeze/unfreeze/close) keys on the
+///   `(account, version)` it records: each version bump happens exactly once, so
+///   the pair is a stable identity that recovery reproduces verbatim.
+/// - `AccountCreated` has no version-transition identity and is not re-driven, so
+///   it returns `None` and may recur.
+///
+/// Keys are strings so both identities share the store's single `dedup_key`
+/// column; the transfer form is the same lowercase hex the column already holds,
+/// so no existing row changes meaning.
+pub fn event_dedup_key(kind: &LedgerEventKind) -> Option<String> {
     match kind {
-        LedgerEventKind::TransferCommitted { transfer_id } => Some(*transfer_id),
-        LedgerEventKind::AccountCreated { .. }
-        | LedgerEventKind::AccountFrozen { .. }
-        | LedgerEventKind::AccountUnfrozen { .. }
-        | LedgerEventKind::AccountClosed { .. } => None,
+        LedgerEventKind::TransferCommitted { transfer_id } => Some(hex(&transfer_id.0)),
+        LedgerEventKind::AccountFrozen {
+            account_id,
+            version,
+        }
+        | LedgerEventKind::AccountUnfrozen {
+            account_id,
+            version,
+        }
+        | LedgerEventKind::AccountClosed {
+            account_id,
+            version,
+        } => Some(format!(
+            "acct:{}:{}:{}",
+            account_id.id, account_id.sub, version
+        )),
+        LedgerEventKind::AccountCreated { .. } => None,
     }
+}
+
+/// Lower-case hex, matching the SQL backend's `dedup_key` encoding for transfer
+/// events so the key a recovered append produces equals the stored one.
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// Persistent event log for ledger events.
