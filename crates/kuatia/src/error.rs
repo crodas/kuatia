@@ -4,8 +4,8 @@
 //! and from storage, so callers get a single error type from every API.
 
 use kuatia_core::{
-    AccountId, AssetId, BookId, EnvelopeId, OverflowError, PostingId, ResolveError, SelectionError,
-    ValidationError,
+    AccountId, AssetId, BookId, EnvelopeId, InsufficientFunds, OverflowError, PostingId,
+    ResolveError, ValidationError,
 };
 use kuatia_storage::error::StoreError;
 
@@ -24,7 +24,7 @@ pub enum LedgerError {
     /// Storage operation failed.
     Store(StoreError),
     /// Posting selection failed (e.g. insufficient funds).
-    Selection(SelectionError),
+    Selection(InsufficientFunds),
     /// The referenced transfer does not exist.
     TransferNotFound(EnvelopeId),
     /// The posting cannot be reversed (e.g. already consumed).
@@ -125,12 +125,6 @@ impl From<ValidationError> for LedgerError {
 impl From<StoreError> for LedgerError {
     fn from(e: StoreError) -> Self {
         LedgerError::Store(e)
-    }
-}
-
-impl From<SelectionError> for LedgerError {
-    fn from(e: SelectionError) -> Self {
-        LedgerError::Selection(e)
     }
 }
 

@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use kuatia_core::{
-    Account, AccountFlags, AccountId, AssetId, BookId, Cent, EnvelopeId, Metadata, Receipt,
-    SelectionError, Transfer, TransferBuilder, hash::double_sha256,
+    Account, AccountFlags, AccountId, AssetId, BookId, Cent, EnvelopeId, InsufficientFunds,
+    Metadata, Receipt, Transfer, TransferBuilder, hash::double_sha256,
 };
 use kuatia_storage::error::StoreError;
 use kuatia_storage::store::EnvelopeRecord;
@@ -318,7 +318,7 @@ impl Ledger {
                 })?;
             let held = self.balance(&leg.hold, &m.asset).await?;
             if m.amount > held {
-                return Err(LedgerError::Selection(SelectionError::InsufficientFunds {
+                return Err(LedgerError::Selection(InsufficientFunds {
                     available: held,
                     requested: m.amount,
                 }));

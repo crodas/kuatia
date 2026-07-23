@@ -6,7 +6,6 @@
 
 pub mod hash;
 pub mod posting_resolution;
-pub mod posting_selection;
 pub mod validate;
 
 pub use kuatia_types::*;
@@ -16,7 +15,7 @@ pub use hash::{
     double_sha256, envelope_id,
 };
 pub use posting_resolution::{
-    Debit, MovementDraft, ResolveError, ResolveInput, draft_movements, resolve_envelope,
+    Debit, InsufficientFunds, MovementDraft, ResolveError, ResolveInput, draft_movements,
+    resolve_envelope,
 };
-pub use posting_selection::SelectionError;
 pub use validate::{Plan, PlanInput, ValidationError, validate_and_plan};

@@ -15,7 +15,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::posting_selection::SelectionError;
 use kuatia_types::{
     AccountId, AssetId, Cent, Envelope, EnvelopeBuilder, NewPosting, OverflowError, Posting,
     PostingId, Transfer,
@@ -25,12 +24,38 @@ use kuatia_types::{
 // Errors
 // ---------------------------------------------------------------------------
 
+/// Available postings do not cover a requested amount.
+///
+/// When a caller uses `pay` or `withdraw` they specify an amount, not which
+/// postings to consume. Selection picks the postings; when a non-overdraft
+/// account cannot cover the amount it fails with this. Selection has this one
+/// failure mode, so it is a struct, not an enum; overflow is reported separately
+/// by [`ResolveError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsufficientFunds {
+    /// Total value of eligible postings.
+    pub available: Cent,
+    /// Amount the caller asked for.
+    pub requested: Cent,
+}
+
+impl std::fmt::Display for InsufficientFunds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "insufficient funds: available {}, requested {}",
+            self.available, self.requested
+        )
+    }
+}
+
+impl std::error::Error for InsufficientFunds {}
+
 /// Failure from resolution pass 2 ([`resolve_envelope`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
-    /// Posting selection failed: insufficient funds for a non-overdraft account,
-    /// or an overflow while summing candidate postings.
-    Selection(SelectionError),
+    /// Posting selection failed: insufficient funds for a non-overdraft account.
+    Selection(InsufficientFunds),
     /// Monetary arithmetic overflowed while computing change or a shortfall.
     Overflow,
 }
@@ -50,12 +75,6 @@ impl std::error::Error for ResolveError {
             Self::Selection(e) => Some(e),
             Self::Overflow => None,
         }
-    }
-}
-
-impl From<SelectionError> for ResolveError {
-    fn from(e: SelectionError) -> Self {
-        Self::Selection(e)
     }
 }
 
@@ -144,7 +163,7 @@ pub struct ResolveInput<'a> {
     /// Accounts that permit overdraft (i.e. that do *not* carry
     /// `DEBIT_MUST_NOT_EXCEED_CREDIT`). A debit short of positive postings gets a
     /// negative offset posting only if its account is in this set; otherwise it
-    /// fails with [`SelectionError::InsufficientFunds`]. A missing account is
+    /// fails with [`InsufficientFunds`]. A missing account is
     /// treated as forbidding overdraft, so an unknown account never gets an
     /// offset position on unknown terms.
     pub overdraft_allowed: &'a HashSet<AccountId>,
@@ -225,7 +244,7 @@ pub fn resolve_envelope(input: ResolveInput<'_>) -> Result<Envelope, ResolveErro
                     payer: None,
                 });
             } else {
-                return Err(ResolveError::Selection(SelectionError::InsufficientFunds {
+                return Err(ResolveError::Selection(InsufficientFunds {
                     available: total_positive,
                     requested: debit.amount,
                 }));
@@ -397,7 +416,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            ResolveError::Selection(SelectionError::InsufficientFunds {
+            ResolveError::Selection(InsufficientFunds {
                 available: Cent::from(40),
                 requested: Cent::from(100),
             })
@@ -419,7 +438,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            ResolveError::Selection(SelectionError::InsufficientFunds {
+            ResolveError::Selection(InsufficientFunds {
                 available: Cent::ZERO,
                 requested: Cent::from(100),
             })

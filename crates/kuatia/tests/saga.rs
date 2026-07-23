@@ -140,10 +140,7 @@ async fn saga_compensation_on_failure() {
             // the overspend surfaces as `Selection(InsufficientFunds)` rather
             // than a stringified `Store(Internal)`.
             assert!(
-                matches!(
-                    err,
-                    LedgerError::Selection(SelectionError::InsufficientFunds { .. })
-                ),
+                matches!(err, LedgerError::Selection(InsufficientFunds { .. })),
                 "expected typed InsufficientFunds, got {err:?}"
             );
             // The deposit should have been compensated (reversed)
