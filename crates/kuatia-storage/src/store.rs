@@ -88,10 +88,19 @@ pub trait AccountStore: Send + Sync {
     async fn get_account(&self, id: &AccountId) -> Result<Account, StoreError>;
     /// Fetch multiple accounts by id.
     async fn get_accounts(&self, ids: &[AccountId]) -> Result<Vec<Account>, StoreError>;
-    /// Persist a new account (version 1).
-    async fn create_account(&self, account: Account) -> Result<(), StoreError>;
-    /// Append a new version to an existing account.
-    async fn append_account_version(&self, account: Account) -> Result<(), StoreError>;
+    /// Persist a new account (version 1). A dumb instruction: insert the account
+    /// if absent and return the **number of accounts created** — **1** if this id
+    /// was newly created, **0** if an account with this id already existed. The
+    /// caller decides what `0` means.
+    async fn create_account(&self, account: Account) -> Result<u64, StoreError>;
+    /// Append a new version to an existing account. A dumb instruction with a
+    /// guarded write: the version lands only when it is exactly one past the
+    /// current head (`version == current + 1`) and not already present, which
+    /// keeps the version chain gap-free and single-winner under contention.
+    /// Returns the **number of versions appended** — **1** if it landed, **0**
+    /// otherwise (no such account, a gap/stale append, or an already-applied
+    /// replay). The caller reads state to disambiguate a `0`.
+    async fn append_account_version(&self, account: Account) -> Result<u64, StoreError>;
     /// Return the full version history for an account.
     async fn get_account_history(&self, id: &AccountId) -> Result<Vec<Account>, StoreError>;
     /// List all accounts (latest version of each).
@@ -235,8 +244,10 @@ pub trait SagaStore: Send + Sync {
 /// Book persistence.
 #[async_trait]
 pub trait BookStore: Send + Sync {
-    /// Create a new book.
-    async fn create_book(&self, book: Book) -> Result<(), StoreError>;
+    /// Create a new book. A dumb instruction: insert the book if absent and
+    /// return the **number of books created** — **1** if newly created, **0** if
+    /// a book with this id already existed. The caller decides what `0` means.
+    async fn create_book(&self, book: Book) -> Result<u64, StoreError>;
     /// Fetch a book by id.
     async fn get_book(&self, id: &BookId) -> Result<Book, StoreError>;
     /// List all books.

@@ -361,7 +361,7 @@ impl AccountStore for SqlStore {
         Ok(result)
     }
 
-    async fn create_account(&self, account: Account) -> Result<(), StoreError> {
+    async fn create_account(&self, account: Account) -> Result<u64, StoreError> {
         // Pessimistic locking: inside one transaction, lock the account's head
         // row with `SELECT ... FOR UPDATE` so a concurrent creator waits. The
         // head is the single row per account; its `ON CONFLICT (id, subaccount)
@@ -384,10 +384,7 @@ impl AccountStore for SqlStore {
         .await
         .map_err(|e| StoreError::Internal(e.to_string()))?;
         if existing.is_some() {
-            return Err(StoreError::AlreadyExists(format!(
-                "account {:?}",
-                account.id
-            )));
+            return Ok(0);
         }
 
         // Append the immutable first version, then point the head at it.
@@ -414,19 +411,16 @@ impl AccountStore for SqlStore {
         .await
         .map_err(|e| StoreError::Internal(e.to_string()))?;
         if res.rows_affected() == 0 {
-            return Err(StoreError::AlreadyExists(format!(
-                "account {:?}",
-                account.id
-            )));
+            return Ok(0);
         }
 
         tx.commit()
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
-        Ok(())
+        Ok(1)
     }
 
-    async fn append_account_version(&self, account: Account) -> Result<(), StoreError> {
+    async fn append_account_version(&self, account: Account) -> Result<u64, StoreError> {
         // Pessimistic locking: inside one transaction, lock the account's head
         // row with `SELECT ... FOR UPDATE` so a concurrent appender waits here
         // until we commit, then check the version, append the new immutable row,
@@ -441,6 +435,10 @@ impl AccountStore for SqlStore {
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
 
+        // A guarded write: no such account, or a version that is not exactly one
+        // past the head, matches nothing and reports 0. This is what keeps the
+        // chain gap-free (a stale or skipped version never lands) and makes a
+        // replay of an already-applied version a no-op.
         let current = sqlx::query(&format!(
             "SELECT version FROM account_head WHERE id = $1 AND subaccount = $2{lock}"
         ))
@@ -448,8 +446,10 @@ impl AccountStore for SqlStore {
         .bind(account.id.sub)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?
-        .ok_or_else(|| StoreError::NotFound(format!("account {:?}", account.id)))?;
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let Some(current) = current else {
+            return Ok(0);
+        };
 
         let current_version: i64 = current
             .try_get("version")
@@ -459,11 +459,7 @@ impl AccountStore for SqlStore {
             .ok_or_else(|| StoreError::Internal("account version overflow".to_string()))?;
 
         if account.version as i64 != expected {
-            return Err(StoreError::VersionConflict {
-                account: account.id,
-                expected: expected as u64,
-                actual: account.version,
-            });
+            return Ok(0);
         }
 
         let res = sqlx::query(
@@ -479,11 +475,7 @@ impl AccountStore for SqlStore {
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         if res.rows_affected() == 0 {
-            return Err(StoreError::VersionConflict {
-                account: account.id,
-                expected: expected as u64,
-                actual: account.version,
-            });
+            return Ok(0);
         }
 
         // Move the head to the new version (delete + insert, never update).
@@ -504,7 +496,7 @@ impl AccountStore for SqlStore {
         tx.commit()
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
-        Ok(())
+        Ok(1)
     }
 
     async fn get_account_history(&self, id: &AccountId) -> Result<Vec<Account>, StoreError> {
@@ -1335,7 +1327,7 @@ impl EventStore for SqlStore {
 
 #[async_trait]
 impl BookStore for SqlStore {
-    async fn create_book(&self, book: Book) -> Result<(), StoreError> {
+    async fn create_book(&self, book: Book) -> Result<u64, StoreError> {
         // Pessimistic locking, same shape as create_account: lock any existing
         // book row with `SELECT ... FOR UPDATE` inside the transaction, then
         // insert with `ON CONFLICT DO NOTHING` as the portable backstop.
@@ -1353,7 +1345,7 @@ impl BookStore for SqlStore {
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         if existing.is_some() {
-            return Err(StoreError::AlreadyExists(format!("book {:?}", book.id)));
+            return Ok(0);
         }
 
         let res = sqlx::query(
@@ -1366,13 +1358,13 @@ impl BookStore for SqlStore {
         .await
         .map_err(|e| StoreError::Internal(e.to_string()))?;
         if res.rows_affected() == 0 {
-            return Err(StoreError::AlreadyExists(format!("book {:?}", book.id)));
+            return Ok(0);
         }
 
         tx.commit()
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
-        Ok(())
+        Ok(1)
     }
 
     async fn get_book(&self, id: &BookId) -> Result<Book, StoreError> {

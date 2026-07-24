@@ -148,35 +148,35 @@ impl AccountStore for InMemoryStore {
         Ok(result)
     }
 
-    async fn create_account(&self, account: Account) -> Result<(), StoreError> {
+    async fn create_account(&self, account: Account) -> Result<u64, StoreError> {
         let id = account.id;
         let mut accounts = self.accounts.write().await;
         if accounts.contains_key(&id) {
-            return Err(StoreError::AlreadyExists(format!("account {id:?}")));
+            return Ok(0);
         }
         accounts.insert(id, vec![account]);
-        Ok(())
+        Ok(1)
     }
 
-    async fn append_account_version(&self, account: Account) -> Result<(), StoreError> {
+    async fn append_account_version(&self, account: Account) -> Result<u64, StoreError> {
         let id = account.id;
         let mut accounts = self.accounts.write().await;
-        let versions = accounts
-            .get_mut(&id)
-            .ok_or_else(|| StoreError::NotFound(format!("account {id:?}")))?;
+        // A guarded write: no such account, or a version that is not exactly one
+        // past the head, matches nothing and reports 0. This is what keeps the
+        // chain gap-free (a stale or skipped version never lands) and makes a
+        // replay of an already-applied version a no-op.
+        let Some(versions) = accounts.get_mut(&id) else {
+            return Ok(0);
+        };
         let current_version = versions.last().map(|a| a.version).unwrap_or(0);
         let expected = current_version
             .checked_add(1)
             .ok_or_else(|| StoreError::Internal("account version overflow".to_string()))?;
         if account.version != expected {
-            return Err(StoreError::VersionConflict {
-                account: account.id,
-                expected,
-                actual: account.version,
-            });
+            return Ok(0);
         }
         versions.push(account);
-        Ok(())
+        Ok(1)
     }
 
     async fn get_account_history(&self, id: &AccountId) -> Result<Vec<Account>, StoreError> {
@@ -498,13 +498,13 @@ impl EventStore for InMemoryStore {
 
 #[async_trait]
 impl BookStore for InMemoryStore {
-    async fn create_book(&self, book: Book) -> Result<(), StoreError> {
+    async fn create_book(&self, book: Book) -> Result<u64, StoreError> {
         let mut books = self.books.write().await;
         if books.contains_key(&book.id) {
-            return Err(StoreError::AlreadyExists(format!("book {:?}", book.id)));
+            return Ok(0);
         }
         books.insert(book.id, book);
-        Ok(())
+        Ok(1)
     }
 
     async fn get_book(&self, id: &BookId) -> Result<Book, StoreError> {

@@ -21,7 +21,9 @@ impl Ledger {
     /// Create a new account and emit an AccountCreated event.
     pub async fn create_account(&self, account: kuatia_core::Account) -> Result<(), LedgerError> {
         let id = account.id;
-        self.store.create_account(account).await?;
+        if self.store.create_account(account).await? == 0 {
+            return Err(LedgerError::AccountAlreadyExists(id));
+        }
         self.store
             .append_event(&LedgerEvent {
                 seq: 0,

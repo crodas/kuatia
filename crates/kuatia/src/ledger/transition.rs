@@ -54,7 +54,16 @@ impl Ledger {
         // the event append is then repaired by recover(), not left dangling.
         let saga_id = self.save_transition(&next, &event).await?;
 
-        self.store.append_account_version(next).await?;
+        let expected = next.version;
+        if self.store.append_account_version(next).await? == 0 {
+            // A concurrent transition moved the head; the guarded append matched
+            // nothing. Surface the conflict; the write-ahead record is repaired
+            // (or cleared) by recover() on the next startup.
+            return Err(LedgerError::AccountVersionConflict {
+                account: *id,
+                expected,
+            });
+        }
         self.store
             .append_event(&LedgerEvent {
                 seq: 0,

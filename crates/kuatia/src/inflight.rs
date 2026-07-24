@@ -214,7 +214,7 @@ impl Ledger {
             acct.metadata = meta_map(&InflightMeta::Hold { destination: *dest })?;
             match self.create_account(acct).await {
                 Ok(()) => {}
-                Err(LedgerError::Store(StoreError::AlreadyExists(_))) => {
+                Err(LedgerError::AccountAlreadyExists(_)) => {
                     return Err(LedgerError::InflightAlreadyOpen(*hold));
                 }
                 Err(e) => return Err(e),

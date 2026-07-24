@@ -35,8 +35,21 @@ pub enum LedgerError {
     AccountNotEmpty(AccountId),
     /// The account is already closed.
     AccountAlreadyClosed(AccountId),
+    /// An account with this id already exists.
+    AccountAlreadyExists(AccountId),
+    /// An account-version append did not land: the head was not at
+    /// `expected - 1` when the append was attempted (a concurrent transition
+    /// moved it). Carries the version this attempt targeted.
+    AccountVersionConflict {
+        /// Account whose version append was rejected.
+        account: AccountId,
+        /// Version this attempt targeted (`current + 1` at read time).
+        expected: u64,
+    },
     /// A transfer named a book that does not exist.
     BookNotFound(BookId),
+    /// A book with this id already exists.
+    BookAlreadyExists(BookId),
     /// The referenced inflight transaction does not exist (no authorize record).
     InflightNotFound(EnvelopeId),
     /// The referenced transfer is not an inflight authorize, or its metadata is
@@ -76,7 +89,13 @@ impl std::fmt::Display for LedgerError {
             Self::AccountNotFound(id) => write!(f, "account not found: {id:?}"),
             Self::AccountNotEmpty(id) => write!(f, "account not empty: {id:?}"),
             Self::AccountAlreadyClosed(id) => write!(f, "account already closed: {id:?}"),
+            Self::AccountAlreadyExists(id) => write!(f, "account already exists: {id:?}"),
+            Self::AccountVersionConflict { account, expected } => write!(
+                f,
+                "account version conflict for {account:?}: could not append version {expected}"
+            ),
             Self::BookNotFound(id) => write!(f, "book not found: {id:?}"),
+            Self::BookAlreadyExists(id) => write!(f, "book already exists: {id:?}"),
             Self::InflightNotFound(id) => write!(f, "inflight transaction not found: {id:?}"),
             Self::NotInflightTransaction(id) => {
                 write!(f, "not an inflight authorize transaction: {id:?}")

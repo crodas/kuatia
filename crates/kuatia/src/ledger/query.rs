@@ -85,7 +85,11 @@ impl Ledger {
 
     /// Create a new book.
     pub async fn create_book(&self, book: kuatia_core::Book) -> Result<(), LedgerError> {
-        Ok(self.store.create_book(book).await?)
+        let id = book.id;
+        if self.store.create_book(book).await? == 0 {
+            return Err(LedgerError::BookAlreadyExists(id));
+        }
+        Ok(())
     }
 
     /// Fetch a book by id.

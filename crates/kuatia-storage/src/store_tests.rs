@@ -173,7 +173,7 @@ async fn commit_envelope(
 /// Create an account and retrieve it.
 pub async fn create_and_get_account(store: &(impl Store + 'static)) {
     let acc = make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
-    store.create_account(acc.clone()).await.unwrap();
+    assert_eq!(store.create_account(acc.clone()).await.unwrap(), 1);
     let got = store.get_account(&AccountId::new(1)).await.unwrap();
     assert_eq!(got.id, acc.id);
     assert_eq!(got.version, 1);
@@ -181,12 +181,11 @@ pub async fn create_and_get_account(store: &(impl Store + 'static)) {
     assert_eq!(got.flags, acc.flags);
 }
 
-/// Duplicate account creation fails.
-pub async fn create_duplicate_account_fails(store: &(impl Store + 'static)) {
+/// Duplicate account creation lands nothing and reports 0.
+pub async fn create_duplicate_account_reports_zero(store: &(impl Store + 'static)) {
     let acc = make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
-    store.create_account(acc.clone()).await.unwrap();
-    let err = store.create_account(acc).await.unwrap_err();
-    assert!(matches!(err, StoreError::AlreadyExists(_)));
+    assert_eq!(store.create_account(acc.clone()).await.unwrap(), 1);
+    assert_eq!(store.create_account(acc).await.unwrap(), 0);
 }
 
 /// Get non-existent account returns NotFound.
@@ -227,15 +226,20 @@ pub async fn append_account_version(store: &(impl Store + 'static)) {
     assert!(got.is_frozen());
 }
 
-/// Appending with wrong version number fails.
-pub async fn append_version_conflict(store: &(impl Store + 'static)) {
+/// Appending a version that would leave a gap (not `current + 1`) lands nothing
+/// and reports 0, keeping the chain contiguous.
+pub async fn append_version_gap_reports_zero(store: &(impl Store + 'static)) {
     let acc = make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT);
     store.create_account(acc.clone()).await.unwrap();
 
     let mut bad = acc.clone();
     bad.version = 5;
-    let err = store.append_account_version(bad).await.unwrap_err();
-    assert!(matches!(err, StoreError::VersionConflict { .. }));
+    assert_eq!(store.append_account_version(bad).await.unwrap(), 0);
+
+    // The head is untouched: still the sole version 1.
+    let history = store.get_account_history(&AccountId::new(1)).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].version, 1);
 }
 
 /// Re-appending an already-taken version is rejected and leaves the history
@@ -250,13 +254,12 @@ pub async fn append_duplicate_version_rejected(store: &(impl Store + 'static)) {
     v2.flags = AccountFlags::FROZEN;
     store.append_account_version(v2).await.unwrap();
 
-    // A second append that also targets version 2 (now the current max) must be
-    // rejected rather than duplicating or overwriting it.
+    // A second append that also targets version 2 (now the current max) lands
+    // nothing (reports 0) rather than duplicating or overwriting it.
     let mut v2_again = acc.clone();
     v2_again.version = 2;
     v2_again.flags = AccountFlags::CLOSED;
-    let err = store.append_account_version(v2_again).await.unwrap_err();
-    assert!(matches!(err, StoreError::VersionConflict { .. }));
+    assert_eq!(store.append_account_version(v2_again).await.unwrap(), 0);
 
     // Exactly one row at version 2, and it is the first (frozen) write.
     let history = store.get_account_history(&AccountId::new(1)).await.unwrap();
@@ -1213,12 +1216,11 @@ pub async fn create_and_get_book(store: &(impl Store + 'static)) {
     assert_eq!(got, book);
 }
 
-/// Duplicate book creation fails.
-pub async fn create_duplicate_book_fails(store: &(impl Store + 'static)) {
+/// Duplicate book creation lands nothing and reports 0.
+pub async fn create_duplicate_book_reports_zero(store: &(impl Store + 'static)) {
     let book = make_book(1, "sales");
-    store.create_book(book.clone()).await.unwrap();
-    let err = store.create_book(book).await.unwrap_err();
-    assert!(matches!(err, StoreError::AlreadyExists(_)));
+    assert_eq!(store.create_book(book.clone()).await.unwrap(), 1);
+    assert_eq!(store.create_book(book).await.unwrap(), 0);
 }
 
 /// Get a non-existent book returns NotFound.
@@ -1339,11 +1341,11 @@ macro_rules! store_tests {
         $crate::store_tests!(@tests $factory,
             // AccountStore
             create_and_get_account,
-            create_duplicate_account_fails,
+            create_duplicate_account_reports_zero,
             get_missing_account_fails,
             get_accounts_batch,
             append_account_version,
-            append_version_conflict,
+            append_version_gap_reports_zero,
             append_duplicate_version_rejected,
             get_account_history,
             list_accounts,
@@ -1391,7 +1393,7 @@ macro_rules! store_tests {
             events_sequence_ordering,
             // BookStore
             create_and_get_book,
-            create_duplicate_book_fails,
+            create_duplicate_book_reports_zero,
             get_missing_book_fails,
             list_books,
             // BalanceProjectionStore
