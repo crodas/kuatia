@@ -35,7 +35,7 @@ pub use canonical::{
 /// An account is a base `id` plus a `subaccount`. `sub = 0` is the main account
 /// (the default when subaccounts are not used); a non-zero `sub` is a
 /// subaccount of the same base id. Each `(id, sub)` is a full account record
-/// with its own policy and lifecycle. See ADR-0012 and ADR-0015.
+/// with its own flags and lifecycle. See ADR-0012 and ADR-0015.
 ///
 /// Both legs are stored as `i64` (they hash and persist as full `i64`), but the
 /// IBAN-style string form ([`Display`](fmt::Display) / [`FromStr`](std::str::FromStr))
@@ -356,7 +356,7 @@ pub enum PostingFilter {
     Active,
     /// Reserved (in-flight) postings only.
     Reserved,
-    /// Active or reserved — the balance-bearing set (the old "not Inactive").
+    /// Active or reserved: the balance-bearing set (everything not yet Spent).
     Live,
     /// Every posting ever created, including spent ones.
     All,
@@ -391,7 +391,8 @@ pub enum PostingState {
 ///
 /// A positive posting is value controlled by the account; a negative posting is
 /// an offset position (issuance, external flow, overdraft, or system balancing).
-/// Negative postings are allowed on every policy except `NoOverdraft`.
+/// Negative postings are allowed on any account except one that forbids
+/// overdraft (carries [`AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT`]).
 ///
 /// A `Posting` is an immutable record: once created it is never updated. Its
 /// lifecycle state is not a field here; it is derived from index-table

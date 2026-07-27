@@ -2,9 +2,9 @@
 //! later.
 //!
 //! An inflight transaction is an ordinary trade whose every destination is
-//! rewritten to a per-destination holding subaccount (`NoOverdraft`, flagged
-//! [`AccountFlags::INFLIGHT`], keyed by a subaccount derived from the trade).
-//! Committing that rewritten transfer parks the
+//! rewritten to a per-destination holding subaccount (flagged
+//! [`AccountFlags::INFLIGHT`] and forbidding overdraft, keyed by a subaccount
+//! derived from the trade). Committing that rewritten transfer parks the
 //! funds. Confirm and void are ordinary commits that move a hold's balance to
 //! its destination or back to its funder. Nothing new is stored: the authorize
 //! transfer's metadata carries the leg table, and every artifact is tagged with
@@ -294,8 +294,8 @@ impl Ledger {
     ///
     /// Each movement delivers `amount` of `asset` from the matching leg's hold to
     /// its destination. `amount` must not exceed the amount still held; the
-    /// `NoOverdraft` hold makes over-confirmation impossible regardless. A hold is
-    /// closed once fully drained.
+    /// overdraft-forbidding hold makes over-confirmation impossible regardless. A
+    /// hold is closed once fully drained.
     ///
     /// Movements settle in order, each its own commit, so the batch is not atomic:
     /// a later movement failing leaves earlier confirmations applied.

@@ -1,8 +1,8 @@
 //! Pure, sync validation — the auditable heart of the ledger.
 //!
 //! [`validate_and_plan`] enforces every invariant (conservation, double-spend,
-//! ownership, overdraft) and produces a [`Plan`] describing the effects to
-//! apply. It takes no IO, no clock, and no randomness, so it is deterministic
+//! account state, overdraft, book policy) and produces a [`Plan`] describing the
+//! effects to apply. It takes no IO, no clock, and no randomness, so it is deterministic
 //! and testable with golden vectors. The caller provides pre-loaded state via
 //! [`PlanInput`]; this module never touches storage.
 
@@ -39,7 +39,7 @@ pub struct PlanInput<'a> {
 pub struct Plan {
     /// Content-addressed id of the validated transfer.
     pub transfer_id: EnvelopeId,
-    /// Postings to mark as inactive (consumed).
+    /// Postings the consumer must spend (mark `Spent`).
     pub postings_to_deactivate: Vec<PostingId>,
     /// New postings to persist.
     pub postings_to_create: Vec<Posting>,

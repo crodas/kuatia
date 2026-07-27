@@ -90,10 +90,10 @@ struct LoadedState {
 
 impl Ledger {
     // -----------------------------------------------------------------------
-    // Three-piece API: load -> plan -> apply
+    // Validation phases: load (read state) -> plan (pure validate)
     // -----------------------------------------------------------------------
 
-    /// Phase 1: load all state needed for validation.
+    /// Load all state needed for validation.
     #[instrument(skip(self, envelope), name = "ledger.load")]
     async fn load(&self, envelope: &Envelope) -> Result<LoadedState, LedgerError> {
         let consumed_postings = if envelope.consumes().is_empty() {
@@ -146,7 +146,7 @@ impl Ledger {
         })
     }
 
-    /// Phase 2: run pure validation and produce a plan.
+    /// Run pure validation over the loaded state and produce a plan.
     fn plan(
         &self,
         envelope: &Envelope,

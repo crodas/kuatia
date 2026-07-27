@@ -767,7 +767,7 @@ pub async fn spent_posting_remains_in_immutable_table(store: &(impl Store + 'sta
 }
 
 /// The `Live` filter returns active and reserved postings but excludes spent
-/// ones (the replacement for the old "not Inactive" balance-bearing set).
+/// ones (the balance-bearing set of active plus reserved postings).
 pub async fn get_postings_by_account_live_filter(store: &(impl Store + 'static)) {
     let active = make_posting([0xB2; 32], 0, 1, 1, 100);
     let reserved = make_posting([0xB2; 32], 1, 1, 1, 200);
@@ -893,8 +893,8 @@ pub async fn reserve_twice_second_zero(store: &(impl Store + 'static)) {
     );
 }
 
-/// A posting cannot be deactivated twice: once Inactive, a second raw deactivate
-/// reports zero — the double-spend guard at the storage layer.
+/// A posting cannot be deactivated twice: once spent, a second raw deactivate
+/// reports zero, the double-spend guard at the storage layer.
 pub async fn deactivate_twice_second_zero(store: &(impl Store + 'static)) {
     let consumed = make_posting([7; 32], 0, 1, 1, 100);
     seed_active(store, 200, std::slice::from_ref(&consumed)).await;

@@ -111,14 +111,14 @@ struct BalanceView {
 
 #[derive(Serialize)]
 struct AccountView {
-    /// Base account id (used only for the route; the display uses `display_id`).
+    /// Raw numeric base id. The display uses `display_id`; routes use `link`.
     id: i64,
     sub: i64,
-    /// `"5"` for a main account, `"5.7"` for subaccount 7 of base 5.
+    /// The account's IBAN-style code, grouped for display (five blocks of four).
     display_id: String,
-    /// Full-page detail link (`/accounts/5` or `/accounts/5/7`).
+    /// Full-page detail link, keyed by the machine-format code (`/accounts/<code>`).
     link: String,
-    /// htmx partial link (`/ui/accounts/5` or `/ui/accounts/5/7`).
+    /// htmx partial link (`/ui/accounts/<code>`).
     ui_link: String,
     name: String,
     version: u64,
@@ -156,7 +156,7 @@ struct TransferView {
 struct EventView {
     seq: u64,
     kind: &'static str,
-    /// Account display id (`"5"` or `"5.7"`), if the event names an account.
+    /// Account's grouped IBAN-style code, if the event names an account.
     account: Option<String>,
     transfer_short: Option<String>,
     time: String,

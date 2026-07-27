@@ -4,7 +4,7 @@
 //! `sqlite` or `postgres` to select the backend.
 //!
 //! ```text
-//! let pool = sqlx::any::Pool<Any>Options::new()
+//! let pool = sqlx::any::AnyPoolOptions::new()
 //!     .connect("sqlite::memory:").await?;
 //! let store = SqlStore::new(pool);
 //! store.migrate().await?;
