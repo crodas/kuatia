@@ -77,15 +77,15 @@ enum PendingRecord {
 }
 
 /// State loaded in phase 1, passed to the pure validation in phase 2.
-pub struct LoadedState {
+struct LoadedState {
     /// Postings being consumed by the envelope.
-    pub consumed_postings: Vec<Posting>,
+    consumed_postings: Vec<Posting>,
     /// Accounts referenced by the envelope.
-    pub accounts: HashMap<AccountId, kuatia_core::Account>,
+    accounts: HashMap<AccountId, kuatia_core::Account>,
     /// Current balances for all referenced (account, asset) pairs.
-    pub balances: HashMap<(AccountId, AssetId), Cent>,
+    balances: HashMap<(AccountId, AssetId), Cent>,
     /// The book gating this transfer, if one is loaded (`None` = unrestricted default).
-    pub book: Option<Book>,
+    book: Option<Book>,
 }
 
 impl Ledger {
@@ -95,7 +95,7 @@ impl Ledger {
 
     /// Phase 1: load all state needed for validation.
     #[instrument(skip(self, envelope), name = "ledger.load")]
-    pub async fn load(&self, envelope: &Envelope) -> Result<LoadedState, LedgerError> {
+    async fn load(&self, envelope: &Envelope) -> Result<LoadedState, LedgerError> {
         let consumed_postings = if envelope.consumes().is_empty() {
             vec![]
         } else {
@@ -147,7 +147,7 @@ impl Ledger {
     }
 
     /// Phase 2: run pure validation and produce a plan.
-    pub fn plan(
+    fn plan(
         &self,
         envelope: &Envelope,
         loaded: &LoadedState,

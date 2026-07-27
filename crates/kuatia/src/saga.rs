@@ -104,9 +104,8 @@ pub(crate) async fn verify_postings(
 
 /// Saga context that wraps a ledger and tracks state across steps.
 ///
-/// The ledger handle is `#[serde(skip)]` -- after deserializing a paused
-/// execution you must call [`inject_ledger`](LedgerCtx::inject_ledger)
-/// before resuming.
+/// The ledger handle is `#[serde(skip)]`: it is supplied when the context is
+/// constructed and is not part of the serialized form.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LedgerCtx {
     /// Receipts collected from completed steps.
@@ -161,23 +160,19 @@ impl LedgerCtx {
         }
     }
 
-    /// Re-inject the ledger handle after deserializing a paused execution.
-    pub fn inject_ledger(&mut self, ledger: Arc<Ledger>) {
-        self.ledger = Some(ledger);
-    }
-
-    /// Borrow the ledger, returning an error if not injected.
+    /// Borrow the ledger, returning an error if the handle is absent.
     pub fn ledger(&self) -> Result<&Ledger, LedgerError> {
-        self.ledger.as_ref().map(|l| l.as_ref()).ok_or_else(|| {
-            internal("ledger not injected -- call inject_ledger() after deserializing")
-        })
+        self.ledger
+            .as_ref()
+            .map(|l| l.as_ref())
+            .ok_or_else(|| internal("ledger handle missing from saga context"))
     }
 
-    /// Clone the ledger `Arc`, returning an error if not injected.
+    /// Clone the ledger `Arc`, returning an error if the handle is absent.
     pub fn ledger_arc(&self) -> Result<Arc<Ledger>, LedgerError> {
-        self.ledger.clone().ok_or_else(|| {
-            internal("ledger not injected -- call inject_ledger() after deserializing")
-        })
+        self.ledger
+            .clone()
+            .ok_or_else(|| internal("ledger handle missing from saga context"))
     }
 }
 

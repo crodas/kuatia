@@ -34,7 +34,6 @@ mod query;
 mod transition;
 
 pub use balance::SubAccountBalance;
-pub use commit::LoadedState;
 
 /// Default grace window (milliseconds) for the balance projection watermark: how
 /// far behind live a snapshot is allowed to advance, covering commit-to-visibility
