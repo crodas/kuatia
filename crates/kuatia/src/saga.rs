@@ -100,6 +100,37 @@ pub(crate) async fn verify_postings(
     .await
 }
 
+/// The authoritative double-spend / reservation-ownership guard.
+///
+/// Consume the reserved postings, then assert every consumed id is now `Spent`.
+/// `deactivate_postings(_, Some(rid))` removes *only* rows this saga reserved, so
+/// the "all Spent" assertion can only pass when no consumed id was left active or
+/// held by another saga: that is what forbids a double-spend.
+///
+/// This CAS is the real concurrency authority for the consumed-posting lifecycle.
+/// The pure lifecycle check in [`validate_and_plan`](kuatia_core::validate_and_plan)
+/// is a snapshot-in-time, best-effort read (ADR-0003); this is the check that
+/// holds under contention. It runs once the saga is past its point of no return
+/// (phase `Finalizing`). See ADR-0021 for the full commit-safety map.
+pub(crate) async fn consume_reserved(
+    store: &dyn Store,
+    consumes: &[PostingId],
+    reservation: ReservationId,
+) -> Result<(), LedgerError> {
+    let spent = store
+        .deactivate_postings(consumes, Some(reservation))
+        .await
+        .map_err(LedgerError::Store)?;
+    verify_postings(
+        store,
+        consumes,
+        spent,
+        |s| *s == PostingState::Spent,
+        "finalize: consume reserved postings",
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // Saga context -- carries the ledger handle + state between steps
 // ---------------------------------------------------------------------------
@@ -418,7 +449,22 @@ impl Step<LedgerCtx, LedgerError> for DepositMovementStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kuatia_core::{EnvelopeId, Posting};
+    use kuatia_storage::mem_store::InMemoryStore;
+    use kuatia_storage::store::PostingStore;
     use std::cell::Cell;
+
+    fn active_posting(store_seed: u8) -> Posting {
+        Posting::new(
+            PostingId {
+                transfer: EnvelopeId([store_seed; 32]),
+                index: 0,
+            },
+            AccountId::new(1),
+            AssetId::new(1),
+            Cent::from(100),
+        )
+    }
 
     #[tokio::test]
     async fn full_count_is_ok_without_re_reading() {
@@ -463,5 +509,64 @@ mod tests {
             result,
             Err(LedgerError::Store(StoreError::Internal(_)))
         ));
+    }
+
+    /// The guard consumes the postings this saga reserved: they end `Spent`.
+    #[tokio::test]
+    async fn consume_reserved_spends_our_postings() {
+        let store = InMemoryStore::new();
+        let p = active_posting(1);
+        store
+            .insert_postings(std::slice::from_ref(&p))
+            .await
+            .unwrap();
+        let rid = ReservationId::default();
+        store.reserve_postings(&[p.id], rid).await.unwrap();
+
+        consume_reserved(&store, &[p.id], rid).await.unwrap();
+
+        let states = store.get_posting_states(&[p.id]).await.unwrap();
+        assert_eq!(states, vec![PostingState::Spent]);
+    }
+
+    /// An unreserved (still active) posting is refused, and left untouched:
+    /// `deactivate_postings(_, Some(rid))` removes nothing we do not own.
+    #[tokio::test]
+    async fn consume_reserved_refuses_unreserved_posting() {
+        let store = InMemoryStore::new();
+        let p = active_posting(2);
+        store
+            .insert_postings(std::slice::from_ref(&p))
+            .await
+            .unwrap();
+
+        let err = consume_reserved(&store, &[p.id], ReservationId::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::Store(StoreError::Internal(_))));
+        let states = store.get_posting_states(&[p.id]).await.unwrap();
+        assert_eq!(states, vec![PostingState::Active]);
+    }
+
+    /// The double-spend guard: a posting reserved by another saga is refused, and
+    /// stays reserved by that saga. Our deactivate removes nothing, so the
+    /// "all Spent" assertion fails.
+    #[tokio::test]
+    async fn consume_reserved_refuses_posting_held_by_another_saga() {
+        let store = InMemoryStore::new();
+        let p = active_posting(3);
+        store
+            .insert_postings(std::slice::from_ref(&p))
+            .await
+            .unwrap();
+        let theirs = ReservationId::default();
+        store.reserve_postings(&[p.id], theirs).await.unwrap();
+
+        let err = consume_reserved(&store, &[p.id], ReservationId::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::Store(StoreError::Internal(_))));
+        let states = store.get_posting_states(&[p.id]).await.unwrap();
+        assert_eq!(states, vec![PostingState::Reserved(theirs)]);
     }
 }

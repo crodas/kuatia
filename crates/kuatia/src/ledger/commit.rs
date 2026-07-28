@@ -27,7 +27,9 @@ use kuatia_storage::store::EnvelopeRecord;
 use super::envelope_saga::*;
 use super::{Ledger, now_millis};
 use crate::error::LedgerError;
-use crate::saga::{FinalizeInput, LedgerCtx, ReserveInput, apply_and_verify, verify_postings};
+use crate::saga::{
+    FinalizeInput, LedgerCtx, ReserveInput, apply_and_verify, consume_reserved, verify_postings,
+};
 
 /// Phase of an in-flight commit, persisted with the write-ahead record so
 /// recovery knows whether validation has completed.
@@ -440,23 +442,9 @@ impl Ledger {
         self.save_pending(envelope, reservation, SagaPhase::Finalizing)
             .await?;
 
-        // Consume our reserved postings (remove from the reserved index → spent),
-        // then assert ALL consumed postings are spent. This is the double-spend
-        // guard: `deactivate_postings(Some(rid))` only removes rows we reserved,
-        // so any consumed id still active or reserved by another saga leaves the
-        // "all spent" check failing.
-        let spent = self
-            .store
-            .deactivate_postings(consumes, Some(reservation))
-            .await?;
-        verify_postings(
-            self.store.as_ref(),
-            consumes,
-            spent,
-            |s| *s == PostingState::Spent,
-            "finalize: consume reserved postings",
-        )
-        .await?;
+        // The authoritative double-spend guard (see `consume_reserved`): consume
+        // only rows we reserved, then assert all consumed postings are spent.
+        consume_reserved(self.store.as_ref(), consumes, reservation).await?;
 
         // Created postings, derived deterministically from the envelope.
         let created: Vec<Posting> = envelope

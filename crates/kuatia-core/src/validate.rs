@@ -242,9 +242,11 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
     let consumed_by_id: HashMap<PostingId, &Posting> =
         input.consumed_postings.iter().map(|p| (p.id, p)).collect();
 
-    // 3. Every consumed posting exists (its lifecycle state is enforced by the
-    // reserve CAS and the finalize "all spent" guard, not here — a `Posting`
-    // carries no state).
+    // 3. Every consumed posting exists. Its lifecycle state (not already
+    // spent / owned by this saga) is not decidable here: a `Posting` carries no
+    // state and this check is a snapshot-in-time read. The authoritative
+    // double-spend guard is the reserve CAS plus `consume_reserved` in the
+    // finalize step (ADR-0021 maps the full commit-safety invariant).
     for pid in envelope.consumes() {
         consumed_by_id
             .get(pid)
