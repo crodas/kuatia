@@ -13,6 +13,7 @@
 //! never silently round or overflow.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
 
@@ -148,7 +149,7 @@ impl fmt::Display for OverflowError {
     }
 }
 
-impl std::error::Error for OverflowError {}
+impl Error for OverflowError {}
 
 /// Returned when a string cannot be parsed into a [`Cent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,7 +161,7 @@ impl fmt::Display for ParseCentError {
     }
 }
 
-impl std::error::Error for ParseCentError {}
+impl Error for ParseCentError {}
 
 impl Cent {
     /// The zero amount.
@@ -326,7 +327,7 @@ impl fmt::Display for ParseAmountError {
     }
 }
 
-impl std::error::Error for ParseAmountError {}
+impl Error for ParseAmountError {}
 
 impl Amount {
     /// Create an `Amount` formatter with the given number of decimal places.

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use kuatia_core::{AccountId, AssetId, Cent, PostingId};
-use kuatia_storage::store::{Store, TransferQuery};
+use kuatia_storage::store::{EnvelopeRecord, Store, TransferQuery};
 
 use super::{Ledger, now_millis};
 use crate::error::LedgerError;
@@ -29,7 +29,7 @@ async fn fold_account_delta(
     store: &dyn Store,
     account: &AccountId,
     asset: &AssetId,
-    records: &[kuatia_storage::store::EnvelopeRecord],
+    records: &[EnvelopeRecord],
 ) -> Result<(Cent, u64), LedgerError> {
     let mut delta = Cent::ZERO;
     let mut count: u64 = 0;

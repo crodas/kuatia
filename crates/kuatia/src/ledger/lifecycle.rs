@@ -11,7 +11,7 @@
 
 use tracing::instrument;
 
-use kuatia_core::{AccountFlags, AccountId, PostingFilter};
+use kuatia_core::{Account, AccountFlags, AccountId, PostingFilter};
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
 
 use super::{Ledger, now_millis};
@@ -19,7 +19,7 @@ use crate::error::LedgerError;
 
 impl Ledger {
     /// Create a new account and emit an AccountCreated event.
-    pub async fn create_account(&self, account: kuatia_core::Account) -> Result<(), LedgerError> {
+    pub async fn create_account(&self, account: Account) -> Result<(), LedgerError> {
         let id = account.id;
         if self.store.create_account(account).await? == 0 {
             return Err(LedgerError::AccountAlreadyExists(id));

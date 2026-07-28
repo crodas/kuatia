@@ -15,12 +15,14 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use async_trait::async_trait;
+use sqlx::any::AnyRow;
 use sqlx::{Any, Pool, Row};
 
 use kuatia_storage::error::StoreError;
-use kuatia_storage::events::{EventStore, LedgerEvent};
+use kuatia_storage::events::{EventStore, LedgerEvent, event_dedup_key};
 use kuatia_storage::query::{filter_transfers, paginate};
 use kuatia_storage::store::*;
+use kuatia_types::autoid::AutoId;
 use kuatia_types::*;
 
 // Cached backend kind for `SqlStore::backend`.
@@ -36,7 +38,7 @@ const FOR_UPDATE: &str = " FOR UPDATE";
 /// SQL-backed [`Store`] implementation.
 pub struct SqlStore {
     pool: Pool<Any>,
-    autoid: kuatia_types::autoid::AutoId,
+    autoid: AutoId,
     /// Detected backend kind (lazily probed): one of `BACKEND_*`.
     backend: AtomicU8,
 }
@@ -46,7 +48,7 @@ impl SqlStore {
     pub fn new(pool: Pool<Any>) -> Self {
         Self {
             pool,
-            autoid: kuatia_types::autoid::AutoId::new(),
+            autoid: AutoId::new(),
             backend: AtomicU8::new(BACKEND_UNKNOWN),
         }
     }
@@ -223,7 +225,7 @@ fn envelope_id_from_hex(s: &str) -> Result<EnvelopeId, StoreError> {
     Ok(EnvelopeId(arr))
 }
 
-fn row_to_account(row: &sqlx::any::AnyRow) -> Result<Account, StoreError> {
+fn row_to_account(row: &AnyRow) -> Result<Account, StoreError> {
     let id: i64 = row
         .try_get("id")
         .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -252,7 +254,7 @@ fn row_to_account(row: &sqlx::any::AnyRow) -> Result<Account, StoreError> {
     })
 }
 
-fn row_to_posting(row: &sqlx::any::AnyRow) -> Result<Posting, StoreError> {
+fn row_to_posting(row: &AnyRow) -> Result<Posting, StoreError> {
     let transfer_id: String = row
         .try_get("transfer_id")
         .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -637,7 +639,7 @@ impl PostingStore for SqlStore {
 
         // Key membership by the same `(hex, idx)` values that were bound, so the
         // per-id lookup below matches without decoding transfer ids back.
-        let row_key = |row: &sqlx::any::AnyRow| -> Result<(String, i16), StoreError> {
+        let row_key = |row: &AnyRow| -> Result<(String, i16), StoreError> {
             let transfer_id: String = row
                 .try_get("transfer_id")
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -1253,7 +1255,7 @@ impl EventStore for SqlStore {
         // Idempotent on the dedup key: a replayed transfer or lifecycle-transition
         // event conflicts on `dedup_key` and returns the existing seq instead of a
         // duplicate row.
-        match kuatia_storage::events::event_dedup_key(&event.kind) {
+        match event_dedup_key(&event.kind) {
             Some(dedup_key) => {
                 let res = sqlx::query("INSERT INTO events (seq, timestamp, kind, data, dedup_key) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (dedup_key) DO NOTHING")
                     .bind(seq as i64)

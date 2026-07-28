@@ -16,6 +16,7 @@ mod data;
 mod seed;
 mod ui;
 
+use std::error::Error;
 use std::sync::Arc;
 
 use axum::Router;
@@ -59,7 +60,7 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

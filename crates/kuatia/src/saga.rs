@@ -23,6 +23,8 @@
 //! High-level steps (`PayMovementStep` and `DepositMovementStep`) compose over
 //! the intent-layer API and can be combined into multi-transfer sagas via `legend!`.
 
+use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -65,7 +67,7 @@ pub(crate) async fn apply_and_verify<F, Fut>(
 ) -> Result<(), LedgerError>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<bool, LedgerError>>,
+    Fut: Future<Output = Result<bool, LedgerError>>,
 {
     if count == target as u64 {
         return Ok(());
@@ -121,8 +123,8 @@ pub struct LedgerCtx {
     ledger: Option<Arc<Ledger>>,
 }
 
-impl std::fmt::Debug for LedgerCtx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for LedgerCtx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LedgerCtx")
             .field("receipts", &self.receipts)
             .field("reserved_postings", &self.reserved_postings.len())

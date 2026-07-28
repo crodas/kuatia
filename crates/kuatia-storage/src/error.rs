@@ -1,5 +1,8 @@
 //! Error types for storage implementations.
 
+use std::error::Error;
+use std::fmt;
+
 /// Errors produced by [`Store`](crate::store::Store) implementations.
 ///
 /// The store is a dumb instruction follower: writes report affected-row counts,
@@ -15,8 +18,8 @@ pub enum StoreError {
     Internal(String),
 }
 
-impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound(msg) => write!(f, "not found: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
@@ -24,4 +27,4 @@ impl std::fmt::Display for StoreError {
     }
 }
 
-impl std::error::Error for StoreError {}
+impl Error for StoreError {}

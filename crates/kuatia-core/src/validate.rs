@@ -7,6 +7,8 @@
 //! [`PlanInput`]; this module never touches storage.
 
 use std::collections::{HashMap, HashSet};
+use std::error::Error;
+use std::fmt;
 
 use crate::hash::{account_hash, envelope_id};
 use kuatia_types::*;
@@ -129,8 +131,8 @@ pub enum ValidationError {
     Overflow,
 }
 
-impl std::fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyTransfer => write!(f, "transfer has no postings"),
             Self::DuplicateConsumedPosting(id) => write!(f, "duplicate consumed posting {id:?}"),
@@ -200,7 +202,7 @@ impl std::fmt::Display for ValidationError {
     }
 }
 
-impl std::error::Error for ValidationError {}
+impl Error for ValidationError {}
 
 impl From<OverflowError> for ValidationError {
     fn from(_: OverflowError) -> Self {

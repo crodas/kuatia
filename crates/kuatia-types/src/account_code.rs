@@ -4,7 +4,7 @@
 //! 18-character base-36 body followed by two ISO 7064 mod-97 check digits, with
 //! no country code. It is produced and consumed through a narrow interface of
 //! three methods on [`AccountId`]: [`Display`](fmt::Display) (machine form),
-//! [`FromStr`](std::str::FromStr) (validating parse), and
+//! [`FromStr`] (validating parse), and
 //! [`to_grouped`](AccountId::to_grouped) (presentation spacing).
 //!
 //! Everything behind that interface is private: bit-packing the `(id, sub)`
@@ -16,7 +16,9 @@
 //! encodable range and to key the deployment's codes.
 
 use crate::AccountId;
+use std::error::Error;
 use std::fmt;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -225,7 +227,7 @@ impl fmt::Display for AccountId {
     /// country code. The `(id, sub)` pair is packed into a 93-bit value and run
     /// through a keyed format-preserving permutation (see [`set_id_seed`]) before
     /// encoding, so the body does not reveal the raw ids. Round-trips via
-    /// [`FromStr`](std::str::FromStr); [`to_grouped`](AccountId::to_grouped) adds
+    /// [`FromStr`]; [`to_grouped`](AccountId::to_grouped) adds
     /// the presentation spacing (five groups of four).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let body = base36_body(obfuscate(pack(self.id, self.sub), id_seed()));
@@ -262,9 +264,9 @@ impl fmt::Display for ParseAccountIdError {
     }
 }
 
-impl std::error::Error for ParseAccountIdError {}
+impl Error for ParseAccountIdError {}
 
-impl std::str::FromStr for AccountId {
+impl FromStr for AccountId {
     type Err = ParseAccountIdError;
 
     /// Parse an IBAN-style account code back into the two legs. Any spaces

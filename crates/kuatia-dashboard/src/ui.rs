@@ -13,7 +13,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::get,
 };
-use kuatia_core::{Amount, AssetId, Cent};
+use kuatia_core::{AccountId, Amount, AssetId, Cent};
 use serde::Serialize;
 use tera::{Context, Tera};
 
@@ -261,13 +261,13 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 // ---------------------------------------------------------------------------
 
 /// Display an account id as its IBAN-style code in grouped (spaced) format.
-fn acct_display(id: kuatia_core::AccountId) -> String {
+fn acct_display(id: AccountId) -> String {
     id.to_grouped()
 }
 
 /// The detail route path for an account, keyed by the machine-format code:
 /// `/accounts/<code>`.
-fn acct_link(id: kuatia_core::AccountId) -> String {
+fn acct_link(id: AccountId) -> String {
     format!("/accounts/{id}")
 }
 
@@ -388,7 +388,7 @@ async fn accounts_ctx(state: &AppState) -> Result<Context, ApiError> {
     Ok(ctx)
 }
 
-async fn account_ctx(state: &AppState, id: kuatia_core::AccountId) -> Result<Context, ApiError> {
+async fn account_ctx(state: &AppState, id: AccountId) -> Result<Context, ApiError> {
     let dto = data::account_detail(state, id).await?;
     let mut ctx = Context::new();
     ctx.insert("nav", "accounts");

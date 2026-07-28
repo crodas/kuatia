@@ -5,20 +5,23 @@
 //! underlying store is reachable via [`Ledger::store`] for callers that want the
 //! raw storage error instead.
 
-use kuatia_core::{AccountId, PostingFilter, PostingId, PostingState};
+use kuatia_core::{
+    Account, AccountId, Book, BookId, Posting, PostingFilter, PostingId, PostingState,
+};
 use kuatia_storage::events::LedgerEvent;
 
 use super::Ledger;
 use crate::error::LedgerError;
+use crate::store::{EnvelopeRecord, Page, PostingQuery, TransferQuery};
 
 impl Ledger {
     /// List all accounts (latest version of each).
-    pub async fn list_accounts(&self) -> Result<Vec<kuatia_core::Account>, LedgerError> {
+    pub async fn list_accounts(&self) -> Result<Vec<Account>, LedgerError> {
         Ok(self.store.list_accounts().await?)
     }
 
     /// Fetch a single account by id.
-    pub async fn get_account(&self, id: &AccountId) -> Result<kuatia_core::Account, LedgerError> {
+    pub async fn get_account(&self, id: &AccountId) -> Result<Account, LedgerError> {
         self.store
             .get_account(id)
             .await
@@ -26,10 +29,7 @@ impl Ledger {
     }
 
     /// Return all transfers involving the given account (exact subaccount).
-    pub async fn history(
-        &self,
-        account: &AccountId,
-    ) -> Result<Vec<crate::store::EnvelopeRecord>, LedgerError> {
+    pub async fn history(&self, account: &AccountId) -> Result<Vec<EnvelopeRecord>, LedgerError> {
         Ok(self
             .store
             .get_transfers_for_account(account.id, Some(account.sub))
@@ -39,16 +39,13 @@ impl Ledger {
     /// Query transfers with filtering and pagination.
     pub async fn query_transfers(
         &self,
-        query: &crate::store::TransferQuery,
-    ) -> Result<crate::store::Page<crate::store::EnvelopeRecord>, LedgerError> {
+        query: &TransferQuery,
+    ) -> Result<Page<EnvelopeRecord>, LedgerError> {
         Ok(self.store.query_transfers(query).await?)
     }
 
     /// Return all postings (any state) for the given account.
-    pub async fn postings(
-        &self,
-        account: &AccountId,
-    ) -> Result<Vec<kuatia_core::Posting>, LedgerError> {
+    pub async fn postings(&self, account: &AccountId) -> Result<Vec<Posting>, LedgerError> {
         Ok(self
             .store
             .get_postings_by_account(account.id, Some(account.sub), None, PostingFilter::All)
@@ -60,7 +57,7 @@ impl Ledger {
     pub async fn postings_with_state(
         &self,
         account: &AccountId,
-    ) -> Result<Vec<(kuatia_core::Posting, PostingState)>, LedgerError> {
+    ) -> Result<Vec<(Posting, PostingState)>, LedgerError> {
         let postings = self.postings(account).await?;
         let ids: Vec<PostingId> = postings.iter().map(|p| p.id).collect();
         let states = self.store.get_posting_states(&ids).await?;
@@ -68,23 +65,17 @@ impl Ledger {
     }
 
     /// Query postings with filtering and pagination.
-    pub async fn query_postings(
-        &self,
-        query: &crate::store::PostingQuery,
-    ) -> Result<crate::store::Page<kuatia_core::Posting>, LedgerError> {
+    pub async fn query_postings(&self, query: &PostingQuery) -> Result<Page<Posting>, LedgerError> {
         Ok(self.store.query_postings(query).await?)
     }
 
     /// Return the full version history for an account.
-    pub async fn account_history(
-        &self,
-        id: &AccountId,
-    ) -> Result<Vec<kuatia_core::Account>, LedgerError> {
+    pub async fn account_history(&self, id: &AccountId) -> Result<Vec<Account>, LedgerError> {
         Ok(self.store.get_account_history(id).await?)
     }
 
     /// Create a new book.
-    pub async fn create_book(&self, book: kuatia_core::Book) -> Result<(), LedgerError> {
+    pub async fn create_book(&self, book: Book) -> Result<(), LedgerError> {
         let id = book.id;
         if self.store.create_book(book).await? == 0 {
             return Err(LedgerError::BookAlreadyExists(id));
@@ -93,15 +84,12 @@ impl Ledger {
     }
 
     /// Fetch a book by id.
-    pub async fn get_book(
-        &self,
-        id: &kuatia_core::BookId,
-    ) -> Result<kuatia_core::Book, LedgerError> {
+    pub async fn get_book(&self, id: &BookId) -> Result<Book, LedgerError> {
         Ok(self.store.get_book(id).await?)
     }
 
     /// List all books.
-    pub async fn list_books(&self) -> Result<Vec<kuatia_core::Book>, LedgerError> {
+    pub async fn list_books(&self) -> Result<Vec<Book>, LedgerError> {
         Ok(self.store.list_books().await?)
     }
 

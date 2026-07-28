@@ -2,6 +2,7 @@
 //! them from an external boundary account, then runs payments and a
 //! multi-asset trade so the dashboard has something to visualize.
 
+use std::error::Error;
 use std::sync::Arc;
 
 use kuatia::ledger::Ledger;
@@ -45,7 +46,7 @@ pub fn account_label(id: AccountId) -> Option<&'static str> {
 /// connection its own separate database, so more than one would split the
 /// ledger; one connection is also fine for a low-traffic dashboard on a file or
 /// Postgres backend.
-pub async fn connect(db_url: &str) -> Result<Arc<Ledger>, Box<dyn std::error::Error>> {
+pub async fn connect(db_url: &str) -> Result<Arc<Ledger>, Box<dyn Error>> {
     sqlx::any::install_default_drivers();
     let pool = sqlx::any::AnyPoolOptions::new()
         .max_connections(1)
@@ -73,7 +74,7 @@ fn sqlite_creatable(db_url: &str) -> String {
 /// it seeded, `false` if the ledger was already populated (so re-running with
 /// `--seed` against a persistent database is a safe no-op rather than a
 /// duplicate-id error).
-pub async fn seed_if_empty(ledger: &Arc<Ledger>) -> Result<bool, Box<dyn std::error::Error>> {
+pub async fn seed_if_empty(ledger: &Arc<Ledger>) -> Result<bool, Box<dyn Error>> {
     if !ledger.list_accounts().await?.is_empty() {
         return Ok(false);
     }
@@ -82,7 +83,7 @@ pub async fn seed_if_empty(ledger: &Arc<Ledger>) -> Result<bool, Box<dyn std::er
 }
 
 /// Populate the ledger with demo accounts and a spread of transfers.
-pub async fn populate(ledger: &Arc<Ledger>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn populate(ledger: &Arc<Ledger>) -> Result<(), Box<dyn Error>> {
     // Two-decimal assets (USD, EUR) and an 8-decimal asset (BTC).
     let fiat = Amount::new(2);
     let btc = Amount::new(8);
@@ -130,7 +131,7 @@ async fn create(
     ledger: &Arc<Ledger>,
     id: AccountId,
     debit_must_not_exceed_credit: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let account = if debit_must_not_exceed_credit {
         Account::debit_must_not_exceed_credit(id)
     } else {
@@ -145,7 +146,7 @@ async fn deposit(
     to: AccountId,
     asset: AssetId,
     amount: Cent,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let transfer = TransferBuilder::new()
         .deposit(to, asset, amount, EXTERNAL)?
         .build();
@@ -159,7 +160,7 @@ async fn pay(
     to: AccountId,
     asset: AssetId,
     amount: Cent,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let transfer = TransferBuilder::new().pay(from, to, asset, amount).build();
     ledger.commit(transfer).await?;
     Ok(())

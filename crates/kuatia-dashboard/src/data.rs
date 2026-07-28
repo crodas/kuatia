@@ -3,6 +3,8 @@
 //! Everything here is read-only. Monetary values stay as raw [`Cent`] (minor
 //! units); presentation formats them.
 
+use std::cmp::Reverse;
+use std::fmt;
 use std::sync::Arc;
 
 use axum::{
@@ -10,6 +12,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use kuatia::error::LedgerError;
 use kuatia::ledger::Ledger;
 use kuatia_core::{Account, AccountId, AssetId, Cent, PostingId, PostingState};
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
@@ -18,7 +21,7 @@ use serde::Serialize;
 use tera::Tera;
 
 use crate::assets::AssetMeta;
-use crate::seed::account_label;
+use crate::seed::{EXTERNAL, account_label};
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -219,10 +222,7 @@ pub async fn overview(state: &AppState) -> Result<OverviewDto, ApiError> {
     // mirrors everything in circulation.
     let mut issued = Vec::new();
     for asset in state.assets.iter() {
-        let external = state
-            .ledger
-            .balance(&crate::seed::EXTERNAL, &asset.id)
-            .await?;
+        let external = state.ledger.balance(&EXTERNAL, &asset.id).await?;
         let issued_value = external
             .checked_neg()
             .map_err(|_| ApiError::internal("overflow"))?;
@@ -281,7 +281,7 @@ pub async fn account_detail(state: &AppState, id: AccountId) -> Result<AccountDe
             status: posting_state_label(state).to_string(),
         })
         .collect();
-    postings.sort_by_key(|p| std::cmp::Reverse(p.value));
+    postings.sort_by_key(|p| Reverse(p.value));
 
     let transfers = state
         .ledger
@@ -315,7 +315,7 @@ pub async fn transfers(state: &AppState, limit: Option<u32>) -> Result<Vec<Trans
     };
     let page = state.ledger.query_transfers(&query).await?;
     let mut out: Vec<TransferDto> = page.items.iter().map(transfer_dto).collect();
-    out.sort_by_key(|t| std::cmp::Reverse(t.created_at));
+    out.sort_by_key(|t| Reverse(t.created_at));
     Ok(out)
 }
 
@@ -345,13 +345,13 @@ impl ApiError {
     }
 
     /// Build a 500 from any displayable error (used by the HTML render path).
-    pub fn from_display(err: impl std::fmt::Display) -> Self {
+    pub fn from_display(err: impl fmt::Display) -> Self {
         Self::internal(err.to_string())
     }
 
     /// Build a 400 from a displayable error (used for a malformed account id in
     /// the URL).
-    pub fn bad_request(err: impl std::fmt::Display) -> Self {
+    pub fn bad_request(err: impl fmt::Display) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: err.to_string(),
@@ -359,9 +359,8 @@ impl ApiError {
     }
 }
 
-impl From<kuatia::error::LedgerError> for ApiError {
-    fn from(err: kuatia::error::LedgerError) -> Self {
-        use kuatia::error::LedgerError;
+impl From<LedgerError> for ApiError {
+    fn from(err: LedgerError) -> Self {
         let status = match err {
             LedgerError::AccountNotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,

@@ -3,6 +3,9 @@
 //! [`LedgerError`] unifies errors from the pure core (validation, selection)
 //! and from storage, so callers get a single error type from every API.
 
+use std::error::Error;
+use std::fmt;
+
 use kuatia_core::{
     AccountId, AssetId, BookId, EnvelopeId, InsufficientFunds, OverflowError, PostingId,
     ResolveError, ValidationError,
@@ -78,8 +81,8 @@ pub enum LedgerError {
     },
 }
 
-impl std::fmt::Display for LedgerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for LedgerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Validation(e) => write!(f, "validation: {e}"),
             Self::Store(e) => write!(f, "store: {e}"),
@@ -122,8 +125,8 @@ impl std::fmt::Display for LedgerError {
     }
 }
 
-impl std::error::Error for LedgerError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for LedgerError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Validation(e) => Some(e),
             Self::Store(e) => Some(e),

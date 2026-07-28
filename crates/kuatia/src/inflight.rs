@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use kuatia_core::{
     Account, AccountFlags, AccountId, AssetId, BookId, Cent, EnvelopeId, InsufficientFunds,
-    Metadata, Receipt, Transfer, TransferBuilder, hash::double_sha256,
+    Metadata, Receipt, SUB_BITS, Transfer, TransferBuilder, hash::double_sha256,
 };
 use kuatia_storage::error::StoreError;
 use kuatia_storage::store::EnvelopeRecord;
@@ -565,7 +565,7 @@ fn inflight_subaccount(transfer: &Transfer) -> i64 {
     first.copy_from_slice(&hash[..8]);
     // Keep only the low SUB_BITS so the hold's subaccount id fits the account
     // code's encodable range (ADR-0015). The result is always positive.
-    let mask = (1u64 << kuatia_types::SUB_BITS) - 1;
+    let mask = (1u64 << SUB_BITS) - 1;
     (u64::from_be_bytes(first) & mask) as i64
 }
 

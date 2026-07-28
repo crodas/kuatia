@@ -13,6 +13,7 @@ pub use account_code::{
     DEFAULT_ID_SEED, ID_BITS, ParseAccountIdError, SUB_BITS, id_seed, set_id_seed,
 };
 
+use crate::autoid::AutoId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -139,7 +140,7 @@ impl Default for AccountId {
     fn default() -> Self {
         // Process-global generator: a per-thread one could mint the same id on
         // two threads within a millisecond, yielding duplicate account ids.
-        static GEN: crate::autoid::AutoId = crate::autoid::AutoId::new();
+        static GEN: AutoId = AutoId::new();
         Self {
             id: GEN.next(),
             sub: 0,
@@ -220,7 +221,7 @@ impl BookId {
     pub fn generate() -> Self {
         // Process-global so the "process-unique" contract holds across threads;
         // a per-thread generator can repeat an id on another thread.
-        static GEN: crate::autoid::AutoId = crate::autoid::AutoId::new();
+        static GEN: AutoId = AutoId::new();
         Self(GEN.next())
     }
 }
@@ -251,7 +252,7 @@ impl Default for ReservationId {
         // generator lets two sagas on different threads mint the same id within
         // a millisecond, which collapses the reservation-ownership check and
         // allows a double-spend under concurrency.
-        static GEN: crate::autoid::AutoId = crate::autoid::AutoId::new();
+        static GEN: AutoId = AutoId::new();
         Self(GEN.next())
     }
 }

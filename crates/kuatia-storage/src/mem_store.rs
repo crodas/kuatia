@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use tokio::sync::RwLock;
 
 use kuatia_types::autoid::AutoId;
@@ -13,7 +14,7 @@ use kuatia_types::{
 };
 
 use crate::error::StoreError;
-use crate::events::{EventStore, LedgerEvent};
+use crate::events::{EventStore, LedgerEvent, event_dedup_key};
 use crate::query::{filter_transfers, paginate};
 use crate::store::{
     AccountStore, BalanceProjection, BalanceProjectionStore, BookStore, EnvelopeRecord, Page,
@@ -339,8 +340,7 @@ impl PostingStore for InMemoryStore {
         let mut store = self.postings.write().await;
         let mut inserted: u64 = 0;
         for posting in postings {
-            if let std::collections::hash_map::Entry::Vacant(e) = store.immutable.entry(posting.id)
-            {
+            if let Entry::Vacant(e) = store.immutable.entry(posting.id) {
                 e.insert(posting.clone());
                 // Only newly-inserted postings are activated; a since-spent
                 // posting is not re-activated on a replayed insert. The active
@@ -465,10 +465,10 @@ impl EventStore for InMemoryStore {
         let mut events = self.events.write().await;
         // Idempotent on the dedup key: a replayed transfer or lifecycle-transition
         // event returns the existing seq instead of inserting a duplicate.
-        if let Some(key) = crate::events::event_dedup_key(&event.kind)
+        if let Some(key) = event_dedup_key(&event.kind)
             && let Some(existing) = events
                 .iter()
-                .find(|e| crate::events::event_dedup_key(&e.kind).as_deref() == Some(key.as_str()))
+                .find(|e| event_dedup_key(&e.kind).as_deref() == Some(key.as_str()))
         {
             return Ok(existing.seq);
         }

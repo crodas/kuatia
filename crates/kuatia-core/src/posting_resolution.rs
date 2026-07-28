@@ -16,6 +16,8 @@
 //! they are reachable without standing up a store.
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 
 use kuatia_types::{
     Account, AccountId, AssetId, Cent, Envelope, EnvelopeBuilder, NewPosting, OverflowError,
@@ -41,8 +43,8 @@ pub struct InsufficientFunds {
     pub requested: Cent,
 }
 
-impl std::fmt::Display for InsufficientFunds {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for InsufficientFunds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "insufficient funds: available {}, requested {}",
@@ -51,7 +53,7 @@ impl std::fmt::Display for InsufficientFunds {
     }
 }
 
-impl std::error::Error for InsufficientFunds {}
+impl Error for InsufficientFunds {}
 
 /// Failure from resolution pass 2 ([`resolve_envelope`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,8 +64,8 @@ pub enum ResolveError {
     Overflow,
 }
 
-impl std::fmt::Display for ResolveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Selection(e) => write!(f, "selection: {e}"),
             Self::Overflow => write!(f, "monetary amount overflow"),
@@ -71,8 +73,8 @@ impl std::fmt::Display for ResolveError {
     }
 }
 
-impl std::error::Error for ResolveError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for ResolveError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Selection(e) => Some(e),
             Self::Overflow => None,

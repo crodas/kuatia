@@ -7,16 +7,17 @@
 //! crash.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use legend::ExecutionResult;
 use tracing::instrument;
 
 use kuatia_core::{
-    AccountId, AccountSnapshotId, AssetId, Book, Cent, DEFAULT_BOOK, Envelope, EnvelopeBuilder,
-    EnvelopeId, NewPosting, PlanInput, Posting, PostingFilter, PostingId, PostingState, Receipt,
-    ResolveInput, Transfer, account_snapshot_id, draft_movements, envelope_id, resolve_envelope,
-    validate_and_plan,
+    Account, AccountId, AccountSnapshotId, AssetId, Book, Cent, DEFAULT_BOOK, Envelope,
+    EnvelopeBuilder, EnvelopeId, NewPosting, Plan, PlanInput, Posting, PostingFilter, PostingId,
+    PostingState, Receipt, ReservationId, ResolveInput, Transfer, account_snapshot_id,
+    draft_movements, envelope_id, resolve_envelope, validate_and_plan,
 };
 
 use kuatia_storage::error::StoreError;
@@ -47,7 +48,7 @@ enum SagaPhase {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PendingSaga {
     envelope: Envelope,
-    reservation: kuatia_core::ReservationId,
+    reservation: ReservationId,
     phase: SagaPhase,
 }
 
@@ -59,7 +60,7 @@ struct PendingSaga {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct PendingTransition {
     /// The next account version to append: version already bumped, flag flipped.
-    pub next: kuatia_core::Account,
+    pub next: Account,
     /// The lifecycle event paired with this version bump. It carries the target
     /// version, so re-appending it on recovery dedups to the original.
     pub event: LedgerEventKind,
@@ -81,7 +82,7 @@ struct LoadedState {
     /// Postings being consumed by the envelope.
     consumed_postings: Vec<Posting>,
     /// Accounts referenced by the envelope.
-    accounts: HashMap<AccountId, kuatia_core::Account>,
+    accounts: HashMap<AccountId, Account>,
     /// Current balances for all referenced (account, asset) pairs.
     balances: HashMap<(AccountId, AssetId), Cent>,
     /// The book gating this transfer, if one is loaded (`None` = unrestricted default).
@@ -147,11 +148,7 @@ impl Ledger {
     }
 
     /// Run pure validation over the loaded state and produce a plan.
-    fn plan(
-        &self,
-        envelope: &Envelope,
-        loaded: &LoadedState,
-    ) -> Result<kuatia_core::Plan, LedgerError> {
+    fn plan(&self, envelope: &Envelope, loaded: &LoadedState) -> Result<Plan, LedgerError> {
         let input = PlanInput {
             envelope,
             consumed_postings: &loaded.consumed_postings,
@@ -185,7 +182,7 @@ impl Ledger {
         // to zero on the system account, so it produces no debit and loads nothing
         // here.
         let mut available: HashMap<(AccountId, AssetId), Vec<Posting>> = HashMap::new();
-        let mut accounts: HashMap<AccountId, kuatia_core::Account> = HashMap::new();
+        let mut accounts: HashMap<AccountId, Account> = HashMap::new();
         for debit in &draft.debits {
             let postings = self
                 .store
@@ -197,7 +194,7 @@ impl Ledger {
                 )
                 .await?;
             available.insert((debit.account, debit.asset), postings);
-            if let std::collections::hash_map::Entry::Vacant(e) = accounts.entry(debit.account) {
+            if let Entry::Vacant(e) = accounts.entry(debit.account) {
                 e.insert(self.store.get_account(&debit.account).await?);
             }
         }
@@ -257,7 +254,7 @@ impl Ledger {
 
         // Write-ahead: persist {envelope, reservation, phase=Reserving} before any
         // mutation. The finalize step bumps the phase to Finalizing.
-        let reservation = kuatia_core::ReservationId::default();
+        let reservation = ReservationId::default();
         let saga_id = reservation.0;
         self.save_pending(&envelope, reservation, SagaPhase::Reserving)
             .await?;
@@ -286,7 +283,7 @@ impl Ledger {
     async fn drive_envelope_saga(
         self: &Arc<Self>,
         envelope: Envelope,
-        reservation: kuatia_core::ReservationId,
+        reservation: ReservationId,
     ) -> Result<Receipt, LedgerError> {
         let saga = EnvelopeSaga::new(EnvelopeSagaInputs {
             reserve: ReserveInput,
@@ -404,7 +401,7 @@ impl Ledger {
     pub(crate) async fn finalize_envelope(
         &self,
         envelope: &Envelope,
-        reservation: kuatia_core::ReservationId,
+        reservation: ReservationId,
     ) -> Result<Receipt, LedgerError> {
         let tid = envelope_id(envelope);
         if let Some(record) = self.store.get_transfer(&tid).await? {
@@ -538,7 +535,7 @@ impl Ledger {
     async fn save_pending(
         &self,
         envelope: &Envelope,
-        reservation: kuatia_core::ReservationId,
+        reservation: ReservationId,
         phase: SagaPhase,
     ) -> Result<(), LedgerError> {
         let blob = serde_json::to_vec(&PendingRecord::Envelope(PendingSaga {
@@ -557,10 +554,10 @@ impl Ledger {
     /// key never collides with an in-flight commit saga's key.
     pub(super) async fn save_transition(
         &self,
-        next: &kuatia_core::Account,
+        next: &Account,
         event: &LedgerEventKind,
     ) -> Result<i64, LedgerError> {
-        let saga_id = kuatia_core::ReservationId::default().0;
+        let saga_id = ReservationId::default().0;
         let blob = serde_json::to_vec(&PendingRecord::Transition(PendingTransition {
             next: next.clone(),
             event: event.clone(),
