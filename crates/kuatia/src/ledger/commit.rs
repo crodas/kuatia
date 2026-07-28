@@ -6,7 +6,7 @@
 //! lets [`Ledger::recover`] complete or safely abandon a commit interrupted by a
 //! crash.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use legend::ExecutionResult;
@@ -172,18 +172,20 @@ impl Ledger {
     /// The decision is pure ([`kuatia_core::draft_movements`] +
     /// [`kuatia_core::resolve_envelope`]); this method only loads the state those
     /// functions need. Pass 1 aggregates net debits and tells us which postings
-    /// to load and which accounts permit overdraft; pass 2 selects postings,
-    /// computes change, and covers any overdraft shortfall.
+    /// and accounts to load; pass 2 selects postings, computes change, and covers
+    /// any overdraft shortfall (reading each account's own flag, the same one
+    /// validation reads).
     #[instrument(skip(self, transfer), name = "ledger.resolve")]
     pub async fn resolve(&self, transfer: &Transfer) -> Result<Envelope, LedgerError> {
         let draft = draft_movements(transfer)?;
 
-        // Load the active postings for each debit, and note which debit accounts
-        // permit overdraft. A deposit nets to zero on the system account, so it
-        // produces no debit and loads nothing here.
+        // Load the active postings for each debit and the debit accounts
+        // themselves. Pass 2 reads the overdraft decision off each account's flag,
+        // so we hand it the accounts rather than a re-derived set. A deposit nets
+        // to zero on the system account, so it produces no debit and loads nothing
+        // here.
         let mut available: HashMap<(AccountId, AssetId), Vec<Posting>> = HashMap::new();
-        let mut overdraft_allowed: HashSet<AccountId> = HashSet::new();
-        let mut checked: HashSet<AccountId> = HashSet::new();
+        let mut accounts: HashMap<AccountId, kuatia_core::Account> = HashMap::new();
         for debit in &draft.debits {
             let postings = self
                 .store
@@ -195,14 +197,8 @@ impl Ledger {
                 )
                 .await?;
             available.insert((debit.account, debit.asset), postings);
-            if checked.insert(debit.account)
-                && !self
-                    .store
-                    .get_account(&debit.account)
-                    .await?
-                    .forbids_overdraft()
-            {
-                overdraft_allowed.insert(debit.account);
+            if let std::collections::hash_map::Entry::Vacant(e) = accounts.entry(debit.account) {
+                e.insert(self.store.get_account(&debit.account).await?);
             }
         }
 
@@ -210,7 +206,7 @@ impl Ledger {
             transfer,
             draft,
             available: &available,
-            overdraft_allowed: &overdraft_allowed,
+            accounts: &accounts,
         })?;
 
         // Resolve account snapshots for optimistic concurrency
