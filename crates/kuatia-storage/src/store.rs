@@ -237,6 +237,10 @@ pub trait SagaStore: Send + Sync {
     async fn save_saga(&self, id: &i64, data: Vec<u8>) -> Result<(), StoreError>;
     /// Load all pending (incomplete) saga states.
     async fn list_pending_sagas(&self) -> Result<Vec<(i64, Vec<u8>)>, StoreError>;
+    /// Load one saga state by id, or `None` if no record is stored under `id`.
+    /// A keyed read so a caller checking a single in-flight saga does not scan
+    /// every pending record.
+    async fn get_saga(&self, id: &i64) -> Result<Option<Vec<u8>>, StoreError>;
     /// Delete a completed saga state.
     async fn delete_saga(&self, id: &i64) -> Result<(), StoreError>;
 }

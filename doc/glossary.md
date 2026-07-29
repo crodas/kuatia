@@ -93,14 +93,21 @@ atomically flips `Active → PendingInactive` stamped with a `ReservationId`,
 so two sagas cannot both claim the same posting. This (not a global
 transaction) is what prevents double-spend.
 
-### PendingSaga / recovery
+### Write-ahead record (PendingRecord) / recovery
 
-A write-ahead record `{envelope, reservation, phase}` persisted via
-`SagaStore` before a commit mutates anything. The `phase`
-(`Reserving` → `Finalizing`) tells `Ledger::recover()` (startup) how to
-complete a crashed saga: a `Reserving` saga is re-run and **re-validated**;
-a `Finalizing` saga (already validated, owns its postings) is rolled forward
-through the verified `finalize_envelope`. Roll-forward, not rollback.
+A record persisted via `SagaStore` before a multi-write operation mutates
+anything, so a crash mid-sequence can be completed on the next startup. There
+are two kinds (`PendingRecord`): a **commit saga** `{envelope, reservation,
+phase}`, and an **account transition** `{next, event}` (freeze/unfreeze/close).
+The `pending` module owns the concept: what a record is, how it is
+(de)serialized, and how each kind completes.
+
+`Ledger::recover()` (startup) loads each surviving record and drives it to a
+terminal state through `PendingRecord::complete`. A commit saga's `phase`
+(`Reserving` → `Finalizing`) decides how: a `Reserving` saga is re-run and
+**re-validated**; a `Finalizing` saga (already validated, owns its postings) is
+rolled forward through the verified `finalize_envelope`. A transition rolls its
+version + event forward idempotently. Roll-forward, not rollback.
 
 ### Book
 

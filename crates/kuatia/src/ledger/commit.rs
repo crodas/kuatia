@@ -31,53 +31,7 @@ use crate::saga::{
     FinalizeInput, LedgerCtx, ReserveInput, apply_and_verify, consume_reserved, verify_postings,
 };
 
-/// Phase of an in-flight commit, persisted with the write-ahead record so
-/// recovery knows whether validation has completed.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-enum SagaPhase {
-    /// Saved before reserve. Validation has not necessarily run, so recovery must
-    /// re-reserve and re-validate before it can commit.
-    Reserving,
-    /// Saved at the start of finalize — after validation passed and just before
-    /// the consumed postings begin being removed from the reserved index (the
-    /// point of no return). Recovery rolls forward without re-validating.
-    Finalizing,
-}
-
-/// Write-ahead record for an in-flight commit, persisted via `SagaStore` before
-/// the saga mutates anything and removed once it reaches a terminal state. On
-/// startup [`Ledger::recover`] completes any that survive a crash.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PendingSaga {
-    envelope: Envelope,
-    reservation: ReservationId,
-    phase: SagaPhase,
-}
-
-/// Write-ahead record for an in-flight account-version transition
-/// (freeze/unfreeze/close). The transition appends a new account version and then
-/// its lifecycle event; a crash between the two leaves a version bump with no
-/// event. Persisting this before either write lets [`Ledger::recover`] roll the
-/// transition forward, re-appending the (idempotent) event.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(super) struct PendingTransition {
-    /// The next account version to append: version already bumped, flag flipped.
-    pub next: Account,
-    /// The lifecycle event paired with this version bump. It carries the target
-    /// version, so re-appending it on recovery dedups to the original.
-    pub event: LedgerEventKind,
-}
-
-/// The two kinds of write-ahead record the [`SagaStore`](kuatia_storage::store::SagaStore)
-/// holds, tagged so [`Ledger::recover`] can tell an envelope commit saga from an
-/// account transition and complete each through its own path.
-#[derive(serde::Serialize, serde::Deserialize)]
-enum PendingRecord {
-    /// A two-step envelope commit saga (reserve → finalize).
-    Envelope(PendingSaga),
-    /// A single account-version transition (append version + lifecycle event).
-    Transition(PendingTransition),
-}
+use super::pending::{PendingRecord, SagaPhase};
 
 /// State loaded in phase 1, passed to the pure validation in phase 2.
 struct LoadedState {
@@ -258,7 +212,8 @@ impl Ledger {
         // mutation. The finalize step bumps the phase to Finalizing.
         let reservation = ReservationId::default();
         let saga_id = reservation.0;
-        self.save_pending(&envelope, reservation, SagaPhase::Reserving)
+        PendingRecord::envelope(envelope.clone(), reservation, SagaPhase::Reserving)
+            .save(self, saga_id)
             .await?;
 
         // Commit does not touch the balance projection (ADR-0019): cache points
@@ -272,7 +227,7 @@ impl Ledger {
         // the half-applied commit forward.
         let safe_to_delete = match &result {
             Ok(_) => true,
-            Err(_) => self.read_pending_phase(saga_id).await? != Some(SagaPhase::Finalizing),
+            Err(_) => self.saga_phase(saga_id).await? != Some(SagaPhase::Finalizing),
         };
         if safe_to_delete {
             self.store.delete_saga(&saga_id).await?;
@@ -282,7 +237,7 @@ impl Ledger {
 
     /// Build and run the envelope saga (reserve → finalize) to a terminal
     /// outcome, returning the resulting receipt.
-    async fn drive_envelope_saga(
+    pub(super) async fn drive_envelope_saga(
         self: &Arc<Self>,
         envelope: Envelope,
         reservation: ReservationId,
@@ -319,73 +274,23 @@ impl Ledger {
         }
     }
 
-    /// Complete every pending saga left by a crash. Call on startup; returns how
-    /// many were processed.
+    /// Complete every pending write-ahead record left by a crash. Call on
+    /// startup; returns how many were processed.
     ///
-    /// Recovery branches on the persisted phase. A `Reserving` saga had not
-    /// necessarily validated, so it is re-run through the real saga (which
-    /// re-reserves and **re-validates** — aborting cleanly if the postings were
-    /// taken or an account was frozen meanwhile). A `Finalizing` saga had already
-    /// validated and owns its postings, so it is rolled forward through the
-    /// verified `finalize_envelope`. Either way the record is removed only once
-    /// the work is committed or safely abandoned.
+    /// Each record is decoded and driven to a terminal state by
+    /// `PendingRecord::complete` (in the `pending` module), which owns the
+    /// per-kind completion: a transition rolls forward; an envelope commit
+    /// branches on its persisted phase — a `Reserving` saga is re-run and
+    /// re-validated, a `Finalizing` saga is rolled forward through the verified
+    /// `finalize_envelope`.
     #[instrument(skip(self), name = "ledger.recover")]
     pub async fn recover(self: &Arc<Self>) -> Result<usize, LedgerError> {
         let pending = self.store.list_pending_sagas().await?;
         let count = pending.len();
         for (saga_id, blob) in pending {
-            let record: PendingRecord = serde_json::from_slice(&blob)
-                .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
-
-            match record {
-                PendingRecord::Transition(PendingTransition { next, event }) => {
-                    // Roll the account transition forward: append the version if it
-                    // is not yet present, then (re-)append the idempotent event.
-                    // Both steps no-op when already applied, so this is safe to run
-                    // in any crash window.
-                    self.complete_transition(saga_id, next, event).await?;
-                }
-                PendingRecord::Envelope(PendingSaga {
-                    envelope,
-                    reservation,
-                    phase,
-                }) => {
-                    // The transfer record is durable, but a full commit is more
-                    // than the transfer row: it also includes the committed event,
-                    // appended *after* store_transfer. A crash in that window
-                    // leaves the record present yet the event missing, so repair
-                    // the whole end-state (idempotent) before clearing the record.
-                    let tid = envelope_id(&envelope);
-                    if self.store.get_transfer(&tid).await?.is_some() {
-                        self.append_committed_event(tid).await?;
-                        self.store.delete_saga(&saga_id).await?;
-                        continue;
-                    }
-
-                    match phase {
-                        SagaPhase::Finalizing => {
-                            // Validation passed and the postings are ours; roll
-                            // forward. Keep the record if completion fails so a
-                            // later run retries.
-                            if self.finalize_envelope(&envelope, reservation).await.is_ok() {
-                                self.store.delete_saga(&saga_id).await?;
-                            }
-                        }
-                        SagaPhase::Reserving => {
-                            // Re-run the validating saga. On failure, delete only if
-                            // it did not reach finalize (clean abort); otherwise
-                            // keep for next run.
-                            let result = self.drive_envelope_saga(envelope, reservation).await;
-                            let safe_to_delete = result.is_ok()
-                                || self.read_pending_phase(saga_id).await?
-                                    != Some(SagaPhase::Finalizing);
-                            if safe_to_delete {
-                                self.store.delete_saga(&saga_id).await?;
-                            }
-                        }
-                    }
-                }
-            }
+            PendingRecord::decode(&blob)?
+                .complete(self, saga_id)
+                .await?;
         }
         Ok(count)
     }
@@ -439,7 +344,8 @@ impl Ledger {
         }
 
         // Point of no return: record Finalizing before any posting is consumed.
-        self.save_pending(envelope, reservation, SagaPhase::Finalizing)
+        PendingRecord::envelope(envelope.clone(), reservation, SagaPhase::Finalizing)
+            .save(self, reservation.0)
             .await?;
 
         // The authoritative double-spend guard (see `consume_reserved`): consume
@@ -508,7 +414,7 @@ impl Ledger {
     /// retried finalize both call this to repair the committed end-state.
     /// `append_event` dedups on the transfer id, so calling it more than once for
     /// the same transfer is a no-op.
-    async fn append_committed_event(&self, tid: EnvelopeId) -> Result<(), LedgerError> {
+    pub(super) async fn append_committed_event(&self, tid: EnvelopeId) -> Result<(), LedgerError> {
         self.store
             .append_event(&LedgerEvent {
                 seq: 0,
@@ -519,56 +425,15 @@ impl Ledger {
         Ok(())
     }
 
-    /// Persist the write-ahead pending-saga record (upsert on the reservation id).
-    async fn save_pending(
-        &self,
-        envelope: &Envelope,
-        reservation: ReservationId,
-        phase: SagaPhase,
-    ) -> Result<(), LedgerError> {
-        let blob = serde_json::to_vec(&PendingRecord::Envelope(PendingSaga {
-            envelope: envelope.clone(),
-            reservation,
-            phase,
-        }))
-        .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
-        self.store.save_saga(&reservation.0, blob).await?;
-        Ok(())
-    }
-
-    /// Persist the write-ahead record for an account-version transition, keyed by
-    /// a fresh unique id, and return that id so the caller can delete the record
-    /// once the transition is complete. Shares the reservation-id generator so the
-    /// key never collides with an in-flight commit saga's key.
-    pub(super) async fn save_transition(
-        &self,
-        next: &Account,
-        event: &LedgerEventKind,
-    ) -> Result<i64, LedgerError> {
-        let saga_id = ReservationId::default().0;
-        let blob = serde_json::to_vec(&PendingRecord::Transition(PendingTransition {
-            next: next.clone(),
-            event: event.clone(),
-        }))
-        .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
-        self.store.save_saga(&saga_id, blob).await?;
-        Ok(saga_id)
-    }
-
-    /// Read the persisted phase of a pending *envelope* saga, if one exists under
-    /// `saga_id`. A transition record (no phase) reads as `None`.
-    async fn read_pending_phase(&self, saga_id: i64) -> Result<Option<SagaPhase>, LedgerError> {
-        for (id, blob) in self.store.list_pending_sagas().await? {
-            if id == saga_id {
-                let record: PendingRecord = serde_json::from_slice(&blob)
-                    .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
-                return Ok(match record {
-                    PendingRecord::Envelope(s) => Some(s.phase),
-                    PendingRecord::Transition(_) => None,
-                });
-            }
+    /// The persisted commit phase of the record stored under `saga_id`, via a
+    /// keyed read. `None` when no record exists there or it is a transition
+    /// (which has no phase). Used to decide whether a failed commit reached the
+    /// point of no return.
+    pub(super) async fn saga_phase(&self, saga_id: i64) -> Result<Option<SagaPhase>, LedgerError> {
+        match self.store.get_saga(&saga_id).await? {
+            Some(blob) => Ok(PendingRecord::decode(&blob)?.envelope_phase()),
+            None => Ok(None),
         }
-        Ok(None)
     }
 
     // -----------------------------------------------------------------------
@@ -637,6 +502,7 @@ impl Ledger {
 
 #[cfg(test)]
 mod recovery_tests {
+    use super::super::pending::{PendingSaga, PendingTransition};
     use super::*;
     use kuatia_core::{Account, AccountFlags, ReservationId, TransferBuilder};
     use kuatia_storage::mem_store::InMemoryStore;

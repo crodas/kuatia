@@ -1230,6 +1230,23 @@ impl SagaStore for SqlStore {
         Ok(result)
     }
 
+    async fn get_saga(&self, id: &i64) -> Result<Option<Vec<u8>>, StoreError> {
+        let row = sqlx::query("SELECT data FROM sagas WHERE id = $1")
+            .bind(*id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        match row {
+            Some(row) => {
+                let data_hex: String = row
+                    .try_get("data")
+                    .map_err(|e| StoreError::Internal(e.to_string()))?;
+                Ok(Some(from_hex(&data_hex)?))
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn delete_saga(&self, id: &i64) -> Result<(), StoreError> {
         sqlx::query("DELETE FROM sagas WHERE id = $1")
             .bind(*id)

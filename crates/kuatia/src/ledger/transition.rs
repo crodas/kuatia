@@ -15,9 +15,10 @@
 //! already present, and the event carries its target version so a second append
 //! dedups to the original.
 
-use kuatia_core::{Account, AccountFlags, AccountId};
+use kuatia_core::{AccountFlags, AccountId, ReservationId};
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
 
+use super::pending::PendingRecord;
 use super::{Ledger, now_millis};
 use crate::error::LedgerError;
 
@@ -51,8 +52,13 @@ impl Ledger {
         let event = make_event(*id, next.version);
 
         // Write-ahead before either write. A crash between the version append and
-        // the event append is then repaired by recover(), not left dangling.
-        let saga_id = self.save_transition(&next, &event).await?;
+        // the event append is then repaired by recover(), not left dangling. The
+        // key shares the reservation-id generator so it never collides with an
+        // in-flight commit saga's key.
+        let saga_id = ReservationId::default().0;
+        PendingRecord::transition(next.clone(), event.clone())
+            .save(self, saga_id)
+            .await?;
 
         let expected = next.version;
         if self.store.append_account_version(next).await? == 0 {
@@ -63,44 +69,6 @@ impl Ledger {
                 account: *id,
                 expected,
             });
-        }
-        self.store
-            .append_event(&LedgerEvent {
-                seq: 0,
-                timestamp: now_millis()?,
-                kind: event,
-            })
-            .await?;
-        self.store.delete_saga(&saga_id).await?;
-        Ok(())
-    }
-
-    /// Roll a crash-interrupted transition forward and clear its write-ahead
-    /// record. Called by [`recover`](Ledger::recover) for a persisted
-    /// [`PendingTransition`](super::commit).
-    ///
-    /// Idempotent in every crash window: the version append runs only when the
-    /// version is not yet present (`append_account_version` requires
-    /// `version == current + 1`, so a blind retry after it applied would fail),
-    /// and the event carries its target version so re-appending it dedups to the
-    /// original.
-    pub(super) async fn complete_transition(
-        &self,
-        saga_id: i64,
-        next: Account,
-        event: LedgerEventKind,
-    ) -> Result<(), LedgerError> {
-        // The account is guaranteed to exist here (its version was already
-        // bumped, or is about to be), so a read failure is transient or a real
-        // invariant breach, not "not found": surface it verbatim so recovery
-        // retries rather than reporting a misleading domain error.
-        let current = self.store.get_account(&next.id).await?;
-        // Append only into an empty version slot. This also subsumes the
-        // is_closed guard the forward path runs: a close always bumps the
-        // version, so a since-closed account sits at version >= next.version and
-        // this branch is skipped, never appending onto a closed account.
-        if current.version < next.version {
-            self.store.append_account_version(next).await?;
         }
         self.store
             .append_event(&LedgerEvent {

@@ -83,6 +83,7 @@ classDiagram
     class SagaStore {
         +save_saga(id, data)
         +list_pending_sagas()
+        +get_saga(id)
         +delete_saga(id)
     }
     class EventStore {

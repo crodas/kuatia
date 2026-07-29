@@ -448,6 +448,11 @@ impl SagaStore for InMemoryStore {
         Ok(sagas.iter().map(|(k, v)| (*k, v.clone())).collect())
     }
 
+    async fn get_saga(&self, id: &i64) -> Result<Option<Vec<u8>>, StoreError> {
+        let sagas = self.sagas.read().await;
+        Ok(sagas.get(id).cloned())
+    }
+
     async fn delete_saga(&self, id: &i64) -> Result<(), StoreError> {
         let mut sagas = self.sagas.write().await;
         sagas.remove(id);

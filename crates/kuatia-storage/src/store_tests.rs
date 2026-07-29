@@ -1144,6 +1144,22 @@ pub async fn delete_saga(store: &(impl Store + 'static)) {
     assert!(pending.is_empty());
 }
 
+/// A keyed `get_saga` returns the stored blob, and `None` for an absent or
+/// deleted id.
+pub async fn get_saga_by_id(store: &(impl Store + 'static)) {
+    let id: i64 = 42;
+    let data = vec![7, 8, 9];
+    assert!(store.get_saga(&id).await.unwrap().is_none());
+
+    store.save_saga(&id, data.clone()).await.unwrap();
+    assert_eq!(store.get_saga(&id).await.unwrap(), Some(data));
+    // A different id is still absent while this one exists.
+    assert!(store.get_saga(&99).await.unwrap().is_none());
+
+    store.delete_saga(&id).await.unwrap();
+    assert!(store.get_saga(&id).await.unwrap().is_none());
+}
+
 // ---------------------------------------------------------------------------
 // EventStore tests
 // ---------------------------------------------------------------------------
@@ -1387,6 +1403,7 @@ macro_rules! store_tests {
             query_transfers_store_wide,
             // SagaStore
             save_and_list_sagas,
+            get_saga_by_id,
             delete_saga,
             // EventStore
             append_and_query_events,
