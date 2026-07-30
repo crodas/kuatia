@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-30
+
 ### Added
 
 - Subaccounts: `AccountId` gains a subaccount leg (`{ id, sub }`), so several
@@ -108,5 +110,6 @@ Initial release.
 - `kuatia-storage-sql` — SQLite/PostgreSQL backend.
 - `kuatia` — async `Ledger` resource and saga commit pipeline.
 
+[0.3.0]: https://github.com/crodas/kuatia/releases/tag/v0.3.0
 [0.2.0]: https://github.com/crodas/kuatia/releases/tag/v0.2.0
 [0.1.0]: https://github.com/crodas/kuatia/releases/tag/v0.1.0
