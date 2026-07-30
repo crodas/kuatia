@@ -30,7 +30,6 @@ mod balance;
 mod commit;
 mod lifecycle;
 mod pending;
-mod projection;
 mod query;
 mod transition;
 
