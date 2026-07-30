@@ -43,10 +43,49 @@ jobs:
       - run: cargo doc --workspace --all-features --no-deps
 
   test:
-    name: Test
+    name: Test (SQLite, i64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Default features: the SQLite backend with the i64 Cent backing.
       - run: cargo test --all
+
+  test-i128:
+    name: Test (i128 backing)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Swap the Cent backing to i128 across the whole chain. Dashboard has no
+      # i128 feature, so exclude it from the feature-scoped run.
+      - run: cargo test --workspace --exclude kuatia-dashboard --features i128
+
+  test-postgres:
+    name: Test (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: kuatia
+          POSTGRES_PASSWORD: kuatia
+          POSTGRES_DB: kuatia
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kuatia"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://kuatia:kuatia@localhost:5432/kuatia
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Run only the SQL backend's conformance suite against real Postgres, so
+      # the Postgres-only code paths (FOR UPDATE locks, ON CONFLICT) are covered.
+      - run: cargo test -p kuatia-storage-sql --no-default-features --features test-postgres

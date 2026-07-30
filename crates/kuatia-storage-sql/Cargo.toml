@@ -33,5 +33,10 @@ serde_json.workspace = true
 default = ["sqlite"]
 sqlite = ["sqlx/sqlite"]
 postgres = ["sqlx/postgres"]
+# Opt-in gate for the Postgres conformance suite (`tests/postgres.rs`), which
+# needs a live `DATABASE_URL`. Kept distinct from `postgres` so that a plain
+# `cargo test` (which unifies `postgres` on via the dashboard's dependency) does
+# not try to run it; only the dedicated CI job enables `test-postgres`.
+test-postgres = ["postgres"]
 # Pass through to the domain crates: swap the Cent backing to i128.
 i128 = ["kuatia-types/i128", "kuatia-storage/i128"]

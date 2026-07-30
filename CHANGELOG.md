@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Subaccounts: `AccountId` gains a subaccount leg (`{ id, sub }`), so several
+  independent balances live under one owner, each individually addressable,
+  drained, and closed. Aggregate reads take a base id plus an optional
+  subaccount filter; exact operations take the full `AccountId`; balances are
+  never summed across subaccounts. (ADR-0012)
+- Inflight holds: authorize, confirm, and void value through per-destination
+  holding subaccounts, so an authorization reserves funds without committing
+  them and a void returns them. (ADR-0014)
+- IBAN-style account identifiers: `AccountId` has a fixed 20-character
+  `Display`/`FromStr` form (a base-36 body plus two mod-97 check digits) for
+  presentation and routing, while storage keeps the two integer legs. (ADR-0015)
+- Cached balance projection: an append-only balance snapshot, refreshed lazily
+  off the read path once enough activity accrues, shortens the everyday balance
+  read; the authoritative live-posting sum stays the source of truth. (ADR-0019)
+- `SagaStore::get_saga`, a keyed read for a single write-ahead record, so
+  recovery no longer scans every pending record.
+- Continuous integration now runs the storage conformance suite against
+  PostgreSQL (exercising the Postgres-only `FOR UPDATE` and `ON CONFLICT` paths)
+  and runs the test suite with the i128 Cent backing.
+
+### Changed
+
+- Storage write contract: every `Store` write method returns the number of
+  affected rows and makes no domain decision. The saga interprets counts and
+  owns idempotency and compensation, with a phase-tracked write-ahead record and
+  roll-forward crash recovery in place of a monolithic commit transaction.
+  (ADR-0003) *(breaking for `Store` implementors)*
+- Account balance constraint collapsed to the single
+  `DEBIT_MUST_NOT_EXCEED_CREDIT` flag; overdraft is allowed by default. (ADR-0018)
+- The SQL schema separates append-only value tables from disposable
+  active/reserved index tables. (ADR-0016, ADR-0017)
+- Intent resolution is pure and preserves typed errors across the saga.
+- Internal structure: the `Ledger` was split into concern-named submodules; the
+  commit-safety invariant is documented and its double-spend guard named
+  (ADR-0021); the write-ahead recovery record was concentrated into one
+  `pending` module; balance computation was consolidated into one module.
+
+### Removed
+
+- The vestigial `UserData` type and the orphaned withdraw saga step. *(breaking)*
+
 ### Documentation
 
 - Document that the ledger supports journaling: a committed transfer is a
