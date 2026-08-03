@@ -48,6 +48,65 @@ pub struct Plan {
 }
 
 // ---------------------------------------------------------------------------
+// Required state: the single source of truth for what the loader must fetch
+// ---------------------------------------------------------------------------
+
+/// The exact stored state [`validate_and_plan`] reads for a given envelope.
+///
+/// Validation's correctness rests on being handed *complete* state: a missing
+/// balance key silently defaults to zero and would flip an overdraft decision.
+/// Deriving the key-set here, in the pure core, gives that "load everything
+/// validation reads" rule one home and one test surface. The async loader
+/// iterates these keys rather than re-deriving its own, so it cannot
+/// under-fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredState {
+    /// Posting ids validation reads: exactly `envelope.consumes()`.
+    pub consumed_postings: Vec<PostingId>,
+    /// Accounts validation reads: owners of created and consumed postings, plus
+    /// every snapshot-pinned account.
+    pub accounts: Vec<AccountId>,
+    /// Balance keys validation reads: `(owner, asset)` of every consumed and
+    /// created posting.
+    pub balances: Vec<(AccountId, AssetId)>,
+}
+
+/// Derive the state key-set [`validate_and_plan`] will read.
+///
+/// The consumed postings must be passed in because their owner and asset (which
+/// drive the account and balance key-sets) live in the store, not the envelope.
+/// The loader therefore fetches `envelope.consumes()` first, then calls this to
+/// own every remaining key. Kept in lockstep with what `validate_and_plan`
+/// actually reads: change one, change the other.
+pub fn required_state(envelope: &Envelope, consumed_postings: &[Posting]) -> RequiredState {
+    let mut accounts: Vec<AccountId> = envelope.creates().iter().map(|np| np.owner).collect();
+    for p in consumed_postings {
+        accounts.push(p.owner);
+    }
+    for snap in envelope.account_snapshots() {
+        accounts.push(snap.account);
+    }
+    accounts.sort();
+    accounts.dedup();
+
+    let mut balances: Vec<(AccountId, AssetId)> = Vec::new();
+    for p in consumed_postings {
+        balances.push((p.owner, p.asset));
+    }
+    for np in envelope.creates() {
+        balances.push((np.owner, np.asset));
+    }
+    balances.sort();
+    balances.dedup();
+
+    RequiredState {
+        consumed_postings: envelope.consumes().to_vec(),
+        accounts,
+        balances,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -1127,5 +1186,187 @@ mod tests {
 
         let plan = validate_and_plan(input).unwrap();
         assert_eq!(plan.postings_to_create.len(), 2);
+    }
+
+    // -- required_state golden vectors -------------------------------------
+    //
+    // The key-set required_state names must equal exactly what validate_and_plan
+    // reads. These pin the derivation for the shapes load exercises.
+
+    #[test]
+    fn required_state_deposit_nets_to_system_account() {
+        // A deposit consumes nothing; it creates on account 1 and the system
+        // account 99. No consumed postings, so no owners come from the store.
+        let envelope = deposit_envelope();
+        let required = required_state(&envelope, &[]);
+
+        assert!(required.consumed_postings.is_empty());
+        assert_eq!(
+            required.accounts,
+            vec![AccountId::new(1), AccountId::new(99)]
+        );
+        assert_eq!(
+            required.balances,
+            vec![
+                (AccountId::new(1), AssetId::new(1)),
+                (AccountId::new(99), AssetId::new(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn required_state_internal_transfer_with_change() {
+        // account1 spends a 100 posting, sends 60 to account2, keeps 40 change.
+        // account1's key is only reachable through the consumed posting, so it
+        // must appear even though the envelope's creates never name it as a
+        // debit source directly.
+        let pid = PostingId {
+            transfer: EnvelopeId([1; 32]),
+            index: 0,
+        };
+        let posting = Posting {
+            id: pid,
+            owner: AccountId::new(1),
+            asset: AssetId::new(1),
+            value: Cent::from(100),
+        };
+        let envelope = Envelope {
+            consumes: vec![pid],
+            creates: vec![
+                NewPosting {
+                    owner: AccountId::new(2),
+                    asset: AssetId::new(1),
+                    value: Cent::from(60),
+                    payer: Some(AccountId::new(1)),
+                },
+                NewPosting {
+                    owner: AccountId::new(1),
+                    asset: AssetId::new(1),
+                    value: Cent::from(40),
+                    payer: None,
+                },
+            ],
+            book: BookId(0),
+            account_snapshots: vec![],
+            metadata: BTreeMap::new(),
+        };
+
+        let required = required_state(&envelope, std::slice::from_ref(&posting));
+
+        assert_eq!(required.consumed_postings, vec![pid]);
+        assert_eq!(
+            required.accounts,
+            vec![AccountId::new(1), AccountId::new(2)]
+        );
+        assert_eq!(
+            required.balances,
+            vec![
+                (AccountId::new(1), AssetId::new(1)),
+                (AccountId::new(2), AssetId::new(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn required_state_multi_asset() {
+        // Two consumed postings of different assets from account 1, creating on
+        // accounts 2 and 3. Balance keys are per (owner, asset), so account 1
+        // contributes one key per asset it spends.
+        let pid_a = PostingId {
+            transfer: EnvelopeId([1; 32]),
+            index: 0,
+        };
+        let pid_b = PostingId {
+            transfer: EnvelopeId([2; 32]),
+            index: 0,
+        };
+        let consumed = vec![
+            Posting {
+                id: pid_a,
+                owner: AccountId::new(1),
+                asset: AssetId::new(1),
+                value: Cent::from(100),
+            },
+            Posting {
+                id: pid_b,
+                owner: AccountId::new(1),
+                asset: AssetId::new(2),
+                value: Cent::from(50),
+            },
+        ];
+        let envelope = Envelope {
+            consumes: vec![pid_a, pid_b],
+            creates: vec![
+                NewPosting {
+                    owner: AccountId::new(2),
+                    asset: AssetId::new(1),
+                    value: Cent::from(100),
+                    payer: Some(AccountId::new(1)),
+                },
+                NewPosting {
+                    owner: AccountId::new(3),
+                    asset: AssetId::new(2),
+                    value: Cent::from(50),
+                    payer: Some(AccountId::new(1)),
+                },
+            ],
+            book: BookId(0),
+            account_snapshots: vec![],
+            metadata: BTreeMap::new(),
+        };
+
+        let required = required_state(&envelope, &consumed);
+
+        assert_eq!(required.consumed_postings, vec![pid_a, pid_b]);
+        assert_eq!(
+            required.accounts,
+            vec![AccountId::new(1), AccountId::new(2), AccountId::new(3)]
+        );
+        assert_eq!(
+            required.balances,
+            vec![
+                (AccountId::new(1), AssetId::new(1)),
+                (AccountId::new(1), AssetId::new(2)),
+                (AccountId::new(2), AssetId::new(1)),
+                (AccountId::new(3), AssetId::new(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn required_state_includes_snapshot_only_accounts() {
+        // A snapshot may pin an account that appears in neither creates nor any
+        // consumed posting. validate_and_plan reads it (step 5b), so
+        // required_state must name it or the loader would miss it.
+        let envelope = Envelope {
+            consumes: vec![],
+            creates: vec![
+                NewPosting {
+                    owner: AccountId::new(1),
+                    asset: AssetId::new(1),
+                    value: Cent::from(100),
+                    payer: None,
+                },
+                NewPosting {
+                    owner: AccountId::new(99),
+                    asset: AssetId::new(1),
+                    value: Cent::from(-100),
+                    payer: None,
+                },
+            ],
+            book: BookId(0),
+            account_snapshots: vec![AccountSnapshotId {
+                account: AccountId::new(7),
+                snapshot_id: [0; 32],
+            }],
+            metadata: BTreeMap::new(),
+        };
+
+        let required = required_state(&envelope, &[]);
+
+        assert_eq!(
+            required.accounts,
+            vec![AccountId::new(1), AccountId::new(7), AccountId::new(99)]
+        );
     }
 }

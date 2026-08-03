@@ -17,18 +17,18 @@ use kuatia_core::{
     Account, AccountId, AccountSnapshotId, AssetId, Book, Cent, DEFAULT_BOOK, Envelope,
     EnvelopeBuilder, EnvelopeId, NewPosting, Plan, PlanInput, Posting, PostingFilter, PostingId,
     PostingState, Receipt, ReservationId, ResolveInput, Transfer, account_snapshot_id,
-    draft_movements, envelope_id, resolve_envelope, validate_and_plan,
+    draft_movements, envelope_id, required_state, resolve_envelope, validate_and_plan,
 };
 
 use kuatia_storage::error::StoreError;
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
 use kuatia_storage::store::EnvelopeRecord;
 
-use super::envelope_saga::*;
 use super::{Ledger, now_millis};
 use crate::error::LedgerError;
 use crate::saga::{
-    FinalizeInput, LedgerCtx, ReserveInput, apply_and_verify, consume_reserved, verify_postings,
+    EnvelopeSaga, EnvelopeSagaInputs, FinalizeInput, LedgerCtx, ReserveInput, apply_and_verify,
+    consume_reserved, verify_postings,
 };
 
 use super::pending::{PendingRecord, SagaPhase};
@@ -59,28 +59,16 @@ impl Ledger {
             self.store.get_postings(envelope.consumes()).await?
         };
 
-        let mut account_ids: Vec<AccountId> = envelope.creates().iter().map(|p| p.owner).collect();
-        for p in &consumed_postings {
-            account_ids.push(p.owner);
-        }
-        account_ids.sort();
-        account_ids.dedup();
+        // The pure core names exactly what validation will read; iterate that
+        // key-set so the loader cannot silently under-fetch (a missing balance
+        // key defaults to zero and would flip an overdraft decision).
+        let required = required_state(envelope, &consumed_postings);
 
-        let account_list = self.store.get_accounts(&account_ids).await?;
+        let account_list = self.store.get_accounts(&required.accounts).await?;
         let accounts: HashMap<AccountId, _> = account_list.into_iter().map(|a| (a.id, a)).collect();
 
-        let mut balance_keys: Vec<(AccountId, AssetId)> = Vec::new();
-        for p in &consumed_postings {
-            balance_keys.push((p.owner, p.asset));
-        }
-        for np in envelope.creates() {
-            balance_keys.push((np.owner, np.asset));
-        }
-        balance_keys.sort();
-        balance_keys.dedup();
-
         let mut balances = HashMap::new();
-        for (account_id, asset_id) in &balance_keys {
+        for (account_id, asset_id) in &required.balances {
             let bal = self.compute_balance(account_id, asset_id).await?;
             balances.insert((*account_id, *asset_id), bal);
         }
@@ -105,6 +93,18 @@ impl Ledger {
 
     /// Run pure validation over the loaded state and produce a plan.
     fn plan(&self, envelope: &Envelope, loaded: &LoadedState) -> Result<Plan, LedgerError> {
+        // The loader must have fetched every balance key validation reads.
+        // `compute_balance` never omits a key (an empty account is zero), so a
+        // gap here means `load` under-fetched — a silent write-skew, not a
+        // missing row. Fail loudly instead of validating against zero.
+        debug_assert!(
+            required_state(envelope, &loaded.consumed_postings)
+                .balances
+                .iter()
+                .all(|key| loaded.balances.contains_key(key)),
+            "load under-fetched balances required by validation",
+        );
+
         let input = PlanInput {
             envelope,
             consumed_postings: &loaded.consumed_postings,
