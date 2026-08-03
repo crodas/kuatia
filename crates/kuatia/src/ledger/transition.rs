@@ -9,7 +9,7 @@
 //! The durability point: the version append and the event append are two separate
 //! store writes with no shared transaction. A crash between them would otherwise
 //! leave a version bump with no event and nothing to repair it. Persisting a
-//! write-ahead [`PendingTransition`](super::commit) before either write lets
+//! write-ahead [`PendingTransition`](super::pending) before either write lets
 //! [`Ledger::recover`](Ledger) roll the transition forward. Recovery is
 //! idempotent both ways: the version append is skipped when the version is
 //! already present, and the event carries its target version so a second append
