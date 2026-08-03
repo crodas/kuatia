@@ -31,7 +31,7 @@ use crate::saga::{
     consume_reserved, verify_postings,
 };
 
-use super::pending::{PendingRecord, SagaPhase};
+use super::pending::{PendingRecord, PendingSaga, SagaPhase};
 
 /// State loaded in phase 1, passed to the pure validation in phase 2.
 struct LoadedState {
@@ -208,31 +208,13 @@ impl Ledger {
             return Ok(record.receipt);
         }
 
-        // Write-ahead: persist {envelope, reservation, phase=Reserving} before any
-        // mutation. The finalize step bumps the phase to Finalizing.
-        let reservation = ReservationId::default();
-        let saga_id = reservation.0;
-        PendingRecord::envelope(envelope.clone(), reservation, SagaPhase::Reserving)
-            .save(self, saga_id)
-            .await?;
-
-        // Commit does not touch the balance projection (ADR-0019): cache points
-        // are appended lazily on read, once enough credits/debits have accrued.
-        let result = self.drive_envelope_saga(envelope, reservation).await;
-
-        // Delete the pending record only when it is safe: on success, or on a
-        // failure that never reached finalize (phase still Reserving → the saga's
-        // compensation released our reservation, nothing of ours was applied). If
-        // finalize started (Finalizing) and failed, keep it so `recover()` rolls
-        // the half-applied commit forward.
-        let safe_to_delete = match &result {
-            Ok(_) => true,
-            Err(_) => self.saga_phase(saga_id).await? != Some(SagaPhase::Finalizing),
-        };
-        if safe_to_delete {
-            self.store.delete_saga(&saga_id).await?;
-        }
-        result
+        // The write-ahead record owns its own lifecycle (persist at Reserving,
+        // drive the saga, clear only when past-the-point-of-no-return is safe), so
+        // this path and `recover()` share one contract instead of each re-deriving
+        // the phase rules.
+        PendingSaga::new(envelope, ReservationId::default())
+            .run(self)
+            .await
     }
 
     /// Build and run the envelope saga (reserve → finalize) to a terminal
@@ -344,8 +326,8 @@ impl Ledger {
         }
 
         // Point of no return: record Finalizing before any posting is consumed.
-        PendingRecord::envelope(envelope.clone(), reservation, SagaPhase::Finalizing)
-            .save(self, reservation.0)
+        PendingSaga::finalizing(envelope.clone(), reservation)
+            .persist(self)
             .await?;
 
         // The authoritative double-spend guard (see `consume_reserved`): consume
