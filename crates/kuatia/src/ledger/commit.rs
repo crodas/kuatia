@@ -1,16 +1,15 @@
-//! The write-ahead saga/commit engine: resolve, reserve, finalize, recover.
+//! The write-ahead commit engine: resolve, reserve, finalize, recover.
 //!
-//! This is the deep core of the ledger. Every commit is the two-step envelope
-//! saga (`reserve → finalize`, validation inside finalize) with automatic retry
-//! and LIFO compensation. A phase-tracked write-ahead record ([`PendingSaga`])
-//! lets [`Ledger::recover`] complete or safely abandon a commit interrupted by a
-//! crash.
+//! This is the deep core of the ledger. Every commit is the linear
+//! `reserve → finalize` path (validation inside finalize), which releases its
+//! reservation to compensate a failure before the point of no return. A
+//! phase-tracked write-ahead record ([`PendingSaga`]) lets [`Ledger::recover`]
+//! complete or safely abandon a commit interrupted by a crash.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
-use legend::ExecutionResult;
 use tracing::instrument;
 
 use kuatia_core::{
@@ -26,10 +25,7 @@ use kuatia_storage::store::EnvelopeRecord;
 
 use super::{Ledger, now_millis};
 use crate::error::LedgerError;
-use crate::saga::{
-    EnvelopeSaga, EnvelopeSagaInputs, FinalizeInput, LedgerCtx, ReserveInput, apply_and_verify,
-    consume_reserved, verify_postings,
-};
+use crate::saga::{apply_and_verify, consume_reserved, verify_postings};
 
 use super::pending::{PendingRecord, PendingSaga, SagaPhase};
 
@@ -186,9 +182,9 @@ impl Ledger {
     /// validate -> finalize). This is the single commit path; `commit()` and
     /// `reverse()` both funnel through it.
     ///
-    /// Before running, the saga (envelope + reservation) is persisted as a
+    /// Before running, the commit (envelope + reservation) is persisted as a
     /// pending record so a crash mid-commit is completed by [`recover`](Self::recover). The
-    /// record is deleted once the saga reaches a terminal state. The commit is
+    /// record is deleted once the commit reaches a terminal state. The commit is
     /// idempotent on the content-addressed transfer id.
     #[instrument(skip(self, envelope), name = "ledger.commit_envelope")]
     pub async fn commit_envelope(
@@ -217,43 +213,71 @@ impl Ledger {
             .await
     }
 
-    /// Build and run the envelope saga (reserve → finalize) to a terminal
-    /// outcome, returning the resulting receipt.
-    pub(super) async fn drive_envelope_saga(
-        self: &Arc<Self>,
-        envelope: Envelope,
+    /// The single-commit core: reserve the consumed postings, then finalize.
+    ///
+    /// This used to be a two-step `legend` saga; for one commit the steps were
+    /// pass-throughs, so the reserve/compensation policy now lives here as a
+    /// linear path next to [`finalize_envelope`](Self::finalize_envelope).
+    /// (`legend` still drives the composed multi-transfer sagas in `saga`.)
+    ///
+    /// On any failure the reservation is released (the LIFO compensation collapsed
+    /// to its one meaningful action). Before the point of no return that returns
+    /// the postings to Active so the caller's `clear_if_safe` can drop the
+    /// write-ahead record; past `Finalizing` the postings are already spent, so
+    /// the release is a no-op and the record is instead kept for roll-forward. The
+    /// typed error (validation / overdraft / frozen) reaches the caller unchanged.
+    pub(super) async fn reserve_and_finalize(
+        &self,
+        envelope: &Envelope,
         reservation: ReservationId,
     ) -> Result<Receipt, LedgerError> {
-        let saga = EnvelopeSaga::new(EnvelopeSagaInputs {
-            reserve: ReserveInput,
-            finalize: FinalizeInput,
-        });
-        let ctx = LedgerCtx::for_envelope(Arc::clone(self), envelope, reservation);
-        let execution = saga.build(ctx);
+        let consumes = envelope.consumes();
 
-        match execution.start().await {
-            ExecutionResult::Completed(e) => {
-                let ctx = e.into_context();
-                ctx.receipts.last().cloned().ok_or_else(|| {
-                    LedgerError::Store(StoreError::Internal("saga completed but no receipt".into()))
-                })
-            }
-            // The saga's error type is `LedgerError`, so a validation / overdraft
-            // / frozen failure detected during commit reaches the caller as the
-            // real typed variant instead of a stringified internal fault.
-            ExecutionResult::Failed(_, err) => Err(err),
-            ExecutionResult::CompensationFailed {
-                original_error,
-                compensation_error,
-                ..
-            } => Err(LedgerError::CompensationFailed {
-                original: Box::new(original_error),
-                compensation: Box::new(compensation_error),
-            }),
-            ExecutionResult::Paused(_) => Err(LedgerError::Store(StoreError::Internal(
-                "saga paused unexpectedly".into(),
-            ))),
+        let result = match self.reserve_consumed(consumes, reservation).await {
+            Ok(()) => self.finalize_envelope(envelope, reservation).await,
+            Err(err) => Err(err),
+        };
+
+        match result {
+            Ok(receipt) => Ok(receipt),
+            // Compensate by releasing our reservation. If the release itself fails
+            // we surface both errors, matching the old saga's `CompensationFailed`.
+            Err(err) => match self.store.release_postings(consumes, reservation).await {
+                Ok(_) => Err(err),
+                Err(comp) => Err(LedgerError::CompensationFailed {
+                    original: Box::new(err),
+                    compensation: Box::new(LedgerError::Store(comp)),
+                }),
+            },
         }
+    }
+
+    /// Reserve every consumed posting into the reserved index under `reservation`
+    /// (a CAS out of the active index), then check the affected-row count against
+    /// the ADR-0003 contract. A short count is accepted only when the shortfall is
+    /// already reserved by us (an idempotent replay, e.g. recovery re-running a
+    /// `Reserving` saga). A deposit consumes nothing, so this is a no-op.
+    async fn reserve_consumed(
+        &self,
+        consumes: &[PostingId],
+        reservation: ReservationId,
+    ) -> Result<(), LedgerError> {
+        if consumes.is_empty() {
+            return Ok(());
+        }
+        let reserved = self
+            .store
+            .reserve_postings(consumes, reservation)
+            .await
+            .map_err(LedgerError::Store)?;
+        verify_postings(
+            self.store.as_ref(),
+            consumes,
+            reserved,
+            |s| matches!(s, PostingState::Reserved(r) if *r == reservation),
+            "reserve",
+        )
+        .await
     }
 
     /// Complete every pending write-ahead record left by a crash. Call on
