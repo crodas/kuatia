@@ -17,17 +17,19 @@ use std::sync::Arc;
 
 use kuatia_core::{
     Account, AccountFlags, AccountId, AssetId, BookId, Cent, EnvelopeId, InsufficientFunds,
-    Metadata, Receipt, SUB_BITS, Transfer, TransferBuilder, hash::double_sha256,
+    Receipt, SUB_BITS, Transfer, TransferBuilder, hash::double_sha256,
 };
-use kuatia_storage::error::StoreError;
 use kuatia_storage::store::EnvelopeRecord;
 use serde::{Deserialize, Serialize};
 
 use crate::error::LedgerError;
 use crate::ledger::Ledger;
 
-/// Single metadata key holding the CBOR-encoded [`InflightMeta`] payload.
-const K_INFLIGHT: &str = "inflight";
+mod projection;
+use projection::{
+    FunderPayout, InflightMeta, K_INFLIGHT, StatusInput, derive_status, distribute_to_funders,
+    encode_meta, group_holds, meta_map, read_meta,
+};
 
 /// One leg of an inflight transaction: an amount of an asset funded by `funder`,
 /// parked in `hold`, destined for `destination`.
@@ -109,61 +111,11 @@ pub struct InflightStatus {
     pub state: InflightState,
 }
 
-// ---------------------------------------------------------------------------
-// Metadata: one CBOR-encoded tagged payload under the `inflight` key
-// ---------------------------------------------------------------------------
-
-/// The inflight payload carried in a transfer's or holding account's metadata.
-/// Serialized to CBOR (via `ciborium`) and stored under [`K_INFLIGHT`], so the
-/// whole lifecycle is self-describing and read back, not inferred.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum InflightMeta {
-    /// Tags the authorize transfer and carries its leg table.
-    Authorize { legs: Vec<InflightLeg> },
-    /// Tags a per-destination holding subaccount.
-    Hold { destination: AccountId },
-    /// Tags a settling transfer that delivers to a destination.
-    Confirm {
-        tx: EnvelopeId,
-        destination: AccountId,
-    },
-    /// Tags a settling transfer that returns to a funder.
-    Void {
-        tx: EnvelopeId,
-        destination: AccountId,
-    },
-}
-
 /// Whether a settle delivers to the destination or returns to a funder.
 #[derive(Clone, Copy)]
 enum SettleRole {
     Confirm,
     Void,
-}
-
-fn malformed(tid: EnvelopeId) -> LedgerError {
-    LedgerError::NotInflightTransaction(tid)
-}
-
-/// Encode an [`InflightMeta`] to CBOR bytes.
-fn encode_meta(meta: &InflightMeta) -> Result<Vec<u8>, LedgerError> {
-    let mut buf = Vec::new();
-    ciborium::into_writer(meta, &mut buf)
-        .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
-    Ok(buf)
-}
-
-/// Wrap a single [`InflightMeta`] into a fresh [`Metadata`] map.
-fn meta_map(meta: &InflightMeta) -> Result<Metadata, LedgerError> {
-    let mut m = Metadata::new();
-    m.insert(K_INFLIGHT.to_string(), encode_meta(meta)?);
-    Ok(m)
-}
-
-/// Decode the [`InflightMeta`] carried by a metadata map, if any.
-fn read_meta(meta: &Metadata) -> Option<InflightMeta> {
-    let bytes = meta.get(K_INFLIGHT)?;
-    ciborium::from_reader(bytes.as_slice()).ok()
 }
 
 impl Ledger {
@@ -359,40 +311,25 @@ impl Ledger {
         let mut receipts = Vec::new();
         for group in group_holds(&legs, *inflight)? {
             for asset in &group.assets {
-                let mut remaining = self.balance(&group.hold, asset).await?;
-                // Return to funders in leg order, each up to what it funded. For
-                // the common single-funder-per-(hold, asset) case this returns the
-                // whole remaining balance to that funder.
-                let mut funders: Vec<(AccountId, Cent)> = legs
-                    .iter()
-                    .filter(|l| l.hold == group.hold && l.asset == *asset)
-                    .map(|l| (l.funder, l.amount))
-                    .collect();
-                // Ensure any co-funding rounding leftover lands on the last funder.
-                if let Some(last) = funders.last_mut() {
-                    last.1 = Cent::from(i64::MAX);
-                }
-                for (funder, cap) in funders {
-                    if !remaining.is_positive() {
-                        break;
-                    }
-                    let give = if cap < remaining { cap } else { remaining };
-                    if give.is_positive() {
-                        receipts.push(
-                            self.settle(
-                                book,
-                                *inflight,
-                                group.hold,
-                                funder,
-                                group.destination,
-                                *asset,
-                                give,
-                                SettleRole::Void,
-                            )
-                            .await?,
-                        );
-                        remaining = remaining.checked_sub(give)?;
-                    }
+                // Return each hold's remaining balance to its funders; the pure
+                // split owns the leg-order and rounding-leftover rules.
+                let remaining = self.balance(&group.hold, asset).await?;
+                for FunderPayout { funder, give } in
+                    distribute_to_funders(&legs, group.hold, *asset, remaining)?
+                {
+                    receipts.push(
+                        self.settle(
+                            book,
+                            *inflight,
+                            group.hold,
+                            funder,
+                            group.destination,
+                            *asset,
+                            give,
+                            SettleRole::Void,
+                        )
+                        .await?,
+                    );
                 }
             }
             self.close_if_drained(&group.hold).await?;
@@ -412,65 +349,27 @@ impl Ledger {
         inflight: &EnvelopeId,
     ) -> Result<InflightStatus, LedgerError> {
         let (_record, legs) = self.load_inflight(inflight).await?;
-        let groups = group_holds(&legs, *inflight)?;
 
-        // Authorized per (hold, asset).
-        let mut authorized: BTreeMap<(AccountId, AssetId), Cent> = BTreeMap::new();
-        for l in &legs {
-            let e = authorized.entry((l.hold, l.asset)).or_insert(Cent::ZERO);
-            *e = e.checked_add(l.amount)?;
-        }
-
-        // Confirmed / voided per (hold, asset), summed from settle transfers.
-        let mut confirmed: BTreeMap<(AccountId, AssetId), Cent> = BTreeMap::new();
-        let mut voided: BTreeMap<(AccountId, AssetId), Cent> = BTreeMap::new();
-        for group in &groups {
-            for record in self.history(&group.hold).await? {
-                let bucket = match read_meta(record.envelope.metadata()) {
-                    Some(InflightMeta::Confirm { .. }) => &mut confirmed,
-                    Some(InflightMeta::Void { .. }) => &mut voided,
-                    _ => continue,
-                };
-                for np in record.envelope.creates() {
-                    if np.owner == group.hold {
-                        continue; // change returned to the hold, not settled out
-                    }
-                    let e = bucket.entry((group.hold, np.asset)).or_insert(Cent::ZERO);
-                    *e = e.checked_add(np.value)?;
-                }
-            }
-        }
-
-        let mut lines = Vec::new();
-        for group in &groups {
+        // Load exactly what the projection reads: each hold's settle history and
+        // its live per-asset balance. `group_holds` names the holds to fetch;
+        // `derive_status` re-derives its own grouping to fold the status.
+        let mut hold_history: Vec<(AccountId, Vec<EnvelopeRecord>)> = Vec::new();
+        let mut held: BTreeMap<(AccountId, AssetId), Cent> = BTreeMap::new();
+        for group in group_holds(&legs, *inflight)? {
+            hold_history.push((group.hold, self.history(&group.hold).await?));
             for asset in &group.assets {
-                let held = self.balance(&group.hold, asset).await?;
-                lines.push(InflightLegStatus {
-                    destination: group.destination,
-                    hold: group.hold,
-                    asset: *asset,
-                    authorized: authorized
-                        .get(&(group.hold, *asset))
-                        .copied()
-                        .unwrap_or(Cent::ZERO),
-                    confirmed: confirmed
-                        .get(&(group.hold, *asset))
-                        .copied()
-                        .unwrap_or(Cent::ZERO),
-                    voided: voided
-                        .get(&(group.hold, *asset))
-                        .copied()
-                        .unwrap_or(Cent::ZERO),
-                    held,
-                });
+                held.insert(
+                    (group.hold, *asset),
+                    self.balance(&group.hold, asset).await?,
+                );
             }
         }
 
-        let state = overall_state(&lines);
-        Ok(InflightStatus {
+        derive_status(StatusInput {
             inflight: *inflight,
-            legs: lines,
-            state,
+            legs: &legs,
+            hold_history: &hold_history,
+            held: &held,
         })
     }
 
@@ -567,79 +466,6 @@ fn inflight_subaccount(transfer: &Transfer) -> i64 {
     // code's encodable range (ADR-0015). The result is always positive.
     let mask = (1u64 << SUB_BITS) - 1;
     (u64::from_be_bytes(first) & mask) as i64
-}
-
-/// A holding subaccount of an inflight together with its destination and the
-/// assets it carries. Groups a leg table by hold so the confirm, void, and
-/// status paths share one traversal instead of each re-deriving `holds_of` /
-/// `destination_of` / `assets_of` inline.
-struct HoldGroup {
-    hold: AccountId,
-    destination: AccountId,
-    assets: Vec<AssetId>,
-}
-
-/// Group `legs` by holding subaccount, resolving each hold's destination. This
-/// is the single "walk the holds of an inflight" traversal; it is pure over the
-/// leg table and yields holds in sorted order (each with its assets sorted).
-fn group_holds(legs: &[InflightLeg], inflight: EnvelopeId) -> Result<Vec<HoldGroup>, LedgerError> {
-    holds_of(legs)
-        .into_iter()
-        .map(|hold| {
-            Ok(HoldGroup {
-                hold,
-                destination: destination_of(legs, hold, inflight)?,
-                assets: assets_of(legs, hold).into_iter().collect(),
-            })
-        })
-        .collect()
-}
-
-fn holds_of(legs: &[InflightLeg]) -> BTreeSet<AccountId> {
-    legs.iter().map(|l| l.hold).collect()
-}
-
-fn assets_of(legs: &[InflightLeg], hold: AccountId) -> BTreeSet<AssetId> {
-    legs.iter()
-        .filter(|l| l.hold == hold)
-        .map(|l| l.asset)
-        .collect()
-}
-
-fn destination_of(
-    legs: &[InflightLeg],
-    hold: AccountId,
-    inflight: EnvelopeId,
-) -> Result<AccountId, LedgerError> {
-    legs.iter()
-        .find(|l| l.hold == hold)
-        .map(|l| l.destination)
-        .ok_or_else(|| malformed(inflight))
-}
-
-fn overall_state(lines: &[InflightLegStatus]) -> InflightState {
-    let mut any_held = false;
-    let mut any_confirmed = false;
-    let mut any_voided = false;
-    for l in lines {
-        if l.held.is_positive() {
-            any_held = true;
-        }
-        if l.confirmed.is_positive() {
-            any_confirmed = true;
-        }
-        if l.voided.is_positive() {
-            any_voided = true;
-        }
-    }
-    match (any_held, any_confirmed, any_voided) {
-        (true, false, false) => InflightState::Held,
-        (true, _, _) => InflightState::PartiallyConfirmed,
-        (false, true, true) => InflightState::Mixed,
-        (false, false, true) => InflightState::Voided,
-        // Fully settled to destinations, or an empty/zero authorization.
-        (false, _, false) => InflightState::Confirmed,
-    }
 }
 
 #[cfg(test)]

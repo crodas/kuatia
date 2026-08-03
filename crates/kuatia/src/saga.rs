@@ -12,7 +12,7 @@
 //! 1. **ReservePostingsStep** -- `reserve_postings`: move each consumed posting from the active index into the reserved index under the saga's `ReservationId`; interprets the count via `verify_postings`.
 //! 2. **FinalizeTransferStep** -- delegates to `Ledger::finalize_envelope`, which re-validates against current state (the last-step floor / freeze-close guard), marks the saga `Finalizing`, then runs the dumb primitives (`deactivate_postings` → `insert_postings` → `store_transfer` → `append_event`) verifying every end-state.
 //!
-//! The `EnvelopeSaga` is defined via `legend!` in `ledger.rs` and driven by
+//! The `EnvelopeSaga` is defined via `legend!` below and driven by
 //! `commit_envelope()`. Crash recovery (`Ledger::recover`) re-completes a
 //! persisted saga using its persisted phase: a `Reserving` saga is re-run
 //! (re-validating); a `Finalizing` saga is rolled forward through the same
@@ -23,11 +23,17 @@
 //! High-level steps (`PayMovementStep` and `DepositMovementStep`) compose over
 //! the intent-layer API and can be combined into multi-transfer sagas via `legend!`.
 
+// The `legend!` expansion for `EnvelopeSaga` below emits public fields it does
+// not document. An outer `#[allow]` on the macro call is ignored by the
+// compiler, so the allow is scoped to the whole module.
+#![allow(missing_docs)]
+
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use legend::legend;
 use legend::step::{CompensationOutcome, RetryPolicy, Step, StepOutcome};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
@@ -342,6 +348,13 @@ impl Step<LedgerCtx, LedgerError> for FinalizeTransferStep {
 
     fn retry_policy() -> RetryPolicy {
         RetryPolicy::retries(3)
+    }
+}
+
+legend! {
+    EnvelopeSaga<LedgerCtx, LedgerError> {
+        reserve: ReservePostingsStep,
+        finalize: FinalizeTransferStep,
     }
 }
 
