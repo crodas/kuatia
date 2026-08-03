@@ -18,4 +18,6 @@ pub use posting_resolution::{
     Debit, InsufficientFunds, MovementDraft, ResolveError, ResolveInput, draft_movements,
     resolve_envelope,
 };
-pub use validate::{Plan, PlanInput, ValidationError, validate_and_plan};
+pub use validate::{
+    Plan, PlanInput, RequiredState, ValidationError, required_state, validate_and_plan,
+};

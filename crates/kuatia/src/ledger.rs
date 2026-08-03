@@ -17,14 +17,7 @@ use std::sync::Arc;
 
 use kuatia_storage::store::Store;
 
-// Kept in root scope so `envelope_saga`'s `use super::*` resolves the `legend!`
-// macro and the types its expansion names.
 use crate::error::LedgerError;
-use crate::saga::{FinalizeTransferStep, LedgerCtx, ReservePostingsStep};
-use legend::legend;
-
-#[allow(missing_docs)]
-mod envelope_saga;
 
 mod balance;
 mod commit;
