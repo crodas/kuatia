@@ -209,8 +209,7 @@ async fn migration_004_backfills_index_tables() {
         .await
         .unwrap();
 
-    // A post-003 DB also has the accounts table (empty here); migrate() will run
-    // 005 after 004, which backfills the account head from it.
+    // A post-003 DB also has the accounts table (empty here).
     sqlx::query(
         "CREATE TABLE accounts (id BIGINT NOT NULL, subaccount BIGINT NOT NULL DEFAULT 0, version BIGINT NOT NULL, policy TEXT NOT NULL, flags INTEGER NOT NULL, book BIGINT NOT NULL, metadata TEXT NOT NULL, PRIMARY KEY (id, subaccount, version))",
     )
@@ -218,12 +217,23 @@ async fn migration_004_backfills_index_tables() {
     .await
     .unwrap();
 
-    // Record 001-003 as applied so migrate() only runs 004 and 005.
+    // Record every migration except 004 as applied so migrate() runs only 004,
+    // isolating its backfill. In particular 008 (which merges the index tables
+    // into `live_postings`) is pinned as applied so it does not run and clobber
+    // the active/reserved tables this test inspects.
     sqlx::query("CREATE TABLE _migrations (name TEXT PRIMARY KEY)")
         .execute(&pool)
         .await
         .unwrap();
-    for m in ["001_init", "002_subaccounts", "003_drop_user_data"] {
+    for m in [
+        "001_init",
+        "002_subaccounts",
+        "003_drop_user_data",
+        "005_account_head",
+        "006_drop_policy",
+        "007_balance_projection",
+        "008_live_postings",
+    ] {
         sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
             .bind(m)
             .execute(&pool)
@@ -298,7 +308,9 @@ async fn migration_005_backfills_account_head() {
             .unwrap();
     }
 
-    // Record 001-004 as applied so migrate() only runs 005.
+    // Record every migration except 005 as applied so migrate() runs only 005.
+    // 008 is pinned as applied so it does not run against a DB whose 004 index
+    // tables were never created.
     sqlx::query("CREATE TABLE _migrations (name TEXT PRIMARY KEY)")
         .execute(&pool)
         .await
@@ -308,6 +320,9 @@ async fn migration_005_backfills_account_head() {
         "002_subaccounts",
         "003_drop_user_data",
         "004_index_tables",
+        "006_drop_policy",
+        "007_balance_projection",
+        "008_live_postings",
     ] {
         sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
             .bind(m)
@@ -333,6 +348,95 @@ async fn migration_005_backfills_account_head() {
     // The store reads the current version through the head.
     let acct = store.get_account(&AccountId::new(1)).await.unwrap();
     assert_eq!(acct.version, 3);
+}
+
+/// The 008 migration merges the two index tables into one `live_postings`
+/// table: an active row is backfilled with `reservation` NULL, a reserved row
+/// keeps its token, and the old `active_postings`/`reserved_postings` tables are
+/// dropped.
+#[tokio::test]
+async fn migration_008_merges_live_postings() {
+    let pool = new_pool().await;
+
+    // Post-004 index tables with one active and one reserved posting.
+    sqlx::query(
+        "CREATE TABLE active_postings (transfer_id TEXT NOT NULL, idx SMALLINT NOT NULL, owner BIGINT NOT NULL, subaccount BIGINT NOT NULL DEFAULT 0, asset INTEGER NOT NULL, value TEXT NOT NULL, PRIMARY KEY (transfer_id, idx))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE reserved_postings (transfer_id TEXT NOT NULL, idx SMALLINT NOT NULL, owner BIGINT NOT NULL, subaccount BIGINT NOT NULL DEFAULT 0, asset INTEGER NOT NULL, value TEXT NOT NULL, reservation BIGINT NOT NULL, PRIMARY KEY (transfer_id, idx))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO active_postings (transfer_id, idx, owner, subaccount, asset, value) VALUES ('aa', 0, 1, 0, 1, '100')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO reserved_postings (transfer_id, idx, owner, subaccount, asset, value, reservation) VALUES ('bb', 0, 1, 0, 1, '200', 77)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Record every migration except 008 as applied so migrate() runs only 008.
+    sqlx::query("CREATE TABLE _migrations (name TEXT PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for m in [
+        "001_init",
+        "002_subaccounts",
+        "003_drop_user_data",
+        "004_index_tables",
+        "005_account_head",
+        "006_drop_policy",
+        "007_balance_projection",
+    ] {
+        sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
+            .bind(m)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let store = SqlStore::new(pool.clone());
+    store.migrate().await.unwrap();
+
+    // The active row lands with reservation NULL, the reserved row keeps its token.
+    let mut rows: Vec<(String, Option<i64>)> =
+        sqlx::query("SELECT transfer_id, reservation FROM live_postings")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r.try_get("transfer_id").unwrap(),
+                    r.try_get("reservation").unwrap(),
+                )
+            })
+            .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![("aa".to_string(), None), ("bb".to_string(), Some(77))]
+    );
+
+    // The old index tables are gone.
+    assert!(
+        sqlx::query("SELECT 1 FROM active_postings")
+            .fetch_all(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("SELECT 1 FROM reserved_postings")
+            .fetch_all(&pool)
+            .await
+            .is_err()
+    );
 }
 
 /// migrate() is idempotent: running it repeatedly on the same DB is a no-op.

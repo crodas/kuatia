@@ -1,13 +1,12 @@
-//! [`PostingStore`]: the immutable posting record plus two hot index tables
-//! (`active_postings`, `reserved_postings`) whose membership derives each
-//! posting's lifecycle state.
+//! [`PostingStore`]: the immutable posting record plus one `live_postings` hot
+//! table whose `reservation` column derives each posting's lifecycle state.
 //!
-//! A posting is in `active_postings` while spendable, moves to
-//! `reserved_postings` (carrying its reservation) while claimed by a saga, and
-//! once consumed is deleted from both, leaving it only in the immutable
-//! `postings` table (= Spent). See ADR-0016.
+//! A posting is in `live_postings` while it is spendable or reserved:
+//! `reservation IS NULL` = Active, `reservation = rid` = Reserved by that saga.
+//! Once consumed the row is deleted, leaving the posting only in the immutable
+//! `postings` table (= Spent). See ADR-0022 (merged hot index) and ADR-0016.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use sqlx::Row;
@@ -20,21 +19,16 @@ use kuatia_types::*;
 use crate::SqlStore;
 use crate::row::{envelope_id_to_hex, row_to_posting};
 
-/// The FROM source for a posting read of the given derived state. Each index
-/// table carries a full row copy, so the live-set reads target the index table
-/// directly with no merge back to the immutable `postings` record. `Live` is a
-/// `UNION ALL` of the two disjoint live sets (the shared 6 data columns), still
-/// with no join to history. Portable across SQLite and PostgreSQL.
-fn filter_source(filter: PostingFilter) -> &'static str {
+/// The `(source_table, state_predicate)` a posting read of the given filter
+/// targets. Live/Active/Reserved read the single `live_postings` hot table,
+/// narrowed by the `reservation` column; `All` reads the immutable record. No
+/// UNION: the live set is one table.
+fn filter_source(filter: PostingFilter) -> (&'static str, &'static str) {
     match filter {
-        PostingFilter::Active => "active_postings",
-        PostingFilter::Reserved => "reserved_postings",
-        PostingFilter::All => "postings",
-        PostingFilter::Live => {
-            "(SELECT transfer_id, idx, owner, subaccount, asset, value FROM active_postings \
-             UNION ALL \
-             SELECT transfer_id, idx, owner, subaccount, asset, value FROM reserved_postings) AS live"
-        }
+        PostingFilter::Active => ("live_postings", " AND reservation IS NULL"),
+        PostingFilter::Reserved => ("live_postings", " AND reservation IS NOT NULL"),
+        PostingFilter::Live => ("live_postings", ""),
+        PostingFilter::All => ("postings", ""),
     }
 }
 
@@ -64,10 +58,6 @@ fn id_predicate(count: usize, start: u32) -> String {
         .collect::<Vec<_>>()
         .join(" OR ")
 }
-
-// ---------------------------------------------------------------------------
-// PostingStore
-// ---------------------------------------------------------------------------
 
 #[async_trait]
 impl PostingStore for SqlStore {
@@ -130,9 +120,10 @@ impl PostingStore for SqlStore {
     ) -> Result<Vec<Posting>, StoreError> {
         // Build the predicate dynamically: `sub == None` spans every subaccount
         // of `id`, `Some(s)` restricts to one. The subaccount is compared only
-        // for equality, never as a magnitude. The derived-state filter selects
-        // which table (index copy or immutable record) to read from directly.
-        let mut sql = format!("SELECT * FROM {} WHERE owner = $1", filter_source(filter));
+        // for equality, never as a magnitude. The filter picks the source table
+        // and, for the live table, the `reservation` state predicate.
+        let (source, state) = filter_source(filter);
+        let mut sql = format!("SELECT * FROM {source} WHERE owner = $1");
         let mut placeholder = 2u32;
         if sub.is_some() {
             sql.push_str(&format!(" AND subaccount = ${placeholder}"));
@@ -141,6 +132,7 @@ impl PostingStore for SqlStore {
         if asset.is_some() {
             sql.push_str(&format!(" AND asset = ${placeholder}"));
         }
+        sql.push_str(state);
         // Deterministic order by the posting primary key, matching
         // `query_postings`, so callers (and pagination built on top) see a
         // stable sequence.
@@ -166,11 +158,12 @@ impl PostingStore for SqlStore {
             return Ok(Vec::new());
         }
 
-        // One set-based query per state table instead of up to three probes per
-        // id, reusing the portable `id_predicate` (an OR of equality pairs;
-        // row-value `IN` is not portable across SQLite and PostgreSQL) and
-        // binding every id in order as `(hex(transfer), idx as i16)`. Chunked so
-        // a large batch never exceeds the bind-parameter limit.
+        // Two set-based queries per chunk (was three, before the hot tables were
+        // merged): the live table carries both Active (`reservation IS NULL`) and
+        // Reserved (`reservation = rid`) in one row, and `postings` decides Spent
+        // vs Missing for ids absent from the live set. Reuses the portable
+        // `id_predicate` (an OR of equality pairs; row-value `IN` is not portable
+        // across SQLite and PostgreSQL), binding each id as `(hex, idx)`.
 
         // Key membership by the same `(hex, idx)` values that were bound, so the
         // per-id lookup below matches without decoding transfer ids back.
@@ -184,62 +177,50 @@ impl PostingStore for SqlStore {
             Ok((transfer_id, idx))
         };
 
-        let mut active: HashSet<(String, i16)> = HashSet::new();
-        let mut reserved: HashMap<(String, i16), i64> = HashMap::new();
-        let mut spent: HashSet<(String, i16)> = HashSet::new();
+        // `live` maps each present id to its reservation: `None` = Active,
+        // `Some(rid)` = Reserved. `present` is every id in the immutable record,
+        // used to tell Spent (present, not live) from Missing (absent).
+        let mut live: HashMap<(String, i16), Option<i64>> = HashMap::new();
+        let mut present: std::collections::HashSet<(String, i16)> =
+            std::collections::HashSet::new();
 
         for chunk in ids.chunks(MAX_IDS_PER_QUERY) {
             let predicate = id_predicate(chunk.len(), 1);
 
-            let active_sql =
-                format!("SELECT transfer_id, idx FROM active_postings WHERE {predicate}");
-            let mut active_q = sqlx::query(&active_sql);
-            for id in chunk {
-                active_q = active_q
-                    .bind(envelope_id_to_hex(&id.transfer))
-                    .bind(id.index as i16);
-            }
-            let active_rows = active_q
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
-            for row in &active_rows {
-                active.insert(row_key(row)?);
-            }
-
-            let reserved_sql = format!(
-                "SELECT transfer_id, idx, reservation FROM reserved_postings WHERE {predicate}"
+            let live_sql = format!(
+                "SELECT transfer_id, idx, reservation FROM live_postings WHERE {predicate}"
             );
-            let mut reserved_q = sqlx::query(&reserved_sql);
+            let mut live_q = sqlx::query(&live_sql);
             for id in chunk {
-                reserved_q = reserved_q
+                live_q = live_q
                     .bind(envelope_id_to_hex(&id.transfer))
                     .bind(id.index as i16);
             }
-            let reserved_rows = reserved_q
+            let live_rows = live_q
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
-            for row in &reserved_rows {
-                let rid: i64 = row
+            for row in &live_rows {
+                // `reservation` is nullable: NULL decodes to `None` = Active.
+                let rid: Option<i64> = row
                     .try_get("reservation")
                     .map_err(|e| StoreError::Internal(e.to_string()))?;
-                reserved.insert(row_key(row)?, rid);
+                live.insert(row_key(row)?, rid);
             }
 
-            let spent_sql = format!("SELECT transfer_id, idx FROM postings WHERE {predicate}");
-            let mut spent_q = sqlx::query(&spent_sql);
+            let present_sql = format!("SELECT transfer_id, idx FROM postings WHERE {predicate}");
+            let mut present_q = sqlx::query(&present_sql);
             for id in chunk {
-                spent_q = spent_q
+                present_q = present_q
                     .bind(envelope_id_to_hex(&id.transfer))
                     .bind(id.index as i16);
             }
-            let spent_rows = spent_q
+            let present_rows = present_q
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
-            for row in &spent_rows {
-                spent.insert(row_key(row)?);
+            for row in &present_rows {
+                present.insert(row_key(row)?);
             }
         }
 
@@ -248,14 +229,11 @@ impl PostingStore for SqlStore {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             let key = (envelope_id_to_hex(&id.transfer), id.index as i16);
-            out.push(if active.contains(&key) {
-                PostingState::Active
-            } else if let Some(rid) = reserved.get(&key) {
-                PostingState::Reserved(ReservationId::new(*rid))
-            } else if spent.contains(&key) {
-                PostingState::Spent
-            } else {
-                PostingState::Missing
+            out.push(match live.get(&key) {
+                Some(None) => PostingState::Active,
+                Some(Some(rid)) => PostingState::Reserved(ReservationId::new(*rid)),
+                None if present.contains(&key) => PostingState::Spent,
+                None => PostingState::Missing,
             });
         }
         Ok(out)
@@ -263,7 +241,7 @@ impl PostingStore for SqlStore {
 
     async fn query_postings(&self, query: &PostingQuery) -> Result<Page<Posting>, StoreError> {
         let (where_clause, count_clause) = {
-            let source = filter_source(query.filter);
+            let (source, state) = filter_source(query.filter);
             let mut w = String::from("WHERE owner = $1");
             let mut idx = 2u32;
             if query.sub.is_some() {
@@ -273,13 +251,12 @@ impl PostingStore for SqlStore {
             if query.asset.is_some() {
                 w.push_str(&format!(" AND asset = ${idx}"));
             }
+            w.push_str(state);
             let c = format!("SELECT COUNT(*) as cnt FROM {source} {w}");
             let limit = query.limit.unwrap_or(u32::MAX);
             let offset = query.offset.unwrap_or(0);
             // Order by the posting primary key so pagination is deterministic:
-            // without it LIMIT/OFFSET could skip or repeat rows across pages,
-            // especially for `Live`, whose source is a `UNION ALL` with no
-            // inherent order.
+            // without it LIMIT/OFFSET could skip or repeat rows across pages.
             w.push_str(&format!(
                 " ORDER BY transfer_id, idx LIMIT {limit} OFFSET {offset}"
             ));
@@ -327,13 +304,12 @@ impl PostingStore for SqlStore {
         ids: &[PostingId],
         reservation: ReservationId,
     ) -> Result<u64, StoreError> {
-        // Dumb instruction over the whole id set, in two statements: copy the
-        // currently-active rows into the reserved index (sourced from
-        // `active_postings`, so only active ids move), then delete those same
-        // ids from `active_postings`. The DELETE's affected count is the number
-        // claimed, and by active/reserved disjointness it equals the INSERT's
-        // row count. Concurrent reserves serialize on the reserved-index primary
-        // key, so exactly one wins each contended id.
+        // Dumb instruction over the whole id set: flip each still-Active row's
+        // `reservation` from NULL to this saga's id. `WHERE reservation IS NULL`
+        // is the atomic single-winner claim: concurrent reserves serialize on the
+        // row lock, and the loser's predicate no longer matches, so exactly one
+        // wins each contended id. `rows_affected` is the number claimed; an
+        // already-reserved or spent id does not match and is not counted.
         if ids.is_empty() {
             return Ok(0);
         }
@@ -348,38 +324,21 @@ impl PostingStore for SqlStore {
         let mut claimed: u64 = 0;
         for chunk in ids.chunks(MAX_IDS_PER_QUERY) {
             // Reservation is $1; each id pair follows starting at $2.
-            let insert_sql = format!(
-                "INSERT INTO reserved_postings (transfer_id, idx, owner, subaccount, asset, value, reservation) \
-                 SELECT transfer_id, idx, owner, subaccount, asset, value, $1 FROM active_postings WHERE {} \
-                 ON CONFLICT (transfer_id, idx) DO NOTHING",
+            let sql = format!(
+                "UPDATE live_postings SET reservation = $1 WHERE ({}) AND reservation IS NULL",
                 id_predicate(chunk.len(), 2)
             );
-            let mut insert_q = sqlx::query(&insert_sql).bind(reservation.0);
+            let mut q = sqlx::query(&sql).bind(reservation.0);
             for id in chunk {
-                insert_q = insert_q
+                q = q
                     .bind(envelope_id_to_hex(&id.transfer))
                     .bind(id.index as i16);
             }
-            insert_q
+            let res = q
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
-
-            let delete_sql = format!(
-                "DELETE FROM active_postings WHERE {}",
-                id_predicate(chunk.len(), 1)
-            );
-            let mut delete_q = sqlx::query(&delete_sql);
-            for id in chunk {
-                delete_q = delete_q
-                    .bind(envelope_id_to_hex(&id.transfer))
-                    .bind(id.index as i16);
-            }
-            let del = delete_q
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
-            claimed += del.rows_affected();
+            claimed += res.rows_affected();
         }
 
         tx.commit()
@@ -393,10 +352,10 @@ impl PostingStore for SqlStore {
         ids: &[PostingId],
         reservation: ReservationId,
     ) -> Result<u64, StoreError> {
-        // Dumb instruction over the whole id set: copy the rows reserved by
-        // `reservation` back into the active index, then delete them from the
-        // reserved index. The DELETE's affected count is the number released; an
-        // id already active or reserved by another saga does not match.
+        // Dumb instruction over the whole id set: clear the `reservation` of the
+        // rows this saga holds, returning them to Active. `rows_affected` is the
+        // number released; an id already Active or reserved by another saga does
+        // not match `reservation = rid` and is left untouched.
         if ids.is_empty() {
             return Ok(0);
         }
@@ -406,43 +365,24 @@ impl PostingStore for SqlStore {
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
 
-        // Chunked so a large id set stays under the bind-parameter limit; all
-        // chunks share one transaction.
         let mut released: u64 = 0;
         for chunk in ids.chunks(MAX_IDS_PER_QUERY) {
             // Reservation is $1; each id pair follows starting at $2.
-            let insert_sql = format!(
-                "INSERT INTO active_postings (transfer_id, idx, owner, subaccount, asset, value) \
-                 SELECT transfer_id, idx, owner, subaccount, asset, value FROM reserved_postings \
-                 WHERE ({}) AND reservation = $1 ON CONFLICT (transfer_id, idx) DO NOTHING",
+            let sql = format!(
+                "UPDATE live_postings SET reservation = NULL WHERE ({}) AND reservation = $1",
                 id_predicate(chunk.len(), 2)
             );
-            let mut insert_q = sqlx::query(&insert_sql).bind(reservation.0);
+            let mut q = sqlx::query(&sql).bind(reservation.0);
             for id in chunk {
-                insert_q = insert_q
+                q = q
                     .bind(envelope_id_to_hex(&id.transfer))
                     .bind(id.index as i16);
             }
-            insert_q
+            let res = q
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
-
-            let delete_sql = format!(
-                "DELETE FROM reserved_postings WHERE ({}) AND reservation = $1",
-                id_predicate(chunk.len(), 2)
-            );
-            let mut delete_q = sqlx::query(&delete_sql).bind(reservation.0);
-            for id in chunk {
-                delete_q = delete_q
-                    .bind(envelope_id_to_hex(&id.transfer))
-                    .bind(id.index as i16);
-            }
-            let del = delete_q
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
-            released += del.rows_affected();
+            released += res.rows_affected();
         }
 
         tx.commit()
@@ -456,11 +396,11 @@ impl PostingStore for SqlStore {
         ids: &[PostingId],
         reservation: Option<ReservationId>,
     ) -> Result<u64, StoreError> {
-        // Dumb instruction over the whole id set: a DELETE removes the ids from
-        // an index so they become spent (present only in the immutable table).
-        // `rows_affected` is the count; the caller interprets a shortfall.
-        // Chunked under one transaction so a large id set stays within the
-        // bind-parameter limit while the removal stays atomic.
+        // Dumb instruction over the whole id set: DELETE the ids from the live
+        // table so they become spent (present only in the immutable `postings`).
+        // The raw path removes still-Active rows (`reservation IS NULL`); the saga
+        // path removes only the rows reserved by `rid`. `rows_affected` is the
+        // count; the caller interprets a shortfall. Chunked under one transaction.
         if ids.is_empty() {
             return Ok(0);
         }
@@ -472,10 +412,10 @@ impl PostingStore for SqlStore {
         let mut removed: u64 = 0;
         for chunk in ids.chunks(MAX_IDS_PER_QUERY) {
             let (sql, rid) = match reservation {
-                // Raw path: remove from the active index.
+                // Raw path: remove still-Active rows.
                 None => (
                     format!(
-                        "DELETE FROM active_postings WHERE {}",
+                        "DELETE FROM live_postings WHERE ({}) AND reservation IS NULL",
                         id_predicate(chunk.len(), 1)
                     ),
                     None,
@@ -483,7 +423,7 @@ impl PostingStore for SqlStore {
                 // Saga path: remove only the rows reserved by `rid`.
                 Some(rid) => (
                     format!(
-                        "DELETE FROM reserved_postings WHERE ({}) AND reservation = $1",
+                        "DELETE FROM live_postings WHERE ({}) AND reservation = $1",
                         id_predicate(chunk.len(), 2)
                     ),
                     Some(rid),
@@ -512,9 +452,10 @@ impl PostingStore for SqlStore {
 
     async fn insert_postings(&self, postings: &[Posting]) -> Result<u64, StoreError> {
         // Dumb instruction: insert each posting into the immutable table and, only
-        // when the row was newly inserted, add its id to the active index. Return
-        // the count of immutable rows inserted. The newness gate stops a replayed
-        // finalize from re-activating a since-spent posting.
+        // when the row was newly inserted, add it to the live table as Active
+        // (reservation NULL). Return the count of immutable rows inserted. The
+        // newness gate stops a replayed finalize from re-activating a since-spent
+        // posting.
         let mut tx = self
             .pool
             .begin()
@@ -536,9 +477,9 @@ impl PostingStore for SqlStore {
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
             if res.rows_affected() == 1 {
-                // Activate a full copy so spendable reads never merge.
+                // Activate a full copy (reservation NULL) so spendable reads never merge.
                 sqlx::query(
-                    "INSERT INTO active_postings (transfer_id, idx, owner, subaccount, asset, value) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (transfer_id, idx) DO NOTHING",
+                    "INSERT INTO live_postings (transfer_id, idx, owner, subaccount, asset, value, reservation) VALUES ($1, $2, $3, $4, $5, $6, NULL) ON CONFLICT (transfer_id, idx) DO NOTHING",
                 )
                 .bind(hex)
                 .bind(posting.id.index as i16)

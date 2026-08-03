@@ -44,6 +44,10 @@ impl SqlStore {
                 "007_balance_projection",
                 include_str!("migrations/007_balance_projection.sql"),
             ),
+            (
+                "008_live_postings",
+                include_str!("migrations/008_live_postings.sql"),
+            ),
         ];
 
         for (name, sql) in migrations {
