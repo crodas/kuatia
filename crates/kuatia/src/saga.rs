@@ -1,46 +1,31 @@
-//! Legend saga step adapters for the ledger.
+//! Ledger commit helpers and high-level saga steps.
 //!
-//! Provides [`Step`] implementations so the ledger can participate
-//! in multi-resource saga workflows, with automatic LIFO compensation across
-//! resource boundaries.
+//! # Count contract
 //!
-//! # Envelope pipeline saga
-//!
-//! A commit is two saga steps over a pre-resolved [`Envelope`] (resolution runs
-//! before the saga, in `Ledger::commit`):
-//!
-//! 1. **ReservePostingsStep** -- `reserve_postings`: move each consumed posting from the active index into the reserved index under the saga's `ReservationId`; interprets the count via `verify_postings`.
-//! 2. **FinalizeTransferStep** -- delegates to `Ledger::finalize_envelope`, which re-validates against current state (the last-step floor / freeze-close guard), marks the saga `Finalizing`, then runs the dumb primitives (`deactivate_postings` → `insert_postings` → `store_transfer` → `append_event`) verifying every end-state.
-//!
-//! The `EnvelopeSaga` is defined via `legend!` below and driven by
-//! `commit_envelope()`. Crash recovery (`Ledger::recover`) re-completes a
-//! persisted saga using its persisted phase: a `Reserving` saga is re-run
-//! (re-validating); a `Finalizing` saga is rolled forward through the same
-//! verified `finalize_envelope`.
+//! `apply_and_verify`, `verify_postings`, and `consume_reserved` encode the
+//! ADR-0003 affected-row-count rule applied after every dumb write primitive in
+//! the commit path. The commit path itself (reserve → finalize) is a linear
+//! method on [`Ledger`] (`ledger::commit`), not a `legend` saga: for a single
+//! commit the two steps were pass-throughs, so collapsing them keeps the
+//! reserve/compensation policy next to the logic it governs (refines ADR-0002).
 //!
 //! # High-level composition
 //!
-//! High-level steps (`PayMovementStep` and `DepositMovementStep`) compose over
-//! the intent-layer API and can be combined into multi-transfer sagas via `legend!`.
-
-// The `legend!` expansion for `EnvelopeSaga` below emits public fields it does
-// not document. An outer `#[allow]` on the macro call is ignored by the
-// compiler, so the allow is scoped to the whole module.
-#![allow(missing_docs)]
+//! [`PayMovementStep`] and [`DepositMovementStep`] wrap the intent-layer
+//! `Ledger::commit` as `legend` [`Step`]s, so several transfers compose into one
+//! multi-transfer saga (an FX trade, a multi-leg settlement) with LIFO
+//! compensation across the whole workflow. This is where `legend` earns its keep.
 
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use legend::legend;
-use legend::step::{CompensationOutcome, RetryPolicy, Step, StepOutcome};
+use legend::step::{CompensationOutcome, Step, StepOutcome};
 use serde::{Deserialize, Serialize};
-use tracing::Instrument;
 
 use kuatia_core::{
-    AccountId, AssetId, Cent, Envelope, PostingId, PostingState, Receipt, ReservationId,
-    TransferBuilder,
+    AccountId, AssetId, Cent, PostingId, PostingState, Receipt, ReservationId, TransferBuilder,
 };
 
 use crate::error::LedgerError;
@@ -141,21 +126,15 @@ pub(crate) async fn consume_reserved(
 // Saga context -- carries the ledger handle + state between steps
 // ---------------------------------------------------------------------------
 
-/// Saga context that wraps a ledger and tracks state across steps.
+/// Saga context that wraps a ledger and collects the receipts of the transfers a
+/// multi-transfer saga commits, for LIFO compensation.
 ///
 /// The ledger handle is `#[serde(skip)]`: it is supplied when the context is
 /// constructed and is not part of the serialized form.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LedgerCtx {
-    /// Receipts collected from completed steps.
+    /// Receipts collected from completed steps, popped in reverse to compensate.
     pub receipts: Vec<Receipt>,
-    /// Posting ids reserved so far (for compensation).
-    pub reserved_postings: Vec<PostingId>,
-    /// Resolved envelope produced by the resolve step.
-    pub envelope: Option<Envelope>,
-    /// Reservation owner token for this saga's reserved postings. Serialized so
-    /// it survives pause/recovery, keeping ownership stable across restarts.
-    pub reservation: ReservationId,
     #[serde(skip)]
     ledger: Option<Arc<Ledger>>,
 }
@@ -164,8 +143,6 @@ impl fmt::Debug for LedgerCtx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LedgerCtx")
             .field("receipts", &self.receipts)
-            .field("reserved_postings", &self.reserved_postings.len())
-            .field("has_envelope", &self.envelope.is_some())
             .field("ledger_present", &self.ledger.is_some())
             .finish()
     }
@@ -176,25 +153,6 @@ impl LedgerCtx {
     pub fn new(ledger: Arc<Ledger>) -> Self {
         Self {
             receipts: Vec::new(),
-            reserved_postings: Vec::new(),
-            envelope: None,
-            reservation: ReservationId::default(),
-            ledger: Some(ledger),
-        }
-    }
-
-    /// Create a context for the envelope pipeline (reserve → finalize; finalize re-validates)
-    /// with a pre-resolved envelope and an explicit reservation.
-    pub fn for_envelope(
-        ledger: Arc<Ledger>,
-        envelope: Envelope,
-        reservation: ReservationId,
-    ) -> Self {
-        Self {
-            receipts: Vec::new(),
-            reserved_postings: Vec::new(),
-            envelope: Some(envelope),
-            reservation,
             ledger: Some(ledger),
         }
     }
@@ -212,149 +170,6 @@ impl LedgerCtx {
         self.ledger
             .clone()
             .ok_or_else(|| internal("ledger handle missing from saga context"))
-    }
-}
-
-// ===========================================================================
-// Envelope pipeline steps (reserve -> finalize; resolve runs before the saga, validate inside finalize)
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// Step 1: ReservePostingsStep
-// ---------------------------------------------------------------------------
-
-/// Input for the reserve step (posting ids come from ctx.envelope).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReserveInput;
-
-/// Reserves consumed postings by CAS: move each from the active index to the
-/// reserved index (the delete-returns-one picks a single winner).
-///
-/// Gets the posting ids from the resolved envelope in the context.
-/// Compensation releases all reserved postings back to Active.
-pub struct ReservePostingsStep;
-
-#[async_trait]
-impl Step<LedgerCtx, LedgerError> for ReservePostingsStep {
-    type Input = ReserveInput;
-
-    async fn execute(
-        ctx: &mut LedgerCtx,
-        _input: &ReserveInput,
-    ) -> Result<StepOutcome, LedgerError> {
-        async {
-            let posting_ids: Vec<PostingId> = ctx
-                .envelope
-                .as_ref()
-                .ok_or_else(|| internal("no envelope in context -- resolve step must run first"))?
-                .consumes()
-                .to_vec();
-            let rid = ctx.reservation;
-            let ledger = ctx.ledger_arc()?;
-            let store = ledger.store();
-
-            let reserved = store
-                .reserve_postings(&posting_ids, rid)
-                .await
-                .map_err(LedgerError::Store)?;
-            // Storage reports the count; the saga decides. A short count is fine
-            // only if the shortfall is already reserved by us (idempotent replay).
-            verify_postings(
-                store,
-                &posting_ids,
-                reserved,
-                |s| matches!(s, PostingState::Reserved(r) if *r == rid),
-                "reserve",
-            )
-            .await?;
-            ctx.reserved_postings.extend_from_slice(&posting_ids);
-            Ok(StepOutcome::Continue)
-        }
-        .instrument(tracing::info_span!("saga_step", step = "reserve"))
-        .await
-    }
-
-    async fn compensate(
-        ctx: &mut LedgerCtx,
-        _input: &ReserveInput,
-    ) -> Result<CompensationOutcome, LedgerError> {
-        ctx.ledger()?
-            .store()
-            .release_postings(&ctx.reserved_postings, ctx.reservation)
-            .await
-            .map_err(LedgerError::Store)?;
-        ctx.reserved_postings.clear();
-        Ok(CompensationOutcome::Completed)
-    }
-
-    fn retry_policy() -> RetryPolicy {
-        RetryPolicy::retries(3)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Step 2: FinalizeTransferStep
-// ---------------------------------------------------------------------------
-
-/// Input for the finalize step (envelope comes from ctx).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FinalizeInput;
-
-/// Re-validates against current state (the last-step floor / freeze-close guard),
-/// then drives the verified, idempotent commit via `Ledger::finalize_envelope`.
-///
-/// Compensation reverses the finalized envelope (only relevant once committed).
-pub struct FinalizeTransferStep;
-
-#[async_trait]
-impl Step<LedgerCtx, LedgerError> for FinalizeTransferStep {
-    type Input = FinalizeInput;
-
-    async fn execute(
-        ctx: &mut LedgerCtx,
-        _input: &FinalizeInput,
-    ) -> Result<StepOutcome, LedgerError> {
-        async {
-            let envelope = ctx
-                .envelope
-                .clone()
-                .ok_or_else(|| internal("no envelope in context -- resolve step must run first"))?;
-            let rid = ctx.reservation;
-            let ledger = ctx.ledger_arc()?;
-
-            // All commit work (re-validate, mark Finalizing, deactivate/insert/
-            // store/event with end-state verification) lives in `finalize_envelope`
-            // so recovery uses exactly the same path. Its typed error (validation,
-            // overdraft, frozen) reaches the caller unchanged.
-            let receipt = ledger.finalize_envelope(&envelope, rid).await?;
-
-            ctx.receipts.push(receipt);
-            ctx.reserved_postings.clear();
-            Ok(StepOutcome::Continue)
-        }
-        .instrument(tracing::info_span!("saga_step", step = "finalize"))
-        .await
-    }
-
-    async fn compensate(
-        ctx: &mut LedgerCtx,
-        _input: &FinalizeInput,
-    ) -> Result<CompensationOutcome, LedgerError> {
-        if let Some(receipt) = ctx.receipts.pop() {
-            ctx.ledger_arc()?.reverse(&receipt.transfer_id).await?;
-        }
-        Ok(CompensationOutcome::Completed)
-    }
-
-    fn retry_policy() -> RetryPolicy {
-        RetryPolicy::retries(3)
-    }
-}
-
-legend! {
-    EnvelopeSaga<LedgerCtx, LedgerError> {
-        reserve: ReservePostingsStep,
-        finalize: FinalizeTransferStep,
     }
 }
 

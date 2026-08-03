@@ -10,7 +10,7 @@
 //! This module owns the whole write-ahead concept behind one seam: what a
 //! pending record *is*, how it is (de)serialized, how it is persisted, and how
 //! each kind completes. The completion primitives it calls (`finalize_envelope`,
-//! `drive_envelope_saga`) stay on [`Ledger`] because the live commit path shares
+//! `reserve_and_finalize`) stay on [`Ledger`] because the live commit path shares
 //! them; this module sequences them for the recovery path.
 
 use std::sync::Arc;
@@ -158,8 +158,8 @@ impl PendingSaga {
             .await
     }
 
-    /// Run a fresh commit end to end: write-ahead at Reserving, drive the saga,
-    /// then clear the record when it is safe. The single home of the commit
+    /// Run a fresh commit end to end: write-ahead at Reserving, reserve then
+    /// finalize, then clear the record when it is safe. The single home of the commit
     /// write-ahead lifecycle; [`commit_envelope`](Ledger::commit_envelope) calls
     /// this and recovery mirrors it.
     pub(super) async fn run(self, ledger: &Arc<Ledger>) -> Result<Receipt, LedgerError> {
@@ -167,7 +167,7 @@ impl PendingSaga {
         // Commit does not touch the balance projection (ADR-0019): cache points
         // are appended lazily on read, once enough credits/debits have accrued.
         let result = ledger
-            .drive_envelope_saga(self.envelope.clone(), self.reservation)
+            .reserve_and_finalize(&self.envelope, self.reservation)
             .await;
         self.clear_if_safe(ledger, result.is_ok()).await?;
         result
@@ -223,7 +223,7 @@ impl PendingSaga {
             // absorbed (record kept for the next run); only infra errors propagate.
             SagaPhase::Reserving => {
                 let result = ledger
-                    .drive_envelope_saga(self.envelope.clone(), self.reservation)
+                    .reserve_and_finalize(&self.envelope, self.reservation)
                     .await;
                 self.clear_if_safe(ledger, result.is_ok()).await
             }
