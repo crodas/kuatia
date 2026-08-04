@@ -95,6 +95,10 @@ pub struct NewPosting {
     pub asset: AssetId,
     /// Signed amount: positive = value controlled by the account, negative = offset position.
     pub value: Cent,
-    /// Informational provenance — who funded this posting.
+    /// Provenance — who funded this posting. Descriptive only: it is excluded
+    /// from the content-address preimage (see [`NewPosting`]'s `ToBytes`), so it
+    /// does not affect the [`EnvelopeId`](crate::EnvelopeId) or the idempotency
+    /// key. Persisted on the envelope record for audit, not on the stored
+    /// [`Posting`].
     pub payer: Option<AccountId>,
 }

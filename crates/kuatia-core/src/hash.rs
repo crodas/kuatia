@@ -96,6 +96,16 @@ mod tests {
     }
 
     #[test]
+    fn payer_does_not_affect_envelope_id() {
+        // payer is provenance, not identity: two envelopes differing only in
+        // payer must share an EnvelopeId, and thus one idempotency key.
+        let a = sample_envelope();
+        let mut b = sample_envelope();
+        b.creates[0].payer = Some(AccountId::new(9));
+        assert_eq!(envelope_id(&a), envelope_id(&b));
+    }
+
+    #[test]
     fn to_bytes_sha256_consistency() {
         let t = sample_envelope();
         assert_eq!(double_sha256(&t.to_bytes()), envelope_id(&t).0);

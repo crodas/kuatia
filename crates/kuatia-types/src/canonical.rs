@@ -120,17 +120,15 @@ impl ToBytes for BookId {
 
 impl ToBytes for NewPosting {
     fn to_bytes(&self) -> Vec<u8> {
+        // `payer` is provenance, not identity: it is deliberately excluded from
+        // the content-address preimage so an EnvelopeId reflects only economic
+        // content (owner, asset, value). Two envelopes that differ only in a
+        // payer annotation share an id, hence one idempotency key. Provenance is
+        // still persisted on the envelope record for audit.
         let mut buf = Vec::new();
         buf.extend(self.owner.to_bytes());
         buf.extend_from_slice(&self.asset.0.to_be_bytes());
         buf.extend(self.value.to_bytes());
-        match &self.payer {
-            Some(p) => {
-                buf.push(1);
-                buf.extend(p.to_bytes());
-            }
-            None => buf.push(0),
-        }
         buf
     }
 }
