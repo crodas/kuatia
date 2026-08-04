@@ -89,17 +89,18 @@ impl Ledger {
 
     /// Run pure validation over the loaded state and produce a plan.
     fn plan(&self, envelope: &Envelope, loaded: &LoadedState) -> Result<Plan, LedgerError> {
-        // The loader must have fetched every balance key validation reads.
-        // `compute_balance` never omits a key (an empty account is zero), so a
-        // gap here means `load` under-fetched — a silent write-skew, not a
-        // missing row. Fail loudly instead of validating against zero.
-        debug_assert!(
-            required_state(envelope, &loaded.consumed_postings)
-                .balances
-                .iter()
-                .all(|key| loaded.balances.contains_key(key)),
-            "load under-fetched balances required by validation",
-        );
+        // The loader must have fetched every balance key validation reads. A gap
+        // means `load` under-fetched: validation would read the missing key as
+        // zero and could approve an overdraft, silently creating value. This
+        // crosses the async-loader / pure-core seam, so guard it in every build,
+        // not just debug.
+        if let Some((account, asset)) = required_state(envelope, &loaded.consumed_postings)
+            .balances
+            .into_iter()
+            .find(|key| !loaded.balances.contains_key(key))
+        {
+            return Err(LedgerError::UnderFetchedState { account, asset });
+        }
 
         let input = PlanInput {
             envelope,
@@ -1058,6 +1059,33 @@ mod recovery_tests {
         let result = ledger.close(&AccountId::new(1)).await;
         assert!(matches!(result, Err(LedgerError::AccountNotEmpty(_))));
         assert!(ledger.store().list_pending_sagas().await?.is_empty());
+        Ok(())
+    }
+
+    /// If the loader under-fetches a balance key validation reads, `plan` fails
+    /// loudly rather than letting the missing key default to zero and silently
+    /// approve an overdraft. This guards the async-loader / pure-core seam in
+    /// every build, not just debug.
+    #[tokio::test]
+    async fn plan_rejects_under_fetched_balance() -> Result<(), LedgerError> {
+        let ledger = funded_ledger().await;
+        let envelope = ledger.resolve(&pay_transfer()).await?;
+        let mut loaded = ledger.load(&envelope).await?;
+
+        // Drop a key the loader correctly fetched; validation still reads it.
+        let dropped = *loaded
+            .balances
+            .keys()
+            .next()
+            .expect("pay transfer reads at least one balance");
+        loaded.balances.remove(&dropped);
+
+        match ledger.plan(&envelope, &loaded) {
+            Err(LedgerError::UnderFetchedState { account, asset }) => {
+                assert_eq!((account, asset), dropped);
+            }
+            other => panic!("expected UnderFetchedState, got {other:?}"),
+        }
         Ok(())
     }
 }

@@ -72,6 +72,16 @@ pub enum LedgerError {
     InflightSelfMovement(AccountId),
     /// Monetary arithmetic overflow.
     Overflow,
+    /// The loader under-fetched: a balance key `validate_and_plan` reads was not
+    /// loaded. Validation would read the missing key as zero and could approve an
+    /// overdraft, so this is failed loudly instead. A load/validate seam bug, not
+    /// a user error. Carries the missing key.
+    UnderFetchedState {
+        /// Account whose balance was not loaded.
+        account: AccountId,
+        /// Asset whose balance was not loaded.
+        asset: AssetId,
+    },
     /// A saga step failed and its compensation also failed.
     CompensationFailed {
         /// The error that triggered compensation.
@@ -114,6 +124,10 @@ impl fmt::Display for LedgerError {
                 write!(f, "inflight movement must have distinct from/to: {id:?}")
             }
             Self::Overflow => write!(f, "monetary amount overflow"),
+            Self::UnderFetchedState { account, asset } => write!(
+                f,
+                "loader under-fetched balance for account {account:?} asset {asset:?}"
+            ),
             Self::CompensationFailed {
                 original,
                 compensation,
