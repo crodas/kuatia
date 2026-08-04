@@ -71,37 +71,59 @@ pub struct RequiredState {
     pub balances: Vec<(AccountId, AssetId)>,
 }
 
+/// Accounts and balance keys implied purely by the postings an envelope touches:
+/// owners of its created and consumed postings, plus the `(owner, asset)` balance
+/// key for each. This is the one walk [`required_state`] (what the loader fetches)
+/// and [`validate_and_plan`] (what it reads) both derive from, so the load set and
+/// the read set cannot drift.
+struct PostingKeys {
+    owners: Vec<AccountId>,
+    balances: Vec<(AccountId, AssetId)>,
+}
+
+fn posting_keys(envelope: &Envelope, consumed_postings: &[Posting]) -> PostingKeys {
+    let mut owners: Vec<AccountId> = Vec::new();
+    let mut balances: Vec<(AccountId, AssetId)> = Vec::new();
+    for np in envelope.creates() {
+        owners.push(np.owner);
+        balances.push((np.owner, np.asset));
+    }
+    for p in consumed_postings {
+        owners.push(p.owner);
+        balances.push((p.owner, p.asset));
+    }
+    owners.sort();
+    owners.dedup();
+    balances.sort();
+    balances.dedup();
+    PostingKeys { owners, balances }
+}
+
 /// Derive the state key-set [`validate_and_plan`] will read.
 ///
 /// The consumed postings must be passed in because their owner and asset (which
 /// drive the account and balance key-sets) live in the store, not the envelope.
 /// The loader therefore fetches `envelope.consumes()` first, then calls this to
-/// own every remaining key. Kept in lockstep with what `validate_and_plan`
-/// actually reads: change one, change the other.
+/// own every remaining key. Both this and [`validate_and_plan`] derive their
+/// account and balance keys from one shared `posting_keys` walk, so they cannot
+/// drift; the only
+/// extra keys named here are the snapshot-pinned accounts (validated in step 5b),
+/// which the loader must fetch even when they own no posting.
 pub fn required_state(envelope: &Envelope, consumed_postings: &[Posting]) -> RequiredState {
-    let mut accounts: Vec<AccountId> = envelope.creates().iter().map(|np| np.owner).collect();
-    for p in consumed_postings {
-        accounts.push(p.owner);
-    }
-    for snap in envelope.account_snapshots() {
-        accounts.push(snap.account);
-    }
-    accounts.sort();
-    accounts.dedup();
+    let PostingKeys {
+        mut owners,
+        balances,
+    } = posting_keys(envelope, consumed_postings);
 
-    let mut balances: Vec<(AccountId, AssetId)> = Vec::new();
-    for p in consumed_postings {
-        balances.push((p.owner, p.asset));
+    for snap in envelope.account_snapshots() {
+        owners.push(snap.account);
     }
-    for np in envelope.creates() {
-        balances.push((np.owner, np.asset));
-    }
-    balances.sort();
-    balances.dedup();
+    owners.sort();
+    owners.dedup();
 
     RequiredState {
         consumed_postings: envelope.consumes().to_vec(),
-        accounts,
+        accounts: owners,
         balances,
     }
 }
@@ -312,14 +334,12 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
             .ok_or(ValidationError::PostingNotFound(*pid))?;
     }
 
-    // 5. Every referenced account exists, not FROZEN, not CLOSED
-    let mut all_account_ids: Vec<AccountId> = envelope.creates().iter().map(|p| p.owner).collect();
-    for pid in envelope.consumes() {
-        let posting = consumed_by_id[pid];
-        all_account_ids.push(posting.owner);
-    }
-    all_account_ids.sort();
-    all_account_ids.dedup();
+    // 5. Every referenced account exists, not FROZEN, not CLOSED. The account
+    // and balance key-sets come from the same `posting_keys` walk `required_state`
+    // hands the loader, so what validation reads here is structurally what was
+    // fetched. Snapshot-pinned accounts are handled separately in 5b, so this set
+    // deliberately excludes snapshot-only accounts.
+    let all_account_ids = posting_keys(envelope, input.consumed_postings).owners;
 
     for aid in &all_account_ids {
         let account = input
