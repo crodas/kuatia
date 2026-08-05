@@ -69,11 +69,17 @@ pub struct TransferQuery {
 }
 
 /// A page of results with total count for pagination.
+///
+/// The pagination contract every backend implements: `items` is the page cut by
+/// the query's `(offset, limit)` window, and `total` is the count of all matching
+/// rows *ignoring* that window. In-memory backends satisfy it via
+/// [`paginate`](crate::query::paginate); a SQL backend via `LIMIT`/`OFFSET` plus a
+/// separate `COUNT(*)`.
 #[derive(Debug, Clone)]
 pub struct Page<T> {
-    /// The items in this page.
+    /// The items in this page (the `(offset, limit)` window).
     pub items: Vec<T>,
-    /// Total number of matching items (before pagination).
+    /// Count of all matching rows, before the page window is applied.
     pub total: u64,
 }
 

@@ -192,8 +192,7 @@ impl TransferStore for SqlStore {
             .try_get("cnt")
             .map_err(|e| StoreError::Internal(e.to_string()))?;
 
-        let limit = query.limit.unwrap_or(u32::MAX);
-        let offset = query.offset.unwrap_or(0);
+        let (offset, limit) = kuatia_storage::query::window(query.offset, query.limit);
         let data_sql = format!(
             "SELECT t.transfer, t.receipt, t.created_at {from_clause}{where_sql} \
              ORDER BY t.created_at LIMIT {limit} OFFSET {offset}"

@@ -253,8 +253,7 @@ impl PostingStore for SqlStore {
             }
             w.push_str(state);
             let c = format!("SELECT COUNT(*) as cnt FROM {source} {w}");
-            let limit = query.limit.unwrap_or(u32::MAX);
-            let offset = query.offset.unwrap_or(0);
+            let (offset, limit) = kuatia_storage::query::window(query.offset, query.limit);
             // Order by the posting primary key so pagination is deterministic:
             // without it LIMIT/OFFSET could skip or repeat rows across pages.
             w.push_str(&format!(

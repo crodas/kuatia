@@ -43,17 +43,28 @@ pub fn filter_transfers(
         .collect()
 }
 
+/// The effective `(offset, limit)` window from a query's optional bounds: offset
+/// defaults to 0, limit to unbounded. One definition shared by the in-memory
+/// [`paginate`] cut and the SQL `LIMIT`/`OFFSET` push-down, so the two agree on
+/// what an absent bound means instead of each restating the defaults.
+pub fn window(offset: Option<u32>, limit: Option<u32>) -> (u32, u32) {
+    (offset.unwrap_or(0), limit.unwrap_or(u32::MAX))
+}
+
 /// Cut a fully-filtered, ordered record set into one page: `total` is the
-/// pre-pagination count, then skip `offset` (default 0) and take `limit`
-/// (default unbounded).
+/// pre-pagination count (see [`Page`]), then apply the [`window`] (skip `offset`,
+/// take `limit`).
 ///
 /// Callers that push `LIMIT`/`OFFSET` into the store (e.g. SQL `query_postings`)
 /// build their own [`Page`] and skip this; it exists for the backends that hold
 /// the full candidate set in memory.
 pub fn paginate<T>(records: Vec<T>, offset: Option<u32>, limit: Option<u32>) -> Page<T> {
     let total = records.len() as u64;
-    let offset = offset.unwrap_or(0) as usize;
-    let limit = limit.unwrap_or(u32::MAX) as usize;
-    let items = records.into_iter().skip(offset).take(limit).collect();
+    let (offset, limit) = window(offset, limit);
+    let items = records
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
     Page { items, total }
 }
