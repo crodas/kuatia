@@ -3,21 +3,24 @@
 //! A commit (reserve → finalize) and an account-version transition (append
 //! version → append event) are each more than one store write with no shared
 //! transaction, so a crash mid-sequence can leave a half-applied state. Before
-//! either mutates anything it persists a [`PendingRecord`] via `SagaStore`; on
-//! startup [`Ledger::recover`](super::Ledger::recover) loads every surviving
-//! record and drives it to a terminal state through [`PendingRecord::complete`].
+//! either mutates anything it persists a write-ahead record via `SagaStore`,
+//! tagged with its [`SagaKind`]; on startup
+//! [`Ledger::recover`](super::Ledger::recover) loads every surviving record and,
+//! dispatching on that kind, drives it to a terminal state.
 //!
 //! This module owns the whole write-ahead concept behind one seam: what a
-//! pending record *is*, how it is (de)serialized, how it is persisted, and how
-//! each kind completes. The completion primitives it calls (`finalize_envelope`,
-//! `reserve_and_finalize`) stay on [`Ledger`] because the live commit path shares
-//! them; this module sequences them for the recovery path.
+//! pending record *is* ([`PendingSaga`] / [`PendingTransition`]), how it is
+//! (de)serialized, how it is persisted, and how each kind completes. The
+//! completion primitives it calls (`finalize_envelope`, `reserve_and_finalize`)
+//! stay on [`Ledger`] because the live commit path shares them; this module
+//! sequences them for the recovery path.
 
 use std::sync::Arc;
 
 use kuatia_core::{Account, Envelope, Receipt, ReservationId, envelope_id};
 use kuatia_storage::error::StoreError;
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
+use kuatia_storage::store::SagaKind;
 
 use super::{Ledger, now_millis};
 use crate::error::LedgerError;
@@ -59,68 +62,10 @@ pub(super) struct PendingTransition {
     pub(super) event: LedgerEventKind,
 }
 
-/// The two kinds of write-ahead record the [`SagaStore`] holds, tagged so
-/// recovery can tell an envelope commit saga from an account transition and
-/// complete each through its own path.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(super) enum PendingRecord {
-    /// A two-step envelope commit saga (reserve → finalize).
-    Envelope(PendingSaga),
-    /// A single account-version transition (append version + lifecycle event).
-    Transition(PendingTransition),
-}
-
-impl PendingRecord {
-    /// An account-transition write-ahead record.
-    pub(super) fn transition(next: Account, event: LedgerEventKind) -> Self {
-        Self::Transition(PendingTransition { next, event })
-    }
-
-    /// Decode a record from its stored bytes. The single decoder for the
-    /// write-ahead format, shared by `recover` and the keyed phase read.
-    pub(super) fn decode(blob: &[u8]) -> Result<Self, LedgerError> {
-        serde_json::from_slice(blob)
-            .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))
-    }
-
-    /// The commit phase of an envelope record; `None` for a transition record,
-    /// which has no phase.
-    pub(super) fn envelope_phase(&self) -> Option<SagaPhase> {
-        match self {
-            Self::Envelope(s) => Some(s.phase),
-            Self::Transition(_) => None,
-        }
-    }
-
-    /// Persist this record under `saga_id` (upsert on the id).
-    pub(super) async fn save(&self, ledger: &Ledger, saga_id: i64) -> Result<(), LedgerError> {
-        let blob = serde_json::to_vec(self)
-            .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
-        ledger.store.save_saga(&saga_id, blob).await?;
-        Ok(())
-    }
-
-    /// Drive this record to a terminal state and clear it when safe. Called by
-    /// [`Ledger::recover`](super::Ledger::recover) for every surviving record.
-    ///
-    /// A transition rolls forward (any completion error propagates, so recovery
-    /// retries on the next run). An envelope commit branches on its phase, and
-    /// its drive/finalize failures are absorbed here (the record is kept for a
-    /// later run) rather than aborting recovery of the remaining records.
-    pub(super) async fn complete(
-        self,
-        ledger: &Arc<Ledger>,
-        saga_id: i64,
-    ) -> Result<(), LedgerError> {
-        match self {
-            Self::Transition(PendingTransition { next, event }) => {
-                complete_transition(ledger, saga_id, next, event).await
-            }
-            // The commit lifecycle (phase rules, delete-safety) lives on
-            // `PendingSaga`; recovery just hands the decoded record to it.
-            Self::Envelope(saga) => saga.complete(ledger).await,
-        }
-    }
+/// Map a JSON (de)serialization failure to a store error. The write-ahead format
+/// is a store implementation detail, so a codec failure surfaces as `Store`.
+fn json_err(e: serde_json::Error) -> LedgerError {
+    LedgerError::Store(StoreError::Internal(e.to_string()))
 }
 
 impl PendingSaga {
@@ -149,13 +94,21 @@ impl PendingSaga {
         self.reservation.0
     }
 
+    /// Decode an envelope commit record from its stored bytes.
+    pub(super) fn decode(blob: &[u8]) -> Result<Self, LedgerError> {
+        serde_json::from_slice(blob).map_err(json_err)
+    }
+
     /// Persist this record at its current phase (upsert). The single writer of a
     /// commit write-ahead record: the Reserving→Finalizing bump is just a persist
     /// of the [`finalizing`](Self::finalizing) variant.
     pub(super) async fn persist(&self, ledger: &Ledger) -> Result<(), LedgerError> {
-        PendingRecord::Envelope(self.clone())
-            .save(ledger, self.saga_id())
-            .await
+        let blob = serde_json::to_vec(self).map_err(json_err)?;
+        ledger
+            .store
+            .save_saga(SagaKind::Envelope, &self.saga_id(), blob)
+            .await?;
+        Ok(())
     }
 
     /// Run a fresh commit end to end: write-ahead at Reserving, reserve then
@@ -194,7 +147,7 @@ impl PendingSaga {
     /// Complete a crash-interrupted commit from its persisted phase, clearing the
     /// record when safe. The recovery counterpart of [`run`](Self::run): same
     /// lifecycle rules, entered from a decoded record instead of a fresh one.
-    async fn complete(self, ledger: &Arc<Ledger>) -> Result<(), LedgerError> {
+    pub(super) async fn complete(self, ledger: &Arc<Ledger>) -> Result<(), LedgerError> {
         // A full commit is the transfer row plus its committed event (appended
         // after store_transfer). If the row is present the commit reached the far
         // side; repair the possibly-missing event (idempotent) and clear.
@@ -231,35 +184,54 @@ impl PendingSaga {
     }
 }
 
-/// Roll a crash-interrupted transition forward and clear its write-ahead record.
-///
-/// Idempotent in every crash window: the version append runs only into an empty
-/// version slot (`append_account_version` requires `version == current + 1`, so a
-/// blind retry after it applied would fail), and the event carries its target
-/// version so re-appending it dedups to the original. The empty-slot guard also
-/// subsumes the forward path's is_closed check: a close always bumps the version,
-/// so a since-closed account sits at `version >= next.version` and is skipped.
-async fn complete_transition(
-    ledger: &Ledger,
-    saga_id: i64,
-    next: Account,
-    event: LedgerEventKind,
-) -> Result<(), LedgerError> {
-    // The account is guaranteed to exist here (its version was bumped, or is
-    // about to be), so a read failure is transient or a real invariant breach,
-    // not "not found": surface it verbatim so recovery retries.
-    let current = ledger.store.get_account(&next.id).await?;
-    if current.version < next.version {
-        ledger.store.append_account_version(next).await?;
+impl PendingTransition {
+    /// A transition write-ahead record for a version bump and its lifecycle event.
+    pub(super) fn new(next: Account, event: LedgerEventKind) -> Self {
+        Self { next, event }
     }
-    ledger
-        .store
-        .append_event(&LedgerEvent {
-            seq: 0,
-            timestamp: now_millis()?,
-            kind: event,
-        })
-        .await?;
-    ledger.store.delete_saga(&saga_id).await?;
-    Ok(())
+
+    /// Decode a transition record from its stored bytes.
+    pub(super) fn decode(blob: &[u8]) -> Result<Self, LedgerError> {
+        serde_json::from_slice(blob).map_err(json_err)
+    }
+
+    /// Persist this record under `saga_id` (upsert).
+    pub(super) async fn save(&self, ledger: &Ledger, saga_id: i64) -> Result<(), LedgerError> {
+        let blob = serde_json::to_vec(self).map_err(json_err)?;
+        ledger
+            .store
+            .save_saga(SagaKind::Transition, &saga_id, blob)
+            .await?;
+        Ok(())
+    }
+
+    /// Roll a crash-interrupted transition forward and clear its write-ahead
+    /// record.
+    ///
+    /// Idempotent in every crash window: the version append runs only into an
+    /// empty version slot (`append_account_version` requires `version == current +
+    /// 1`, so a blind retry after it applied would fail), and the event carries its
+    /// target version so re-appending it dedups to the original. The empty-slot
+    /// guard also subsumes the forward path's is_closed check: a close always bumps
+    /// the version, so a since-closed account sits at `version >= next.version` and
+    /// is skipped.
+    pub(super) async fn complete(self, ledger: &Ledger, saga_id: i64) -> Result<(), LedgerError> {
+        // The account is guaranteed to exist here (its version was bumped, or is
+        // about to be), so a read failure is transient or a real invariant breach,
+        // not "not found": surface it verbatim so recovery retries.
+        let current = ledger.store.get_account(&self.next.id).await?;
+        if current.version < self.next.version {
+            ledger.store.append_account_version(self.next).await?;
+        }
+        ledger
+            .store
+            .append_event(&LedgerEvent {
+                seq: 0,
+                timestamp: now_millis()?,
+                kind: self.event,
+            })
+            .await?;
+        ledger.store.delete_saga(&saga_id).await?;
+        Ok(())
+    }
 }

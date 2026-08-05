@@ -152,6 +152,12 @@ async fn migration_upgrades_existing_rows_to_main_account() {
         .execute(&pool)
         .await
         .unwrap();
+    // The sagas table has existed since 001; seed it so the 009 ALTER (add the
+    // kind column) has a table to run against on this full-chain upgrade.
+    sqlx::query("CREATE TABLE sagas (id BIGINT PRIMARY KEY, data TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
     // Legacy 001/002 schema carried a user_data JSON column; the 003 migration
     // drops it. Seed it with the value the old UserData type serialized to.
     let user_data = r#"{"d128":0,"d64":0,"d32":0}"#.to_string();
@@ -233,6 +239,7 @@ async fn migration_004_backfills_index_tables() {
         "006_drop_policy",
         "007_balance_projection",
         "008_live_postings",
+        "009_saga_kind",
     ] {
         sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
             .bind(m)
@@ -323,6 +330,7 @@ async fn migration_005_backfills_account_head() {
         "006_drop_policy",
         "007_balance_projection",
         "008_live_postings",
+        "009_saga_kind",
     ] {
         sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
             .bind(m)
@@ -393,6 +401,7 @@ async fn migration_008_merges_live_postings() {
         "005_account_head",
         "006_drop_policy",
         "007_balance_projection",
+        "009_saga_kind",
     ] {
         sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
             .bind(m)

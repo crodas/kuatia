@@ -21,13 +21,13 @@ use kuatia_core::{
 
 use kuatia_storage::error::StoreError;
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
-use kuatia_storage::store::EnvelopeRecord;
+use kuatia_storage::store::{EnvelopeRecord, SagaKind};
 
 use super::{Ledger, now_millis};
 use crate::error::LedgerError;
 use crate::saga::{apply_and_verify, consume_reserved, verify_postings};
 
-use super::pending::{PendingRecord, PendingSaga, SagaPhase};
+use super::pending::{PendingSaga, PendingTransition, SagaPhase};
 
 /// State loaded in phase 1, passed to the pure validation in phase 2.
 struct LoadedState {
@@ -284,20 +284,27 @@ impl Ledger {
     /// Complete every pending write-ahead record left by a crash. Call on
     /// startup; returns how many were processed.
     ///
-    /// Each record is decoded and driven to a terminal state by
-    /// `PendingRecord::complete` (in the `pending` module), which owns the
-    /// per-kind completion: a transition rolls forward; an envelope commit
-    /// branches on its persisted phase — a `Reserving` saga is re-run and
-    /// re-validated, a `Finalizing` saga is rolled forward through the verified
-    /// `finalize_envelope`.
+    /// Each record is dispatched on its stored [`SagaKind`] and driven to a
+    /// terminal state by the completion method in the `pending` module: a
+    /// transition rolls forward; an envelope commit branches on its persisted
+    /// phase — a `Reserving` saga is re-run and re-validated, a `Finalizing` saga
+    /// is rolled forward through the verified `finalize_envelope`.
     #[instrument(skip(self), name = "ledger.recover")]
     pub async fn recover(self: &Arc<Self>) -> Result<usize, LedgerError> {
         let pending = self.store.list_pending_sagas().await?;
         let count = pending.len();
-        for (saga_id, blob) in pending {
-            PendingRecord::decode(&blob)?
-                .complete(self, saga_id)
-                .await?;
+        for (kind, saga_id, blob) in pending {
+            // Dispatch on the store's typed kind, not an in-band blob tag. The
+            // commit lifecycle (phase rules, delete-safety) lives on `PendingSaga`;
+            // a transition rolls itself forward.
+            match kind {
+                SagaKind::Envelope => PendingSaga::decode(&blob)?.complete(self).await?,
+                SagaKind::Transition => {
+                    PendingTransition::decode(&blob)?
+                        .complete(self, saga_id)
+                        .await?
+                }
+            }
         }
         Ok(count)
     }
@@ -437,8 +444,10 @@ impl Ledger {
     /// (which has no phase). Used to decide whether a failed commit reached the
     /// point of no return.
     pub(super) async fn saga_phase(&self, saga_id: i64) -> Result<Option<SagaPhase>, LedgerError> {
+        // Only ever called with an envelope saga's key (its reservation id), so the
+        // record decodes as a `PendingSaga`; a transition never reaches here.
         match self.store.get_saga(&saga_id).await? {
-            Some(blob) => Ok(PendingRecord::decode(&blob)?.envelope_phase()),
+            Some(blob) => Ok(Some(PendingSaga::decode(&blob)?.phase)),
             None => Ok(None),
         }
     }
@@ -511,7 +520,7 @@ impl Ledger {
 mod recovery_tests {
     use super::super::pending::{PendingSaga, PendingTransition};
     use super::*;
-    use kuatia_core::{Account, AccountFlags, ReservationId, TransferBuilder};
+    use kuatia_core::{Account, AccountFlags, ReservationId, TransferBuilder, TransitionId};
     use kuatia_storage::mem_store::InMemoryStore;
     use std::collections::BTreeMap;
 
@@ -565,13 +574,17 @@ mod recovery_tests {
         rid: ReservationId,
         phase: SagaPhase,
     ) {
-        let blob = serde_json::to_vec(&PendingRecord::Envelope(PendingSaga {
+        let blob = serde_json::to_vec(&PendingSaga {
             envelope: envelope.clone(),
             reservation: rid,
             phase,
-        }))
+        })
         .unwrap();
-        ledger.store().save_saga(&rid.0, blob).await.unwrap();
+        ledger
+            .store()
+            .save_saga(SagaKind::Envelope, &rid.0, blob)
+            .await
+            .unwrap();
     }
 
     /// A commit interrupted right after its write-ahead record (phase Reserving,
@@ -858,13 +871,13 @@ mod recovery_tests {
         next: &Account,
         event: &LedgerEventKind,
     ) -> Result<i64, LedgerError> {
-        let saga_id = ReservationId::default().0;
-        let blob = serde_json::to_vec(&PendingRecord::Transition(PendingTransition {
-            next: next.clone(),
-            event: event.clone(),
-        }))
-        .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
-        ledger.store().save_saga(&saga_id, blob).await?;
+        let saga_id = TransitionId::default().0;
+        let blob = serde_json::to_vec(&PendingTransition::new(next.clone(), event.clone()))
+            .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
+        ledger
+            .store()
+            .save_saga(SagaKind::Transition, &saga_id, blob)
+            .await?;
         Ok(saga_id)
     }
 

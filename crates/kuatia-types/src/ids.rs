@@ -78,6 +78,13 @@ pub struct BookId(pub i64);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ReservationId(pub i64);
 
+/// Identifies an account-version transition's write-ahead record. A distinct
+/// type from [`ReservationId`] so a transition does not masquerade as a
+/// reservation, but drawn from the same generator (see [`ReservationId::default`])
+/// so the two write-ahead kinds share one collision-free id space.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TransitionId(pub i64);
+
 // ---------------------------------------------------------------------------
 // Debug impls for identifiers
 // ---------------------------------------------------------------------------
@@ -122,6 +129,12 @@ impl fmt::Debug for BookId {
 impl fmt::Debug for ReservationId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ReservationId({})", self.0)
+    }
+}
+
+impl fmt::Debug for TransitionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TransitionId({})", self.0)
     }
 }
 
@@ -220,14 +233,32 @@ impl ReservationId {
     }
 }
 
+/// The one process-global id source behind every write-ahead saga key —
+/// reservation ids and transition ids alike. One atomic counter, not one per
+/// thread: a `thread_local` generator lets two sagas on different threads mint
+/// the same id within a millisecond, which collapses the reservation-ownership
+/// check and allows a double-spend under concurrency. Sharing it across both
+/// kinds is also what keeps their keys unique in the single saga keyspace.
+fn next_saga_id() -> i64 {
+    static GEN: AutoId = AutoId::new();
+    GEN.next()
+}
+
 impl Default for ReservationId {
     fn default() -> Self {
-        // One process-global generator, not one per thread: its atomic counter
-        // makes every reservation id unique across threads. A `thread_local`
-        // generator lets two sagas on different threads mint the same id within
-        // a millisecond, which collapses the reservation-ownership check and
-        // allows a double-spend under concurrency.
-        static GEN: AutoId = AutoId::new();
-        Self(GEN.next())
+        Self(next_saga_id())
+    }
+}
+
+impl TransitionId {
+    /// Create a `TransitionId` from an `i64`.
+    pub const fn new(id: i64) -> Self {
+        Self(id)
+    }
+}
+
+impl Default for TransitionId {
+    fn default() -> Self {
+        Self(next_saga_id())
     }
 }

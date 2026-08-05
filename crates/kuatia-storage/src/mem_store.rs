@@ -18,7 +18,7 @@ use crate::events::{EventStore, LedgerEvent, event_dedup_key};
 use crate::query::{filter_transfers, paginate};
 use crate::store::{
     AccountStore, BalanceProjection, BalanceProjectionStore, BookStore, EnvelopeRecord, Page,
-    PostingStore, SagaStore, TransferQuery, TransferStore,
+    PostingStore, SagaKind, SagaStore, TransferQuery, TransferStore,
 };
 
 /// Postings held as an immutable record table plus two index maps that carry
@@ -44,7 +44,7 @@ pub struct InMemoryStore {
     /// `store_transfer`, mirroring the SQL `transfer_accounts` table so both
     /// backends resolve `get_transfers_for_account` from the same instruction.
     transfer_accounts: RwLock<HashMap<EnvelopeId, Vec<AccountId>>>,
-    sagas: RwLock<HashMap<i64, Vec<u8>>>,
+    sagas: RwLock<HashMap<i64, (SagaKind, Vec<u8>)>>,
     events: RwLock<Vec<LedgerEvent>>,
     books: RwLock<HashMap<BookId, Book>>,
     /// Append-only balance cache points keyed by `(account, asset)` (ADR-0019).
@@ -437,20 +437,23 @@ impl TransferStore for InMemoryStore {
 
 #[async_trait]
 impl SagaStore for InMemoryStore {
-    async fn save_saga(&self, id: &i64, data: Vec<u8>) -> Result<(), StoreError> {
+    async fn save_saga(&self, kind: SagaKind, id: &i64, data: Vec<u8>) -> Result<(), StoreError> {
         let mut sagas = self.sagas.write().await;
-        sagas.insert(*id, data);
+        sagas.insert(*id, (kind, data));
         Ok(())
     }
 
-    async fn list_pending_sagas(&self) -> Result<Vec<(i64, Vec<u8>)>, StoreError> {
+    async fn list_pending_sagas(&self) -> Result<Vec<(SagaKind, i64, Vec<u8>)>, StoreError> {
         let sagas = self.sagas.read().await;
-        Ok(sagas.iter().map(|(k, v)| (*k, v.clone())).collect())
+        Ok(sagas
+            .iter()
+            .map(|(id, (kind, data))| (*kind, *id, data.clone()))
+            .collect())
     }
 
     async fn get_saga(&self, id: &i64) -> Result<Option<Vec<u8>>, StoreError> {
         let sagas = self.sagas.read().await;
-        Ok(sagas.get(id).cloned())
+        Ok(sagas.get(id).map(|(_, data)| data.clone()))
     }
 
     async fn delete_saga(&self, id: &i64) -> Result<(), StoreError> {

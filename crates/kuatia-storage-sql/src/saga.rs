@@ -11,12 +11,13 @@ use crate::row::{from_hex, to_hex};
 
 #[async_trait]
 impl SagaStore for SqlStore {
-    async fn save_saga(&self, id: &i64, data: Vec<u8>) -> Result<(), StoreError> {
+    async fn save_saga(&self, kind: SagaKind, id: &i64, data: Vec<u8>) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO sagas (id, data) VALUES ($1, $2) \
-             ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+            "INSERT INTO sagas (id, kind, data) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET kind = EXCLUDED.kind, data = EXCLUDED.data",
         )
         .bind(*id)
+        .bind(kind.as_str())
         .bind(to_hex(&data))
         .execute(&self.pool)
         .await
@@ -24,8 +25,8 @@ impl SagaStore for SqlStore {
         Ok(())
     }
 
-    async fn list_pending_sagas(&self) -> Result<Vec<(i64, Vec<u8>)>, StoreError> {
-        let rows = sqlx::query("SELECT id, data FROM sagas")
+    async fn list_pending_sagas(&self) -> Result<Vec<(SagaKind, i64, Vec<u8>)>, StoreError> {
+        let rows = sqlx::query("SELECT id, kind, data FROM sagas")
             .fetch_all(&self.pool)
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -34,10 +35,13 @@ impl SagaStore for SqlStore {
             let id: i64 = row
                 .try_get("id")
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
+            let kind: String = row
+                .try_get("kind")
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
             let data_hex: String = row
                 .try_get("data")
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
-            result.push((id, from_hex(&data_hex)?));
+            result.push((SagaKind::parse(&kind)?, id, from_hex(&data_hex)?));
         }
         Ok(result)
     }

@@ -35,7 +35,7 @@ pub use book::{Book, BookBuilder, BookPolicy};
 pub use envelope::{Envelope, EnvelopeBuilder, Metadata};
 pub use ids::{
     AccountId, AccountSnapshotId, AssetId, BookId, DEFAULT_BOOK, EnvelopeId, PostingId,
-    ReservationId,
+    ReservationId, TransitionId,
 };
 pub use posting::{NewPosting, Posting, PostingFilter, PostingState};
 pub use transfer::{Movement, Receipt, Transfer, TransferBuilder};

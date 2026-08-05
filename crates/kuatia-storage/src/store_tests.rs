@@ -1122,22 +1122,29 @@ pub async fn query_transfers_store_wide(store: &(impl Store + 'static)) {
 // SagaStore tests
 // ---------------------------------------------------------------------------
 
-/// Save saga state and list it.
+/// Save saga state and list it with its kind.
 pub async fn save_and_list_sagas(store: &(impl Store + 'static)) {
     let id: i64 = 42;
     let data = vec![1, 2, 3];
-    store.save_saga(&id, data.clone()).await.unwrap();
+    store
+        .save_saga(SagaKind::Envelope, &id, data.clone())
+        .await
+        .unwrap();
 
     let pending = store.list_pending_sagas().await.unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].0, id);
-    assert_eq!(pending[0].1, data);
+    assert_eq!(pending[0].0, SagaKind::Envelope);
+    assert_eq!(pending[0].1, id);
+    assert_eq!(pending[0].2, data);
 }
 
 /// Delete a saga state.
 pub async fn delete_saga(store: &(impl Store + 'static)) {
     let id: i64 = 42;
-    store.save_saga(&id, vec![1, 2, 3]).await.unwrap();
+    store
+        .save_saga(SagaKind::Envelope, &id, vec![1, 2, 3])
+        .await
+        .unwrap();
     store.delete_saga(&id).await.unwrap();
 
     let pending = store.list_pending_sagas().await.unwrap();
@@ -1151,13 +1158,36 @@ pub async fn get_saga_by_id(store: &(impl Store + 'static)) {
     let data = vec![7, 8, 9];
     assert!(store.get_saga(&id).await.unwrap().is_none());
 
-    store.save_saga(&id, data.clone()).await.unwrap();
+    store
+        .save_saga(SagaKind::Envelope, &id, data.clone())
+        .await
+        .unwrap();
     assert_eq!(store.get_saga(&id).await.unwrap(), Some(data));
     // A different id is still absent while this one exists.
     assert!(store.get_saga(&99).await.unwrap().is_none());
 
     store.delete_saga(&id).await.unwrap();
     assert!(store.get_saga(&id).await.unwrap().is_none());
+}
+
+/// Both write-ahead kinds share one keyspace: `list_pending_sagas` returns each
+/// record with the kind it was saved under, so recovery can dispatch by type
+/// rather than by decoding the blob.
+pub async fn mixed_saga_kinds_list_with_their_kinds(store: &(impl Store + 'static)) {
+    store
+        .save_saga(SagaKind::Envelope, &1, vec![10])
+        .await
+        .unwrap();
+    store
+        .save_saga(SagaKind::Transition, &2, vec![20])
+        .await
+        .unwrap();
+
+    let mut pending = store.list_pending_sagas().await.unwrap();
+    pending.sort_by_key(|(_, id, _)| *id);
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0], (SagaKind::Envelope, 1, vec![10]));
+    assert_eq!(pending[1], (SagaKind::Transition, 2, vec![20]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,6 +1435,7 @@ macro_rules! store_tests {
             save_and_list_sagas,
             get_saga_by_id,
             delete_saga,
+            mixed_saga_kinds_list_with_their_kinds,
             // EventStore
             append_and_query_events,
             events_sequence_ordering,

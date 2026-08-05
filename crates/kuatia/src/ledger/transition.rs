@@ -15,10 +15,10 @@
 //! already present, and the event carries its target version so a second append
 //! dedups to the original.
 
-use kuatia_core::{AccountFlags, AccountId, ReservationId};
+use kuatia_core::{AccountFlags, AccountId, TransitionId};
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
 
-use super::pending::PendingRecord;
+use super::pending::PendingTransition;
 use super::{Ledger, now_millis};
 use crate::error::LedgerError;
 
@@ -53,10 +53,11 @@ impl Ledger {
 
         // Write-ahead before either write. A crash between the version append and
         // the event append is then repaired by recover(), not left dangling. The
-        // key shares the reservation-id generator so it never collides with an
-        // in-flight commit saga's key.
-        let saga_id = ReservationId::default().0;
-        PendingRecord::transition(next.clone(), event.clone())
+        // record is tagged `Transition` in the store, and its id comes from the
+        // shared saga-id generator, so it lands in its own typed slot without
+        // colliding with an in-flight commit saga's key.
+        let saga_id = TransitionId::default().0;
+        PendingTransition::new(next.clone(), event.clone())
             .save(self, saga_id)
             .await?;
 

@@ -236,13 +236,49 @@ pub trait TransferStore: Send + Sync {
     ) -> Result<Page<EnvelopeRecord>, StoreError>;
 }
 
+/// Which kind of write-ahead record a saga row holds. A typed discriminator on
+/// the shared saga keyspace: the store stores and returns it so recovery can
+/// dispatch by type rather than by decoding the opaque blob to read an in-band
+/// tag. Persisted as its [`as_str`](SagaKind::as_str) TEXT form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SagaKind {
+    /// A two-step envelope commit saga (reserve → finalize).
+    Envelope,
+    /// A single account-version transition (append version + lifecycle event).
+    Transition,
+}
+
+impl SagaKind {
+    /// The stored TEXT form of this kind.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Envelope => "envelope",
+            Self::Transition => "transition",
+        }
+    }
+
+    /// Parse the stored TEXT form back into a kind.
+    pub fn parse(s: &str) -> Result<Self, StoreError> {
+        match s {
+            "envelope" => Ok(Self::Envelope),
+            "transition" => Ok(Self::Transition),
+            other => Err(StoreError::Internal(format!("unknown saga kind: {other}"))),
+        }
+    }
+}
+
 /// Saga state persistence for crash recovery.
+///
+/// One flat `id → (kind, bytes)` keyspace holds both write-ahead kinds. `id` is
+/// globally unique (all ids come from one generator), so `get`/`delete` locate a
+/// row by `id` alone; `kind` is carried so `list_pending_sagas` can hand recovery
+/// a typed discriminator instead of an in-band blob tag.
 #[async_trait]
 pub trait SagaStore: Send + Sync {
-    /// Persist a saga execution state.
-    async fn save_saga(&self, id: &i64, data: Vec<u8>) -> Result<(), StoreError>;
-    /// Load all pending (incomplete) saga states.
-    async fn list_pending_sagas(&self) -> Result<Vec<(i64, Vec<u8>)>, StoreError>;
+    /// Persist a saga execution state under `id`, tagged with its [`SagaKind`].
+    async fn save_saga(&self, kind: SagaKind, id: &i64, data: Vec<u8>) -> Result<(), StoreError>;
+    /// Load all pending (incomplete) saga states with their kind.
+    async fn list_pending_sagas(&self) -> Result<Vec<(SagaKind, i64, Vec<u8>)>, StoreError>;
     /// Load one saga state by id, or `None` if no record is stored under `id`.
     /// A keyed read so a caller checking a single in-flight saga does not scan
     /// every pending record.
