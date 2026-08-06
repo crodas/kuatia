@@ -166,14 +166,14 @@ pub enum ValidationError {
         created_sum: Cent,
     },
     /// Projected balance would go negative on an account that forbids overdraft.
+    /// The model is binary: an account either permits unbounded overdraft or
+    /// forbids any negative balance, so there is no configurable floor to report.
     OverdraftExceeded {
         /// The account that would be overdrawn.
         account: AccountId,
         /// The asset involved.
         asset: AssetId,
-        /// The minimum allowed balance (always zero: the overdraft floor).
-        floor: Cent,
-        /// The balance that would result from this transfer.
+        /// The negative balance that would result from this transfer.
         projected: Cent,
     },
     /// Account snapshot hash does not match current state (stale read).
@@ -244,12 +244,11 @@ impl fmt::Display for ValidationError {
             Self::OverdraftExceeded {
                 account,
                 asset,
-                floor,
                 projected,
             } => {
                 write!(
                     f,
-                    "overdraft exceeded for {account:?}/{asset:?}: floor {floor}, projected {projected}"
+                    "overdraft forbidden for {account:?}/{asset:?}: projected {projected}"
                 )
             }
             Self::AccountVersionMismatch {
@@ -463,7 +462,7 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
     }
 
     // 8. An account that forbids overdraft must not project to a negative
-    //    balance. Accounts that permit overdraft have no floor.
+    //    balance. Accounts that permit overdraft are unbounded below.
     let mut deltas: HashMap<(AccountId, AssetId), Cent> = HashMap::new();
     for pid in envelope.consumes() {
         let posting = consumed_by_id[pid];
@@ -492,7 +491,6 @@ pub fn validate_and_plan(input: PlanInput<'_>) -> Result<Plan, ValidationError> 
             return Err(ValidationError::OverdraftExceeded {
                 account: *account_id,
                 asset: *asset_id,
-                floor: Cent::ZERO,
                 projected,
             });
         }
@@ -773,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn capped_overdraft_within_limit() {
+    fn overdraft_may_spend_past_positive_balance() {
         let pid = PostingId {
             transfer: EnvelopeId([1; 32]),
             index: 0,
@@ -859,10 +857,7 @@ mod tests {
         };
 
         match validate_and_plan(input) {
-            Err(ValidationError::OverdraftExceeded {
-                floor, projected, ..
-            }) => {
-                assert_eq!(floor, Cent::ZERO);
+            Err(ValidationError::OverdraftExceeded { projected, .. }) => {
                 assert_eq!(projected, Cent::from(-70));
             }
             other => panic!("expected OverdraftExceeded, got {other:?}"),

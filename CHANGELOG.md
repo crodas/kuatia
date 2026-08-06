@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `ValidationError::OverdraftExceeded` no longer carries a `floor` field. The
+  balance model is binary (an account either permits unbounded overdraft or
+  forbids any negative balance), so the floor was always zero and implied a
+  configurable bound that does not exist. *(breaking for callers matching on the
+  variant)*
+
 ## [0.3.0] - 2026-07-30
 
 ### Added
