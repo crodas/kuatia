@@ -3,8 +3,8 @@
 //! Accounts are stored as append-only version logs keyed by `AccountId`.
 
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
 
 use kuatia_types::autoid::AutoId;
@@ -17,8 +17,9 @@ use crate::error::StoreError;
 use crate::events::{EventStore, LedgerEvent, event_dedup_key};
 use crate::query::{filter_transfers, paginate};
 use crate::store::{
-    AccountStore, BalanceProjection, BalanceProjectionStore, BookStore, EnvelopeRecord, Page,
-    PostingStore, SagaKind, SagaStore, TransferQuery, TransferStore,
+    AccountStore, BalanceProjection, BalanceProjectionStore, BookStore, CommitOutcome,
+    CommitRejection, CommitRequest, CommitStore, EnvelopeRecord, Page, PostingStore, TransferQuery,
+    TransferStore, TransitionOutcome, TransitionRejection,
 };
 
 /// Postings held as an immutable record table plus two index maps that carry
@@ -44,7 +45,6 @@ pub struct InMemoryStore {
     /// `store_transfer`, mirroring the SQL `transfer_accounts` table so both
     /// backends resolve `get_transfers_for_account` from the same instruction.
     transfer_accounts: RwLock<HashMap<EnvelopeId, Vec<AccountId>>>,
-    sagas: RwLock<HashMap<i64, (SagaKind, Vec<u8>)>>,
     events: RwLock<Vec<LedgerEvent>>,
     books: RwLock<HashMap<BookId, Book>>,
     /// Append-only balance cache points keyed by `(account, asset)` (ADR-0019).
@@ -66,7 +66,6 @@ impl InMemoryStore {
             accounts: RwLock::new(HashMap::new()),
             transfers: RwLock::new(HashMap::new()),
             transfer_accounts: RwLock::new(HashMap::new()),
-            sagas: RwLock::new(HashMap::new()),
             events: RwLock::new(Vec::new()),
             books: RwLock::new(HashMap::new()),
             projections: RwLock::new(HashMap::new()),
@@ -432,34 +431,188 @@ impl TransferStore for InMemoryStore {
 }
 
 // ---------------------------------------------------------------------------
-// SagaStore
+// CommitStore
 // ---------------------------------------------------------------------------
 
-#[async_trait]
-impl SagaStore for InMemoryStore {
-    async fn save_saga(&self, kind: SagaKind, id: &i64, data: Vec<u8>) -> Result<(), StoreError> {
-        let mut sagas = self.sagas.write().await;
-        sagas.insert(*id, (kind, data));
-        Ok(())
-    }
-
-    async fn list_pending_sagas(&self) -> Result<Vec<(SagaKind, i64, Vec<u8>)>, StoreError> {
-        let sagas = self.sagas.read().await;
-        Ok(sagas
+/// Append `event` into an already-locked event log, deduping on its key. Mirrors
+/// [`EventStore::append_event`] but takes the guard the atomic commit already
+/// holds, so the whole commit stays under one set of locks.
+fn append_event_locked(events: &mut Vec<LedgerEvent>, autoid: &AutoId, event: &LedgerEvent) {
+    if let Some(key) = event_dedup_key(&event.kind)
+        && events
             .iter()
-            .map(|(id, (kind, data))| (*kind, *id, data.clone()))
-            .collect())
+            .any(|e| event_dedup_key(&e.kind).as_deref() == Some(key.as_str()))
+    {
+        return;
+    }
+    let seq = autoid.next() as u64;
+    events.push(LedgerEvent {
+        seq,
+        timestamp: event.timestamp,
+        kind: event.kind.clone(),
+    });
+}
+
+#[async_trait]
+impl CommitStore for InMemoryStore {
+    async fn commit_envelope(&self, req: CommitRequest<'_>) -> Result<CommitOutcome, StoreError> {
+        let overflow = || StoreError::Internal("commit: monetary overflow".to_string());
+
+        // Fixed lock order: accounts → postings → transfers → transfer_accounts →
+        // events. The whole apply happens under these guards, so the commit is
+        // atomic and its guards cannot race a concurrent commit or transition.
+        let accounts = self.accounts.read().await;
+        let mut postings = self.postings.write().await;
+        let mut transfers = self.transfers.write().await;
+        let mut transfer_accounts = self.transfer_accounts.write().await;
+        let mut events = self.events.write().await;
+
+        let tid = req.transfer_id;
+
+        // Idempotency: an already-committed transfer returns its receipt.
+        if let Some(existing) = transfers.get(&tid) {
+            return Ok(CommitOutcome::AlreadyCommitted(existing.receipt.clone()));
+        }
+
+        let account_of = |aid: &AccountId| -> Result<&Account, StoreError> {
+            accounts
+                .get(aid)
+                .and_then(|v| v.last())
+                .ok_or_else(|| StoreError::Internal(format!("commit: account {aid:?} missing")))
+        };
+
+        // Freeze/close guard, strict inside the lock.
+        for aid in req.involved {
+            let account = account_of(aid)?;
+            if account.is_frozen() {
+                return Ok(CommitOutcome::Rejected(CommitRejection::AccountFrozen(
+                    *aid,
+                )));
+            }
+            if account.is_closed() {
+                return Ok(CommitOutcome::Rejected(CommitRejection::AccountClosed(
+                    *aid,
+                )));
+            }
+        }
+
+        // Double-spend guard: every consumed id must still be Active. This is the
+        // atomic single-winner claim; it applies nothing on a miss.
+        for id in req.consume {
+            if !postings.active.contains_key(id) {
+                return Ok(CommitOutcome::Rejected(CommitRejection::DoubleSpend(*id)));
+            }
+        }
+
+        // Overdraft floor for accounts that forbid it: the projected live balance
+        // per touched (owner, asset) must stay non-negative. Computed from the
+        // surviving active rows (post-consume) plus created deltas, in Rust with
+        // checked arithmetic, segregated by subaccount.
+        let consumed_set: HashSet<PostingId> = req.consume.iter().copied().collect();
+        for aid in req.involved {
+            if !account_of(aid)?.forbids_overdraft() {
+                continue;
+            }
+            let mut assets: HashSet<AssetId> = HashSet::new();
+            for p in req.create.iter().filter(|p| p.owner == *aid) {
+                assets.insert(p.asset);
+            }
+            for id in req.consume {
+                if let Some(p) = postings.active.get(id).filter(|p| p.owner == *aid) {
+                    assets.insert(p.asset);
+                }
+            }
+            for asset in assets {
+                let live_sum = Cent::checked_sum(
+                    postings
+                        .active
+                        .values()
+                        .filter(|p| {
+                            p.owner == *aid && p.asset == asset && !consumed_set.contains(&p.id)
+                        })
+                        .map(|p| p.value),
+                )
+                .map_err(|_| overflow())?;
+                let created_sum = Cent::checked_sum(
+                    req.create
+                        .iter()
+                        .filter(|p| p.owner == *aid && p.asset == asset)
+                        .map(|p| p.value),
+                )
+                .map_err(|_| overflow())?;
+                let projected = live_sum.checked_add(created_sum).map_err(|_| overflow())?;
+                if projected.is_negative() {
+                    return Ok(CommitOutcome::Rejected(
+                        CommitRejection::OverdraftExceeded {
+                            account: *aid,
+                            asset,
+                            projected,
+                        },
+                    ));
+                }
+            }
+        }
+
+        // Apply: spend consumed (immutable copy stays → Spent), insert+activate
+        // created, store and index the transfer, append the event.
+        for id in req.consume {
+            postings.active.remove(id);
+        }
+        for p in req.create {
+            postings.immutable.entry(p.id).or_insert_with(|| p.clone());
+            postings.active.insert(p.id, p.clone());
+        }
+        transfer_accounts.insert(tid, req.involved.to_vec());
+        let receipt = req.record.receipt.clone();
+        transfers.insert(tid, req.record);
+        append_event_locked(&mut events, &self.autoid, &req.event);
+
+        Ok(CommitOutcome::Committed(receipt))
     }
 
-    async fn get_saga(&self, id: &i64) -> Result<Option<Vec<u8>>, StoreError> {
-        let sagas = self.sagas.read().await;
-        Ok(sagas.get(id).map(|(_, data)| data.clone()))
-    }
+    async fn commit_transition(
+        &self,
+        next: Account,
+        event: LedgerEvent,
+    ) -> Result<TransitionOutcome, StoreError> {
+        // Lock order accounts → events, a prefix of the commit order, so the two
+        // atomic writers never deadlock.
+        let mut accounts = self.accounts.write().await;
+        let mut events = self.events.write().await;
 
-    async fn delete_saga(&self, id: &i64) -> Result<(), StoreError> {
-        let mut sagas = self.sagas.write().await;
-        sagas.remove(id);
-        Ok(())
+        let id = next.id;
+        let versions = accounts
+            .get_mut(&id)
+            .ok_or_else(|| StoreError::Internal(format!("transition: account {id:?} missing")))?;
+        let current = versions.last().ok_or_else(|| {
+            StoreError::Internal(format!("transition: account {id:?} has no version"))
+        })?;
+
+        if current.is_closed() {
+            return Ok(TransitionOutcome::Rejected(
+                TransitionRejection::AlreadyClosed(id),
+            ));
+        }
+        let current_version = current.version;
+        if current_version >= next.version {
+            // Already applied: ensure the (idempotent) event and report it.
+            append_event_locked(&mut events, &self.autoid, &event);
+            return Ok(TransitionOutcome::AlreadyApplied);
+        }
+        let expected = current_version
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Internal("account version overflow".to_string()))?;
+        if next.version != expected {
+            return Ok(TransitionOutcome::Rejected(
+                TransitionRejection::VersionConflict {
+                    account: id,
+                    expected: next.version,
+                },
+            ));
+        }
+        versions.push(next);
+        append_event_locked(&mut events, &self.autoid, &event);
+        Ok(TransitionOutcome::Applied)
     }
 }
 

@@ -1119,75 +1119,389 @@ pub async fn query_transfers_store_wide(store: &(impl Store + 'static)) {
 }
 
 // ---------------------------------------------------------------------------
-// SagaStore tests
+// CommitStore (atomic commit) tests
 // ---------------------------------------------------------------------------
 
-/// Save saga state and list it with its kind.
-pub async fn save_and_list_sagas(store: &(impl Store + 'static)) {
-    let id: i64 = 42;
-    let data = vec![1, 2, 3];
-    store
-        .save_saga(SagaKind::Envelope, &id, data.clone())
-        .await
-        .unwrap();
-
-    let pending = store.list_pending_sagas().await.unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].0, SagaKind::Envelope);
-    assert_eq!(pending[0].1, id);
-    assert_eq!(pending[0].2, data);
+fn committed_event(tid: EnvelopeId) -> LedgerEvent {
+    LedgerEvent {
+        seq: 0,
+        timestamp: 1000,
+        kind: LedgerEventKind::TransferCommitted { transfer_id: tid },
+    }
 }
 
-/// Delete a saga state.
-pub async fn delete_saga(store: &(impl Store + 'static)) {
-    let id: i64 = 42;
+/// An atomic commit with no consumed postings creates the new ones, stores and
+/// indexes the transfer, appends the event, and returns `Committed`.
+pub async fn commit_atomic_creates_and_returns_receipt(store: &(impl Store + 'static)) {
     store
-        .save_saga(SagaKind::Envelope, &id, vec![1, 2, 3])
+        .create_account(make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT))
         .await
         .unwrap();
-    store.delete_saga(&id).await.unwrap();
-
-    let pending = store.list_pending_sagas().await.unwrap();
-    assert!(pending.is_empty());
+    store
+        .create_account(make_account(99, AccountFlags::empty()))
+        .await
+        .unwrap();
+    let (envelope, tid) = make_envelope();
+    let create = vec![
+        make_posting(tid.0, 0, 1, 1, 100),
+        make_posting(tid.0, 1, 99, 1, -100),
+    ];
+    let involved = [AccountId::new(1), AccountId::new(99)];
+    let outcome = store
+        .commit_envelope(CommitRequest {
+            transfer_id: tid,
+            consume: &[],
+            create: &create,
+            record: EnvelopeRecord {
+                envelope,
+                receipt: Receipt { transfer_id: tid },
+                created_at: 1000,
+            },
+            involved: &involved,
+            event: committed_event(tid),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, CommitOutcome::Committed(_)));
+    assert_eq!(state_of(store, create[0].id).await, PostingState::Active);
+    assert!(store.get_transfer(&tid).await.unwrap().is_some());
+    assert_eq!(
+        store
+            .get_transfers_for_account(1, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(store.get_events_since(0, 10).await.unwrap().len(), 1);
 }
 
-/// A keyed `get_saga` returns the stored blob, and `None` for an absent or
-/// deleted id.
-pub async fn get_saga_by_id(store: &(impl Store + 'static)) {
-    let id: i64 = 42;
-    let data = vec![7, 8, 9];
-    assert!(store.get_saga(&id).await.unwrap().is_none());
-
+/// Committing the same transfer id twice is idempotent: the second call returns
+/// `AlreadyCommitted` and creates no duplicate posting, transfer, or event.
+pub async fn commit_atomic_idempotent(store: &(impl Store + 'static)) {
     store
-        .save_saga(SagaKind::Envelope, &id, data.clone())
+        .create_account(make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT))
         .await
         .unwrap();
-    assert_eq!(store.get_saga(&id).await.unwrap(), Some(data));
-    // A different id is still absent while this one exists.
-    assert!(store.get_saga(&99).await.unwrap().is_none());
-
-    store.delete_saga(&id).await.unwrap();
-    assert!(store.get_saga(&id).await.unwrap().is_none());
+    store
+        .create_account(make_account(99, AccountFlags::empty()))
+        .await
+        .unwrap();
+    let (envelope, tid) = make_envelope();
+    let create = vec![
+        make_posting(tid.0, 0, 1, 1, 100),
+        make_posting(tid.0, 1, 99, 1, -100),
+    ];
+    let involved = [AccountId::new(1), AccountId::new(99)];
+    let req = || CommitRequest {
+        transfer_id: tid,
+        consume: &[],
+        create: &create,
+        record: EnvelopeRecord {
+            envelope: envelope.clone(),
+            receipt: Receipt { transfer_id: tid },
+            created_at: 1000,
+        },
+        involved: &involved,
+        event: committed_event(tid),
+    };
+    assert!(matches!(
+        store.commit_envelope(req()).await.unwrap(),
+        CommitOutcome::Committed(_)
+    ));
+    assert!(matches!(
+        store.commit_envelope(req()).await.unwrap(),
+        CommitOutcome::AlreadyCommitted(_)
+    ));
+    assert_eq!(store.get_events_since(0, 10).await.unwrap().len(), 1);
 }
 
-/// Both write-ahead kinds share one keyspace: `list_pending_sagas` returns each
-/// record with the kind it was saved under, so recovery can dispatch by type
-/// rather than by decoding the blob.
-pub async fn mixed_saga_kinds_list_with_their_kinds(store: &(impl Store + 'static)) {
-    store
-        .save_saga(SagaKind::Envelope, &1, vec![10])
+/// A consumed posting already spent by a prior commit is refused with
+/// `DoubleSpend`, and the second commit applies nothing.
+pub async fn commit_atomic_double_spend_rejects_and_applies_nothing(
+    store: &(impl Store + 'static),
+) {
+    for id in [1, 2] {
+        store
+            .create_account(make_account(id, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT))
+            .await
+            .unwrap();
+    }
+    let funded = make_posting([1; 32], 0, 1, 1, 100);
+    seed_active(store, 0, std::slice::from_ref(&funded)).await;
+
+    let commit = |tid: EnvelopeId| {
+        let created = make_posting(tid.0, 0, 2, 1, 100);
+        (tid, created)
+    };
+    let (tid1, created1) = commit(EnvelopeId([0xC1; 32]));
+    let involved = [AccountId::new(1), AccountId::new(2)];
+    let first = store
+        .commit_envelope(CommitRequest {
+            transfer_id: tid1,
+            consume: &[funded.id],
+            create: std::slice::from_ref(&created1),
+            record: EnvelopeRecord {
+                envelope: EnvelopeBuilder::new().consumes(vec![funded.id]).build(),
+                receipt: Receipt { transfer_id: tid1 },
+                created_at: 1000,
+            },
+            involved: &involved,
+            event: committed_event(tid1),
+        })
         .await
         .unwrap();
+    assert!(matches!(first, CommitOutcome::Committed(_)));
+
+    let (tid2, created2) = commit(EnvelopeId([0xC2; 32]));
+    let second = store
+        .commit_envelope(CommitRequest {
+            transfer_id: tid2,
+            consume: &[funded.id],
+            create: std::slice::from_ref(&created2),
+            record: EnvelopeRecord {
+                envelope: EnvelopeBuilder::new().consumes(vec![funded.id]).build(),
+                receipt: Receipt { transfer_id: tid2 },
+                created_at: 2000,
+            },
+            involved: &involved,
+            event: committed_event(tid2),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        second,
+        CommitOutcome::Rejected(CommitRejection::DoubleSpend(funded.id))
+    );
+    assert!(store.get_transfer(&tid2).await.unwrap().is_none());
+    assert_eq!(state_of(store, created2.id).await, PostingState::Missing);
+}
+
+/// A commit touching a frozen account is rejected, and nothing is applied.
+pub async fn commit_atomic_rejects_frozen(store: &(impl Store + 'static)) {
     store
-        .save_saga(SagaKind::Transition, &2, vec![20])
+        .create_account(make_account(1, AccountFlags::FROZEN))
+        .await
+        .unwrap();
+    let tid = EnvelopeId([0xF1; 32]);
+    let create = make_posting(tid.0, 0, 1, 1, 100);
+    let outcome = store
+        .commit_envelope(CommitRequest {
+            transfer_id: tid,
+            consume: &[],
+            create: std::slice::from_ref(&create),
+            record: EnvelopeRecord {
+                envelope: EnvelopeBuilder::new().build(),
+                receipt: Receipt { transfer_id: tid },
+                created_at: 1000,
+            },
+            involved: &[AccountId::new(1)],
+            event: committed_event(tid),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Rejected(CommitRejection::AccountFrozen(AccountId::new(1)))
+    );
+    assert!(store.get_transfer(&tid).await.unwrap().is_none());
+    assert_eq!(state_of(store, create.id).await, PostingState::Missing);
+}
+
+/// A commit touching a closed account is rejected, and nothing is applied.
+pub async fn commit_atomic_rejects_closed(store: &(impl Store + 'static)) {
+    store
+        .create_account(make_account(1, AccountFlags::CLOSED))
+        .await
+        .unwrap();
+    let tid = EnvelopeId([0xC0; 32]);
+    let create = make_posting(tid.0, 0, 1, 1, 100);
+    let outcome = store
+        .commit_envelope(CommitRequest {
+            transfer_id: tid,
+            consume: &[],
+            create: std::slice::from_ref(&create),
+            record: EnvelopeRecord {
+                envelope: EnvelopeBuilder::new().build(),
+                receipt: Receipt { transfer_id: tid },
+                created_at: 1000,
+            },
+            involved: &[AccountId::new(1)],
+            event: committed_event(tid),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Rejected(CommitRejection::AccountClosed(AccountId::new(1)))
+    );
+    assert!(store.get_transfer(&tid).await.unwrap().is_none());
+}
+
+/// The overdraft floor is strict inside the commit: a projected negative balance
+/// on an overdraft-forbidding account is rejected, and nothing is applied.
+pub async fn commit_atomic_rejects_overdraft(store: &(impl Store + 'static)) {
+    store
+        .create_account(make_account(1, AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT))
+        .await
+        .unwrap();
+    let tid = EnvelopeId([0x0D; 32]);
+    // A negative posting on an overdraft-forbidding account drives its projected
+    // balance below zero; the store must refuse it.
+    let create = make_posting(tid.0, 0, 1, 1, -30);
+    let outcome = store
+        .commit_envelope(CommitRequest {
+            transfer_id: tid,
+            consume: &[],
+            create: std::slice::from_ref(&create),
+            record: EnvelopeRecord {
+                envelope: EnvelopeBuilder::new().build(),
+                receipt: Receipt { transfer_id: tid },
+                created_at: 1000,
+            },
+            involved: &[AccountId::new(1)],
+            event: committed_event(tid),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        CommitOutcome::Rejected(CommitRejection::OverdraftExceeded {
+            account,
+            projected,
+            ..
+        }) if account == AccountId::new(1) && projected == Cent::from(-30)
+    ));
+    assert!(store.get_transfer(&tid).await.unwrap().is_none());
+    assert_eq!(state_of(store, create.id).await, PostingState::Missing);
+}
+
+/// An atomic transition appends the version and its event.
+pub async fn commit_transition_applies(store: &(impl Store + 'static)) {
+    store
+        .create_account(make_account(1, AccountFlags::empty()))
+        .await
+        .unwrap();
+    let mut next = make_account(1, AccountFlags::FROZEN);
+    next.version = 2;
+    let event = LedgerEvent {
+        seq: 0,
+        timestamp: 1000,
+        kind: LedgerEventKind::AccountFrozen {
+            account_id: AccountId::new(1),
+            version: 2,
+        },
+    };
+    assert_eq!(
+        store.commit_transition(next, event).await.unwrap(),
+        TransitionOutcome::Applied
+    );
+    let account = store.get_account(&AccountId::new(1)).await.unwrap();
+    assert_eq!(account.version, 2);
+    assert!(account.is_frozen());
+    assert_eq!(store.get_events_since(0, 10).await.unwrap().len(), 1);
+}
+
+/// Replaying an already-applied transition is idempotent: `AlreadyApplied`, no
+/// second version, no duplicate event.
+pub async fn commit_transition_idempotent_replay(store: &(impl Store + 'static)) {
+    store
+        .create_account(make_account(1, AccountFlags::empty()))
+        .await
+        .unwrap();
+    let mut next = make_account(1, AccountFlags::FROZEN);
+    next.version = 2;
+    let event = LedgerEvent {
+        seq: 0,
+        timestamp: 1000,
+        kind: LedgerEventKind::AccountFrozen {
+            account_id: AccountId::new(1),
+            version: 2,
+        },
+    };
+    store
+        .commit_transition(next.clone(), event.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.commit_transition(next, event).await.unwrap(),
+        TransitionOutcome::AlreadyApplied
+    );
+    assert_eq!(
+        store.get_account(&AccountId::new(1)).await.unwrap().version,
+        2
+    );
+    assert_eq!(store.get_events_since(0, 10).await.unwrap().len(), 1);
+}
+
+/// A transition that skips a version (a gap) is a `VersionConflict`.
+pub async fn commit_transition_version_conflict(store: &(impl Store + 'static)) {
+    store
+        .create_account(make_account(1, AccountFlags::empty()))
+        .await
+        .unwrap();
+    let mut next = make_account(1, AccountFlags::FROZEN);
+    next.version = 3;
+    let event = LedgerEvent {
+        seq: 0,
+        timestamp: 1000,
+        kind: LedgerEventKind::AccountFrozen {
+            account_id: AccountId::new(1),
+            version: 3,
+        },
+    };
+    assert_eq!(
+        store.commit_transition(next, event).await.unwrap(),
+        TransitionOutcome::Rejected(TransitionRejection::VersionConflict {
+            account: AccountId::new(1),
+            expected: 3,
+        })
+    );
+}
+
+/// A transition on a closed account is rejected with `AlreadyClosed`.
+pub async fn commit_transition_rejects_closed(store: &(impl Store + 'static)) {
+    store
+        .create_account(make_account(1, AccountFlags::empty()))
+        .await
+        .unwrap();
+    let mut closed = make_account(1, AccountFlags::CLOSED);
+    closed.version = 2;
+    store
+        .commit_transition(
+            closed,
+            LedgerEvent {
+                seq: 0,
+                timestamp: 1000,
+                kind: LedgerEventKind::AccountClosed {
+                    account_id: AccountId::new(1),
+                    version: 2,
+                },
+            },
+        )
         .await
         .unwrap();
 
-    let mut pending = store.list_pending_sagas().await.unwrap();
-    pending.sort_by_key(|(_, id, _)| *id);
-    assert_eq!(pending.len(), 2);
-    assert_eq!(pending[0], (SagaKind::Envelope, 1, vec![10]));
-    assert_eq!(pending[1], (SagaKind::Transition, 2, vec![20]));
+    let mut next = make_account(1, AccountFlags::CLOSED | AccountFlags::FROZEN);
+    next.version = 3;
+    let outcome = store
+        .commit_transition(
+            next,
+            LedgerEvent {
+                seq: 0,
+                timestamp: 2000,
+                kind: LedgerEventKind::AccountFrozen {
+                    account_id: AccountId::new(1),
+                    version: 3,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        TransitionOutcome::Rejected(TransitionRejection::AlreadyClosed(AccountId::new(1)))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1431,11 +1745,17 @@ macro_rules! store_tests {
             query_transfers_pagination,
             query_transfers_by_book,
             query_transfers_store_wide,
-            // SagaStore
-            save_and_list_sagas,
-            get_saga_by_id,
-            delete_saga,
-            mixed_saga_kinds_list_with_their_kinds,
+            // CommitStore (atomic commit)
+            commit_atomic_creates_and_returns_receipt,
+            commit_atomic_idempotent,
+            commit_atomic_double_spend_rejects_and_applies_nothing,
+            commit_atomic_rejects_frozen,
+            commit_atomic_rejects_closed,
+            commit_atomic_rejects_overdraft,
+            commit_transition_applies,
+            commit_transition_idempotent_replay,
+            commit_transition_version_conflict,
+            commit_transition_rejects_closed,
             // EventStore
             append_and_query_events,
             events_sequence_ordering,

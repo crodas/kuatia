@@ -1,14 +1,15 @@
-//! Concurrency tests for the saga commit pipeline over `InMemoryStore`.
+//! Concurrency tests for the atomic commit path over `InMemoryStore`.
 //!
-//! `InMemoryStore` guards each field with a `tokio::RwLock`, so every individual
-//! `Store` primitive is atomic. A saga, however, is a *sequence* of primitives
-//! with no overarching lock, so the interesting races live between primitives
-//! across concurrent sagas that share one `Arc<Ledger>`. The generated
+//! A commit resolves and validates read-only, then hands the effects to the
+//! store's atomic `commit_envelope`, which applies them (and re-checks
+//! double-spend, freeze/close, and the floor) under one set of locks. The races
+//! worth testing are therefore between concurrent commits that share one
+//! `Arc<Ledger>` and contend on the same postings or account. The generated
 //! conformance suite only drives the store sequentially, so none of this is
 //! covered there.
 //!
 //! These tests run on a multi-thread runtime and use `tokio::spawn` so the
-//! sagas genuinely interleave rather than run to completion one at a time.
+//! commits genuinely interleave rather than run to completion one at a time.
 
 #![allow(missing_docs)]
 
@@ -72,10 +73,9 @@ async fn deposit(ledger: &Arc<Ledger>, to: AccountId, amount: Cent) {
 // ---------------------------------------------------------------------------
 
 /// Many transfers concurrently try to spend the *same* funded posting to
-/// different recipients. Exactly one may win: the winner's `reserve_postings`
-/// claims the single active posting into the reserved index, and every other
-/// saga's reserve returns zero for a fresh reservation, so it fails and
-/// compensates.
+/// different recipients. Exactly one may win: inside the atomic commit the
+/// winner deletes the single live posting, and every other commit finds it gone
+/// and is rejected with `DoubleSpend`.
 /// The ledger stays conserved: the payer ends at zero and exactly one recipient
 /// receives the full amount.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -158,9 +158,9 @@ async fn recommit_same_envelope_is_idempotent() {
 
 /// The same envelope committed concurrently from many tasks. Because the
 /// content-addressed id is the idempotency key, value moves exactly once no
-/// matter how the sagas interleave: some tasks win or observe the stored
-/// transfer and return its receipt; the rest lose the reservation race and
-/// fail. Every successful receipt is identical, and the balances move once.
+/// matter how the commits interleave: one task applies the transfer and the rest
+/// observe the stored record and return its receipt. Every successful receipt is
+/// identical, and the balances move once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_identical_commits_move_value_once() {
     const TASKS: usize = 8;
@@ -220,13 +220,13 @@ async fn concurrent_identical_commits_move_value_once() {
 // ---------------------------------------------------------------------------
 
 /// Freezing an account concurrently with a payment out of it must leave a
-/// consistent state. The account is versioned and the commit pins the snapshot
-/// it validated against, so the two serialize one way or the other: either the
-/// payment finalizes first (against the unfrozen snapshot) and the freeze lands
-/// on top, or the freeze bumps the version first and the commit's last-step
-/// re-validation rejects the now-frozen account. There is no middle ground where
-/// value moves out of a frozen account against a stale snapshot. Value is always
-/// conserved and the payment is all-or-nothing.
+/// consistent state. The freeze is an atomic transition and the payment is an
+/// atomic commit that re-checks the account's frozen flag inside its
+/// transaction, so the two serialize one way or the other: either the payment
+/// commits first and the freeze lands on top, or the freeze commits first and
+/// the payment's in-transaction freeze check rejects the now-frozen account.
+/// There is no middle ground where value moves out of a frozen account. Value is
+/// always conserved and the payment is all-or-nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn freeze_during_commit_stays_consistent() {
     // Race is timing-dependent; run several fresh rounds to sample interleavings.

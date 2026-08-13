@@ -1,6 +1,6 @@
 # Dumb storage + durable saga recovery
 
-* Status: accepted
+* Status: superseded by ADR-0023
 * Authors: Cesar Rodas
 * Date: 2026-06-29
 * Targeted modules: `kuatia-storage`, `kuatia-storage-sql`,

@@ -165,7 +165,5 @@ async fn connect() -> Result<Arc<Ledger>, Box<dyn std::error::Error>> {
     let store = SqlStore::new(pool);
     store.migrate().await?;
     let ledger = Arc::new(Ledger::new(store));
-    // On startup, finish any commit a crash interrupted (idempotent roll-forward).
-    ledger.recover().await?;
     Ok(ledger)
 }

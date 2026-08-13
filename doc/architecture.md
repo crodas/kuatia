@@ -41,9 +41,8 @@ near-zero dependencies. It can be tested with golden vectors, replayed
 deterministically, and embedded in `no_std` environments.
 
 **kuatia** adds the async `Store` trait (used as `dyn Store` via trait objects)
-and composes the saga commit pipeline. The `Ledger` struct is non-generic: it
-holds an `Arc<dyn Store>`, which allows the `legend!` macro to define saga
-types with concrete `LedgerCtx`.
+and the commit engine. The `Ledger` struct is non-generic: it holds an
+`Arc<dyn Store>`.
 
 This separation keeps the auditable heart of the system deterministic and
 independently testable.
@@ -51,10 +50,11 @@ independently testable.
 ## Store Sub-Trait Architecture
 
 The `Store` trait is a composite of focused sub-traits, each responsible for a
-single domain. Every write method is a **dumb instruction**: it applies one
-update and returns the number of affected rows (or an I/O error). It never
-interprets the count, decides state, enforces idempotency, or compensates. The
-saga does.
+single domain. A transfer is committed atomically through `CommitStore`
+(`commit_envelope` / `commit_transition`); the remaining posting/account write
+methods are **dumb instructions** used by reads and setup: each applies one
+update and returns the number of affected rows (or an I/O error), never
+interpreting the count.
 
 ```mermaid
 classDiagram
@@ -80,11 +80,9 @@ classDiagram
         +get_transfers_for_account(account)
         +query_transfers(query)
     }
-    class SagaStore {
-        +save_saga(id, data)
-        +list_pending_sagas()
-        +get_saga(id)
-        +delete_saga(id)
+    class CommitStore {
+        +commit_envelope(request) CommitOutcome
+        +commit_transition(next, event) TransitionOutcome
     }
     class EventStore {
         +append_event(event)
@@ -101,101 +99,63 @@ classDiagram
     Store --|> AccountStore
     Store --|> PostingStore
     Store --|> TransferStore
-    Store --|> SagaStore
+    Store --|> CommitStore
     Store --|> EventStore
     Store --|> BookStore
 ```
 
-There is no single atomic commit boundary. A commit is a sequence of the dumb
-primitives above (`reserve_postings`, `deactivate_postings`, `insert_postings`,
-`store_transfer`, `append_event`), each its own atomic update and each
-idempotent. The saga sequences them and interprets their counts; a crash
-mid-sequence is completed by roll-forward recovery (see below).
+A whole transfer is committed atomically by `CommitStore::commit_envelope`, so
+there is a single atomic commit boundary. The store enforces the stateful guards
+(double-spend, freeze/close, overdraft floor) inside that transaction; the pure
+core validates everything else first. Balance computation, validation, and the
+resolve decision live in the Ledger and `kuatia-core`.
 
-The store only persists and reads. All domain logic (balance computation,
-validation, balance-constraint enforcement, and the interpretation of primitive
-counts) lives in the Ledger/saga and `kuatia-core`.
+## Atomic Commit
 
-## Saga Commit Pipeline
-
-Every commit is the envelope saga. `commit(transfer)` resolves the intent into
-a concrete envelope (read-only), then runs `commit_envelope`, which persists a
-write-ahead `PendingSaga` record (phase `Reserving`) and drives **two** steps.
-Validation lives inside the finalize step so it runs as late as possible,
-immediately before the writes.
+`commit(transfer)` resolves the intent into a concrete envelope (read-only),
+validates it against loaded state in the pure core, then hands the validated
+effects to `store.commit_envelope(..)`, which applies them in one transaction.
 
 ```mermaid
 sequenceDiagram
     participant C as Caller
     participant L as Ledger
-    participant R as ReserveStep
-    participant F as FinalizeStep
     participant S as Store
 
-    C->>L: commit(transfer) → resolve → commit_envelope(envelope)
-    L->>S: save_saga(PendingSaga{envelope, reservation, Reserving})
-    L->>R: execute
-    R->>S: reserve_postings(ids, rid) → count
-    Note over R: interpret count (full / partial / zero+read)
-
-    L->>F: execute (finalize_envelope)
-    F->>S: load + validate_and_plan() [last-step floor / freeze-close re-check]
-    F->>S: save_saga(... Finalizing)  [point of no return]
-    F->>S: deactivate_postings(consumed, rid) → verify all Inactive
-    F->>S: insert_postings(created) → verify exist
-    F->>S: store_transfer(record, involved) → verify transfer exists
-    F->>S: append_event(committed)
-    F-->>L: Receipt
-    L->>S: delete_saga(...)
-    L-->>C: Receipt
+    C->>L: commit(transfer)
+    L->>L: resolve(transfer) → envelope   [read-only]
+    L->>L: load + validate_and_plan()     [pure core]
+    L->>S: commit_envelope(consume, create, record, involved, event)
+    Note over S: one transaction —<br/>idempotency check, freeze/close,<br/>double-spend (delete-affected-count),<br/>overdraft floor, then apply
+    S-->>L: Committed | AlreadyCommitted | Rejected
+    L-->>C: Receipt (or mapped error)
 ```
 
-On in-process failure before the point of no return, legend compensates in LIFO
-order (finalize is a no-op if nothing committed; reserve runs
-`release_postings`). Once the finalize step has marked the saga `Finalizing`
-and begun deactivating, the half-applied commit is **rolled forward** by
-recovery
-rather than compensated (see below).
+Inside the transaction the store checks idempotency (an already-stored transfer
+returns its receipt), then re-checks the three stateful guards strictly: the
+consumed postings must still be live (the delete-affected-count is the atomic
+single-winner claim), the involved accounts must not be frozen or closed, and an
+overdraft-forbidding account's projected balance must stay non-negative (summed
+in Rust from the live rows). A domain rejection is a typed `CommitRejection` the
+ledger maps to a `LedgerError`; nothing is applied on a rejection.
 
-## Durable Crash Recovery
+Because the write is all-or-nothing, a crash either applied the whole commit or
+none of it. There is no write-ahead record and no `recover()` step. An account
+transition (freeze/unfreeze/close) is the same shape: `commit_transition`
+appends the new version and its lifecycle event in one transaction.
 
-There is no single atomic transaction, so crash-safety comes from a
-phase-tracked write-ahead record plus idempotent roll-forward.
-`commit_envelope` persists a `PendingSaga {envelope, reservation, phase}` via
-`SagaStore` **before** the saga mutates anything (`phase = Reserving`); the
-finalize step bumps it to `Finalizing` after validation passes and just before
-the consumed postings start turning `Inactive`. The record is deleted only when
-the transfer is committed or the commit was cleanly abandoned before finalize.
+This replaced an earlier saga pipeline. A saga is the right tool when a workflow
+spans resources that cannot share a transaction (multiple services or a sharded
+store); here every step lived behind one transactional store, so one ACID
+transaction was the simpler, stricter primitive. If a backend ever shards its
+data, the saga returns *inside* that backend's `commit_envelope`, not in the
+ledger core. See
+[ADR-0023](adr/0023-atomic-storage-commit.md) ("When a saga is the right tool").
 
-`Ledger::recover()` (call on startup) re-completes any surviving pending saga,
-**branching on the persisted phase** so it never commits something that did not
-validate or consume postings it does not own:
-
-```mermaid
-graph TD
-    A[get_transfer?] -->|exists| Z[delete record, done]
-    A -->|missing| P{phase}
-    P -->|Reserving| RR[re-run saga: reserve + finalize]
-    RR -->|re-validates; aborts cleanly if taken/frozen| Z
-    P -->|Finalizing| FF[finalize_envelope: roll forward, verified]
-    FF --> Z
-```
-
-- A **`Reserving`** saga had not necessarily validated, so recovery re-runs the
-  real saga, which re-reserves and **re-validates** against current state. If
-  the postings were taken by another transfer, or an account was frozen, it
-  aborts cleanly (nothing commits) and the record is deleted.
-- A **`Finalizing`** saga had already validated and owns its postings (it
-  reached the point of no return), so recovery rolls it forward through the
-  verified `finalize_envelope`, which checks every end-state and only
-  creates/stores once **all** consumed postings are confirmed `Inactive` (the
-  double-spend guard).
-
-Recovery is roll-forward, not rollback, so the reservation protocol never
-leaves orphaned `PendingInactive` postings for a separate reconciliation pass.
-
-`reverse()` builds a reversal envelope and runs the same `commit_envelope`
-path. There is no separate raw/atomic entry point.
+`reverse()` builds a reversal envelope and runs the same `commit_envelope` path.
+Multiple transfers compose into an all-or-nothing workflow through
+`saga::run_movements`, which commits them in order and reverses the committed
+ones LIFO on failure.
 
 ## Content-Addressed Transfers
 
@@ -270,24 +230,22 @@ negative posting on such an account. Use
 ## The Debit-Must-Not-Exceed-Credit Constraint Under Concurrency
 
 An account that forbids overdraft has a balance floor at zero that is not backed
-by the UTXO model alone: two concurrent transfers could each pass validation but
-together push the balance negative (write-skew).
+by the UTXO model alone: two concurrent transfers could each pass a snapshot
+validation but together push the balance negative (write-skew).
 
-Under the dumb-storage model the floor (and the freeze/close snapshot check) is
-re-validated **as the last thing the finalize step does before it writes**: the
-finalize step re-loads balances and account versions and re-runs
-`validate_and_plan` immediately before `deactivate_postings`. This is the
-tightest best-effort: the check-to-write window is one step, not the whole
-saga's lifetime, and it also runs on the recovery path. It is **not strictly
-atomic**, though. Without folding the check into the write itself (a CAS) or
-serializing per account, a concurrent commit landing in that last sub-step gap
-can still slip through. Double-spend safety is unaffected and holds
-unconditionally: the reservation protocol (`reserve_postings` is a single
-atomic conditional update, so two sagas cannot both claim the same posting)
-prevents
-consuming a posting twice. Only the floor on an account that forbids overdraft
-is best-effort. This tradeoff is recorded in
-[doc/adr/0003-dumb-storage-saga-recovery.md](adr/0003-dumb-storage-saga-recovery.md).
+Under the atomic-commit model (ADR-0023) the floor and the freeze/close checks
+are re-run **inside the commit transaction**, after the consumed postings are
+deleted and the created ones inserted, so they see the true post-commit state. A
+projected-negative balance on an overdraft-forbidding account aborts the whole
+transaction. On PostgreSQL the involved account-head rows are taken `FOR UPDATE`
+before the live-posting writes, serializing concurrent commits that touch the
+same account; on SQLite the single write transaction serializes writers. The
+floor is therefore **strict**, not best-effort. Double-spend safety comes from
+the same transaction: deleting a consumed live row is the atomic single-winner
+claim, so two commits cannot both spend it. This supersedes the best-effort
+tradeoff recorded in
+[doc/adr/0003-dumb-storage-saga-recovery.md](adr/0003-dumb-storage-saga-recovery.md);
+see [doc/adr/0023-atomic-storage-commit.md](adr/0023-atomic-storage-commit.md).
 
 An overdraft-permitting account has no floor to violate.
 
@@ -324,7 +282,10 @@ share one selection pass, avoiding double-selection of the same postings.
 
 ## Posting Lifecycle
 
-Postings follow a three-state lifecycle managed by the saga pipeline:
+A committed transfer moves a posting straight from `Active` to `Inactive` inside
+the atomic commit (the live row is deleted). The intermediate `PendingInactive`
+(reserved) state and the `reserve_postings`/`release_postings` primitives remain
+as generic single-winner claim operations, unused by the commit path:
 
 ```mermaid
 stateDiagram-v2
@@ -347,8 +308,8 @@ The batch posting methods are dumb: each id's conditional update is applied
 independently, and the method returns the number of rows it changed. There is
 no all-or-nothing batch rejection. A posting that does not meet the condition is
 simply skipped (it does not count and does not error), so a batch can apply to
-some ids and not others. The saga interprets the returned count (full continue,
-partial compensate, zero idempotent-replay); the Store never decides.
+some ids and not others. The caller interprets the returned count; the Store
+never decides.
 
 - **`reserve_postings(ids, rid)`**: flips each `Active` posting to
   `PendingInactive` stamped with `rid`. Each flip is a single atomic conditional
@@ -360,71 +321,28 @@ Each posting's update is atomic on its own row, so this enables shard-local
 writes with no cross-shard coordination. Atomicity is per posting, not across
 the batch.
 
-## Saga Composition
+## Multi-Transfer Composition
 
-### Internal pipeline steps
-
-The envelope saga is two `legend::Step` implementations operating on
-`LedgerCtx` (resolution runs before the saga, in `Ledger::commit`):
-
-| Step | Execute | Compensate | Retry |
-|------|---------|------------|-------|
-| `ReservePostingsStep` | Reserve postings `Active → PendingInactive`, interpret the count | Release back to `Active` | 3 retries |
-| `FinalizeTransferStep` | `Ledger::finalize_envelope`: re-validate (last-step floor/freeze guard) → mark `Finalizing` → `deactivate` → `insert` → `store_transfer` → `append_event`, verifying every end-state | `reverse(transfer_id)` | 3 retries |
-
-### High-level composition steps
-
-Higher-level steps compose over the intent-layer API for multi-transfer
-workflows:
-
-| Step | Execute | Compensate |
-|------|---------|------------|
-| `PayMovementStep` | Build pay transfer, `ledger.commit(...)` | `ledger.reverse(receipt.transfer_id)` |
-| `DepositMovementStep` | Build deposit transfer, `ledger.commit(...)` | `ledger.reverse(receipt.transfer_id)` |
-
-### Custom orchestration with legend
-
-You can compose any combination of steps into a saga using the `legend!` macro.
-Legend drives the steps in order, retries on transient failures, and
-compensates completed steps in reverse (LIFO) on unrecoverable failure.
+A single commit is already atomic in the store, so composing several transfers
+into one all-or-nothing workflow (an FX trade, a multi-leg settlement) needs only
+a thin runner, not a saga VM. `saga::run_movements` commits a list of
+`Movement`s in order and, on the first failure, reverses the already-committed
+receipts LIFO via `ledger.reverse(..)`:
 
 ```rust
 use std::sync::Arc;
-use legend::legend;
-use kuatia::saga::*;
+use kuatia::saga::{DepositInput, Movement, PayInput, run_movements};
 
-// Define a multi-transfer saga
-legend! {
-    FundAndPay<LedgerCtx, SagaError> {
-        deposit: DepositMovementStep,
-        pay: PayMovementStep,
-    }
-}
-
-// Build and run: Ledger uses Arc<dyn Store>, so LedgerCtx is concrete
 let ledger: Arc<Ledger> = /* ... */;
-let saga = FundAndPay::new(FundAndPayInputs {
-    deposit: DepositInput { to: alice, asset: usd, amount, external: bank },
-    pay: PayInput { from: alice, to: bob, asset: usd, amount },
-});
-let ctx = LedgerCtx::new(ledger.clone());
-let result = saga.build(ctx).start().await;
-
-match result {
-    ExecutionResult::Completed(e) => { /* all steps succeeded */ }
-    ExecutionResult::Failed(_, err) => { /* deposit was compensated */ }
-    ExecutionResult::Paused(e) => { /* serialize e for crash recovery */ }
-    ExecutionResult::CompensationFailed { .. } => { /* manual intervention */ }
-}
+let receipts = run_movements(&ledger, &[
+    Movement::Deposit(DepositInput { to: alice, asset: usd, amount, external: bank }),
+    Movement::Pay(PayInput { from: alice, to: bob, asset: usd, amount }),
+])
+.await?;
 ```
 
-Since `Ledger` uses `Arc<dyn Store>` internally, `LedgerCtx` is a concrete
-type: no generic parameters needed. This is what allows `legend!` to define
-saga types directly.
-
-The `LedgerCtx` is serializable: a paused saga can be persisted and resumed
-later, enabling crash recovery. On boot, load pending sagas and resume them;
-legend will compensate any completed steps that need rollback.
+If the pay fails, the deposit is reversed and the original error is returned; a
+failing reversal surfaces as `LedgerError::CompensationFailed`.
 
 ### Reversal
 

@@ -78,36 +78,23 @@ The resolved, concrete form of a transfer: which postings to consume and which
 to create. Produced by the resolve step (`commit`), or built directly and
 committed via `commit_envelope(envelope)`.
 
-### Dumb storage
+### Atomic commit
 
-The design where every `Store` write method applies one update and returns the
-**number of affected rows** (or an I/O error), never interpreting that count,
-deciding state, enforcing idempotency, or compensating. The saga reads the
-count and decides: full = continue; partial = error → compensate; zero = read
-state and continue only if this same envelope/reservation already applied it.
+The design where a whole transfer commits in one store transaction
+(`CommitStore::commit_envelope`). The pure core validates first; the transaction
+re-checks the stateful guards inside it (double-spend, freeze/close, overdraft
+floor) and applies the effects all-or-nothing. A crash leaves no half-applied
+state, so there is no write-ahead log and no recovery. See ADR-0023 (superseding
+ADR-0003). The remaining posting/account write methods stay dumb: each applies
+one update and returns the number of affected rows, never interpreting it.
 
-### Reservation protocol
+### Double-spend guard
 
-The concurrency-control mechanism for consumed postings: `reserve_postings`
-atomically flips `Active → PendingInactive` stamped with a `ReservationId`,
-so two sagas cannot both claim the same posting. This (not a global
-transaction) is what prevents double-spend.
-
-### Write-ahead record (PendingRecord) / recovery
-
-A record persisted via `SagaStore` before a multi-write operation mutates
-anything, so a crash mid-sequence can be completed on the next startup. There
-are two kinds (`PendingRecord`): a **commit saga** `{envelope, reservation,
-phase}`, and an **account transition** `{next, event}` (freeze/unfreeze/close).
-The `pending` module owns the concept: what a record is, how it is
-(de)serialized, and how each kind completes.
-
-`Ledger::recover()` (startup) loads each surviving record and drives it to a
-terminal state through `PendingRecord::complete`. A commit saga's `phase`
-(`Reserving` → `Finalizing`) decides how: a `Reserving` saga is re-run and
-**re-validated**; a `Finalizing` saga (already validated, owns its postings) is
-rolled forward through the verified `finalize_envelope`. A transition rolls its
-version + event forward idempotently. Roll-forward, not rollback.
+The concurrency-control mechanism for consumed postings: inside the atomic
+commit, deleting a consumed live posting is a single atomic conditional update,
+so two commits cannot both spend it. The loser sees the row gone and is rejected
+with `DoubleSpend`. This (not a global validation snapshot) is what prevents
+double-spend.
 
 ### Book
 

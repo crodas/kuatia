@@ -32,6 +32,10 @@ pub enum LedgerError {
     TransferNotFound(EnvelopeId),
     /// The posting cannot be reversed (e.g. already consumed).
     PostingNotReversible(PostingId),
+    /// A consumed posting was no longer live at commit time: already spent,
+    /// missing, or taken by a concurrent commit. The atomic commit refused it
+    /// rather than double-spend. Carries the first offending posting.
+    DoubleSpend(PostingId),
     /// The referenced account does not exist.
     AccountNotFound(AccountId),
     /// Cannot close an account that still has active postings.
@@ -99,6 +103,7 @@ impl fmt::Display for LedgerError {
             Self::Selection(e) => write!(f, "selection: {e}"),
             Self::TransferNotFound(id) => write!(f, "transfer not found: {id:?}"),
             Self::PostingNotReversible(id) => write!(f, "posting not reversible: {id:?}"),
+            Self::DoubleSpend(id) => write!(f, "posting already spent: {id:?}"),
             Self::AccountNotFound(id) => write!(f, "account not found: {id:?}"),
             Self::AccountNotEmpty(id) => write!(f, "account not empty: {id:?}"),
             Self::AccountAlreadyClosed(id) => write!(f, "account already closed: {id:?}"),

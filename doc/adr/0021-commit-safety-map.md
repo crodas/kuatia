@@ -1,6 +1,8 @@
 # The commit-safety invariant and where each part is enforced
 
-* Status: accepted
+* Status: accepted (amended by ADR-0023: the double-spend, floor, and
+  freeze/close guards now live in the store's atomic `commit_envelope`, not the
+  saga's count-contract)
 * Authors: Cesar Rodas
 * Date: 2026-07-28
 * Targeted modules: `kuatia-core` (`validate`), `kuatia` (`ledger::commit`,

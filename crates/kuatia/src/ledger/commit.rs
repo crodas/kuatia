@@ -1,10 +1,12 @@
-//! The write-ahead commit engine: resolve, reserve, finalize, recover.
+//! The commit engine: resolve, validate, apply atomically, reverse.
 //!
-//! This is the deep core of the ledger. Every commit is the linear
-//! `reserve → finalize` path (validation inside finalize), which releases its
-//! reservation to compensate a failure before the point of no return. A
-//! phase-tracked write-ahead record ([`PendingSaga`]) lets [`Ledger::recover`]
-//! complete or safely abandon a commit interrupted by a crash.
+//! This is the deep core of the ledger. Every commit resolves a [`Transfer`]
+//! intent into a concrete [`Envelope`], validates it against loaded state in the
+//! pure core, and hands the validated effects to the store's atomic
+//! [`commit_envelope`](kuatia_storage::store::CommitStore::commit_envelope). The
+//! store applies them in one transaction and re-checks the stateful guards
+//! inside it, so there is no half-applied state and nothing to recover after a
+//! crash (ADR-0023, superseding the write-ahead saga of ADR-0003).
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -15,19 +17,16 @@ use tracing::instrument;
 use kuatia_core::{
     Account, AccountId, AccountSnapshotId, AssetId, Book, Cent, DEFAULT_BOOK, Envelope,
     EnvelopeBuilder, EnvelopeId, NewPosting, Plan, PlanInput, Posting, PostingFilter, PostingId,
-    PostingState, Receipt, ReservationId, ResolveInput, Transfer, account_snapshot_id,
-    draft_movements, envelope_id, required_state, resolve_envelope, validate_and_plan,
+    Receipt, ResolveInput, Transfer, ValidationError, account_snapshot_id, draft_movements,
+    envelope_id, required_state, resolve_envelope, validate_and_plan,
 };
 
 use kuatia_storage::error::StoreError;
 use kuatia_storage::events::{LedgerEvent, LedgerEventKind};
-use kuatia_storage::store::{EnvelopeRecord, SagaKind};
+use kuatia_storage::store::{CommitOutcome, CommitRejection, CommitRequest, EnvelopeRecord};
 
 use super::{Ledger, now_millis};
 use crate::error::LedgerError;
-use crate::saga::{apply_and_verify, consume_reserved, verify_postings};
-
-use super::pending::{PendingSaga, PendingTransition, SagaPhase};
 
 /// State loaded in phase 1, passed to the pure validation in phase 2.
 struct LoadedState {
@@ -167,26 +166,26 @@ impl Ledger {
     }
 
     // -----------------------------------------------------------------------
-    // Commit: every commit is the envelope saga (reserve -> finalize; finalize re-validates)
+    // Commit: resolve (read-only) then apply atomically
     // -----------------------------------------------------------------------
 
     /// Commit a [`Transfer`] intent. Resolves it into a concrete envelope, then
-    /// drives the envelope saga. Resolution is read-only, so a crash before the
-    /// saga's write-ahead record leaves no partial state.
+    /// validates and applies it atomically. Resolution is read-only, and the
+    /// apply is one store transaction, so a crash leaves no partial state.
     #[instrument(skip(self, transfer), fields(book = transfer.book.0), name = "ledger.commit")]
     pub async fn commit(self: &Arc<Self>, transfer: Transfer) -> Result<Receipt, LedgerError> {
         let envelope = self.resolve(&transfer).await?;
         self.commit_envelope(envelope).await
     }
 
-    /// Commit a pre-resolved [`Envelope`] through the saga pipeline (reserve ->
-    /// validate -> finalize). This is the single commit path; `commit()` and
-    /// `reverse()` both funnel through it.
-    ///
-    /// Before running, the commit (envelope + reservation) is persisted as a
-    /// pending record so a crash mid-commit is completed by [`recover`](Self::recover). The
-    /// record is deleted once the commit reaches a terminal state. The commit is
-    /// idempotent on the content-addressed transfer id.
+    /// Commit a pre-resolved [`Envelope`]. Validates it against loaded state,
+    /// then applies the validated effects through the store's atomic
+    /// [`commit_envelope`](kuatia_storage::store::CommitStore::commit_envelope):
+    /// one transaction that spends the consumed postings, creates the new ones,
+    /// stores the transfer, and appends the committed event, re-checking
+    /// double-spend, freeze/close, and the overdraft floor inside it. This is the
+    /// single commit path; `commit()` and `reverse()` both funnel through it, and
+    /// it is idempotent on the content-addressed transfer id.
     #[instrument(skip(self, envelope), name = "ledger.commit_envelope")]
     pub async fn commit_envelope(
         self: &Arc<Self>,
@@ -199,256 +198,59 @@ impl Ledger {
             envelope.set_account_snapshots(self.resolve_snapshots(&ids).await?);
         }
 
-        // Idempotency: an already-committed transfer returns its receipt.
+        // Idempotency pre-check: an already-committed transfer returns its receipt
+        // without re-validating. The store also guards this atomically.
         let tid = envelope_id(&envelope);
         if let Some(record) = self.store.get_transfer(&tid).await? {
             return Ok(record.receipt);
         }
 
-        // The write-ahead record owns its own lifecycle (persist at Reserving,
-        // drive the saga, clear only when past-the-point-of-no-return is safe), so
-        // this path and `recover()` share one contract instead of each re-deriving
-        // the phase rules.
-        PendingSaga::new(envelope, ReservationId::default())
-            .run(self)
-            .await
-    }
+        // Pure validation against loaded state (conservation, ownership,
+        // snapshots, book policy, plus a best-effort floor/freeze read). The store
+        // then re-checks the stateful guards strictly inside the commit
+        // transaction.
+        let loaded = self.load(&envelope).await?;
+        let plan = self.plan(&envelope, &loaded)?;
 
-    /// The single-commit core: reserve the consumed postings, then finalize.
-    ///
-    /// This used to be a two-step `legend` saga; for one commit the steps were
-    /// pass-throughs, so the reserve/compensation policy now lives here as a
-    /// linear path next to [`finalize_envelope`](Self::finalize_envelope).
-    /// (`legend` still drives the composed multi-transfer sagas in `saga`.)
-    ///
-    /// On any failure the reservation is released (the LIFO compensation collapsed
-    /// to its one meaningful action). Before the point of no return that returns
-    /// the postings to Active so the caller's `clear_if_safe` can drop the
-    /// write-ahead record; past `Finalizing` the postings are already spent, so
-    /// the release is a no-op and the record is instead kept for roll-forward. The
-    /// typed error (validation / overdraft / frozen) reaches the caller unchanged.
-    pub(super) async fn reserve_and_finalize(
-        &self,
-        envelope: &Envelope,
-        reservation: ReservationId,
-    ) -> Result<Receipt, LedgerError> {
-        let consumes = envelope.consumes();
-
-        let result = match self.reserve_consumed(consumes, reservation).await {
-            Ok(()) => self.finalize_envelope(envelope, reservation).await,
-            Err(err) => Err(err),
-        };
-
-        match result {
-            Ok(receipt) => Ok(receipt),
-            // Compensate by releasing our reservation. If the release itself fails
-            // we surface both errors, matching the old saga's `CompensationFailed`.
-            Err(err) => match self.store.release_postings(consumes, reservation).await {
-                Ok(_) => Err(err),
-                Err(comp) => Err(LedgerError::CompensationFailed {
-                    original: Box::new(err),
-                    compensation: Box::new(LedgerError::Store(comp)),
-                }),
-            },
-        }
-    }
-
-    /// Reserve every consumed posting into the reserved index under `reservation`
-    /// (a CAS out of the active index), then check the affected-row count against
-    /// the ADR-0003 contract. A short count is accepted only when the shortfall is
-    /// already reserved by us (an idempotent replay, e.g. recovery re-running a
-    /// `Reserving` saga). A deposit consumes nothing, so this is a no-op.
-    async fn reserve_consumed(
-        &self,
-        consumes: &[PostingId],
-        reservation: ReservationId,
-    ) -> Result<(), LedgerError> {
-        if consumes.is_empty() {
-            return Ok(());
-        }
-        let reserved = self
-            .store
-            .reserve_postings(consumes, reservation)
-            .await
-            .map_err(LedgerError::Store)?;
-        verify_postings(
-            self.store.as_ref(),
-            consumes,
-            reserved,
-            |s| matches!(s, PostingState::Reserved(r) if *r == reservation),
-            "reserve",
-        )
-        .await
-    }
-
-    /// Complete every pending write-ahead record left by a crash. Call on
-    /// startup; returns how many were processed.
-    ///
-    /// Each record is dispatched on its stored [`SagaKind`] and driven to a
-    /// terminal state by the completion method in the `pending` module: a
-    /// transition rolls forward; an envelope commit branches on its persisted
-    /// phase — a `Reserving` saga is re-run and re-validated, a `Finalizing` saga
-    /// is rolled forward through the verified `finalize_envelope`.
-    #[instrument(skip(self), name = "ledger.recover")]
-    pub async fn recover(self: &Arc<Self>) -> Result<usize, LedgerError> {
-        let pending = self.store.list_pending_sagas().await?;
-        let count = pending.len();
-        for (kind, saga_id, blob) in pending {
-            // Dispatch on the store's typed kind, not an in-band blob tag. The
-            // commit lifecycle (phase rules, delete-safety) lives on `PendingSaga`;
-            // a transition rolls itself forward.
-            match kind {
-                SagaKind::Envelope => PendingSaga::decode(&blob)?.complete(self).await?,
-                SagaKind::Transition => {
-                    PendingTransition::decode(&blob)?
-                        .complete(self, saga_id)
-                        .await?
-                }
-            }
-        }
-        Ok(count)
-    }
-
-    /// Idempotently finalize `envelope` to its committed state, **verifying every
-    /// step's end-state**. Used by the saga's finalize step and by recovery.
-    ///
-    /// When the consumed postings are still reserved it re-validates against
-    /// current state (the last-step floor / freeze-close guard) and then marks
-    /// the saga `Finalizing` (the point of no return). Once any consumed posting
-    /// is already spent — a prior attempt or recovery passed that point — it
-    /// rolls forward without re-validating. It never creates or stores anything
-    /// unless **all** consumed postings are confirmed spent, which is the
-    /// double-spend guard.
-    pub(crate) async fn finalize_envelope(
-        &self,
-        envelope: &Envelope,
-        reservation: ReservationId,
-    ) -> Result<Receipt, LedgerError> {
-        let tid = envelope_id(envelope);
-        if let Some(record) = self.store.get_transfer(&tid).await? {
-            // The transfer record is durable, but a crash (or a retried finalize)
-            // can land between store_transfer and the event append below. The
-            // committed end-state includes the event, so ensure it before
-            // returning — `append_committed_event` is idempotent.
-            self.append_committed_event(tid).await?;
-            return Ok(record.receipt); // already committed
-        }
-        let consumes = envelope.consumes();
-
-        // Read consumed postings (immutable rows, kept for owner indexing) and
-        // their derived states.
-        let consumed = if consumes.is_empty() {
-            Vec::new()
-        } else {
-            self.store.get_postings(consumes).await?
-        };
-        let states = if consumes.is_empty() {
-            Vec::new()
-        } else {
-            self.store.get_posting_states(consumes).await?
-        };
-        let past_no_return = states.contains(&PostingState::Spent);
-
-        // Last-step boundary re-check: re-validate floor + freeze/close + snapshots
-        // against current state, but only while it is still safe (validation
-        // rejects a consumed posting that is no longer live).
-        if !past_no_return {
-            let loaded = self.load(envelope).await?;
-            self.plan(envelope, &loaded)?;
-        }
-
-        // Point of no return: record Finalizing before any posting is consumed.
-        PendingSaga::finalizing(envelope.clone(), reservation)
-            .persist(self)
-            .await?;
-
-        // The authoritative double-spend guard (see `consume_reserved`): consume
-        // only rows we reserved, then assert all consumed postings are spent.
-        consume_reserved(self.store.as_ref(), consumes, reservation).await?;
-
-        // Created postings, derived deterministically from the envelope.
-        let created: Vec<Posting> = envelope
-            .creates()
-            .iter()
-            .enumerate()
-            .map(|(i, np)| {
-                Posting::new(
-                    PostingId {
-                        transfer: tid,
-                        index: i as u16,
-                    },
-                    np.owner,
-                    np.asset,
-                    np.value,
-                )
-            })
-            .collect();
-        let inserted = self.store.insert_postings(&created).await?;
-        let created_ids: Vec<PostingId> = created.iter().map(|p| p.id).collect();
-        verify_postings(
-            self.store.as_ref(),
-            &created_ids,
-            inserted,
-            |s| *s != PostingState::Missing,
-            "finalize: insert created postings",
-        )
-        .await?;
-
-        // Index both created and consumed owners.
-        let mut involved: Vec<AccountId> = created.iter().map(|p| p.owner).collect();
-        involved.extend(consumed.iter().map(|p| p.owner));
+        // Index both created and consumed owners; this is also the set the store
+        // re-checks for freeze/close/floor.
+        let mut involved: Vec<AccountId> =
+            plan.postings_to_create.iter().map(|p| p.owner).collect();
+        involved.extend(loaded.consumed_postings.iter().map(|p| p.owner));
         involved.sort();
         involved.dedup();
 
-        let receipt = Receipt { transfer_id: tid };
-        let stored = self
+        let ts = now_millis()?;
+        let receipt = Receipt {
+            transfer_id: plan.transfer_id,
+        };
+        let record = EnvelopeRecord {
+            envelope: envelope.clone(),
+            receipt: receipt.clone(),
+            created_at: ts,
+        };
+        let event = LedgerEvent {
+            seq: 0,
+            timestamp: ts,
+            kind: LedgerEventKind::TransferCommitted {
+                transfer_id: plan.transfer_id,
+            },
+        };
+
+        let outcome = self
             .store
-            .store_transfer(
-                EnvelopeRecord {
-                    envelope: envelope.clone(),
-                    receipt: receipt.clone(),
-                    created_at: now_millis()?,
-                },
-                &involved,
-            )
-            .await?;
-        apply_and_verify(stored, 1, "finalize: store transfer record", || async {
-            Ok(self.store.get_transfer(&tid).await?.is_some())
-        })
-        .await?;
-
-        self.append_committed_event(tid).await?;
-        Ok(receipt)
-    }
-
-    /// Idempotently append the `TransferCommitted` event for `tid`.
-    ///
-    /// The event append is the final finalize step, *after* `store_transfer`, so a
-    /// crash in that window leaves a stored transfer with no event. Recovery and a
-    /// retried finalize both call this to repair the committed end-state.
-    /// `append_event` dedups on the transfer id, so calling it more than once for
-    /// the same transfer is a no-op.
-    pub(super) async fn append_committed_event(&self, tid: EnvelopeId) -> Result<(), LedgerError> {
-        self.store
-            .append_event(&LedgerEvent {
-                seq: 0,
-                timestamp: now_millis()?,
-                kind: LedgerEventKind::TransferCommitted { transfer_id: tid },
+            .commit_envelope(CommitRequest {
+                transfer_id: plan.transfer_id,
+                consume: &plan.postings_to_deactivate,
+                create: &plan.postings_to_create,
+                record,
+                involved: &involved,
+                event,
             })
             .await?;
-        Ok(())
-    }
-
-    /// The persisted commit phase of the record stored under `saga_id`, via a
-    /// keyed read. `None` when no record exists there or it is a transition
-    /// (which has no phase). Used to decide whether a failed commit reached the
-    /// point of no return.
-    pub(super) async fn saga_phase(&self, saga_id: i64) -> Result<Option<SagaPhase>, LedgerError> {
-        // Only ever called with an envelope saga's key (its reservation id), so the
-        // record decodes as a `PendingSaga`; a transition never reaches here.
-        match self.store.get_saga(&saga_id).await? {
-            Some(blob) => Ok(Some(PendingSaga::decode(&blob)?.phase)),
-            None => Ok(None),
+        match outcome {
+            CommitOutcome::Committed(r) | CommitOutcome::AlreadyCommitted(r) => Ok(r),
+            CommitOutcome::Rejected(reason) => Err(map_rejection(reason)),
         }
     }
 
@@ -516,11 +318,34 @@ impl Ledger {
     }
 }
 
+/// Map a store-side [`CommitRejection`] to the typed ledger error callers match
+/// on, so a strict in-transaction guard surfaces the same error a snapshot-time
+/// validation would.
+fn map_rejection(reason: CommitRejection) -> LedgerError {
+    match reason {
+        CommitRejection::DoubleSpend(id) => LedgerError::DoubleSpend(id),
+        CommitRejection::AccountFrozen(id) => {
+            LedgerError::Validation(ValidationError::AccountFrozen(id))
+        }
+        CommitRejection::AccountClosed(id) => {
+            LedgerError::Validation(ValidationError::AccountClosed(id))
+        }
+        CommitRejection::OverdraftExceeded {
+            account,
+            asset,
+            projected,
+        } => LedgerError::Validation(ValidationError::OverdraftExceeded {
+            account,
+            asset,
+            projected,
+        }),
+    }
+}
+
 #[cfg(test)]
-mod recovery_tests {
-    use super::super::pending::{PendingSaga, PendingTransition};
+mod tests {
     use super::*;
-    use kuatia_core::{Account, AccountFlags, ReservationId, TransferBuilder, TransitionId};
+    use kuatia_core::{Account, AccountFlags, TransferBuilder};
     use kuatia_storage::mem_store::InMemoryStore;
     use std::collections::BTreeMap;
 
@@ -568,35 +393,11 @@ mod recovery_tests {
             .build()
     }
 
-    async fn save_pending(
-        ledger: &Arc<Ledger>,
-        envelope: &Envelope,
-        rid: ReservationId,
-        phase: SagaPhase,
-    ) {
-        let blob = serde_json::to_vec(&PendingSaga {
-            envelope: envelope.clone(),
-            reservation: rid,
-            phase,
-        })
-        .unwrap();
-        ledger
-            .store()
-            .save_saga(SagaKind::Envelope, &rid.0, blob)
-            .await
-            .unwrap();
-    }
-
-    /// A commit interrupted right after its write-ahead record (phase Reserving,
-    /// before any step) is re-run and completed by `recover()`.
+    /// A commit spends the payer's posting and credits the payee atomically.
     #[tokio::test]
-    async fn recover_redrives_reserving_saga() {
+    async fn commit_moves_value() {
         let ledger = funded_ledger().await;
-        let envelope = ledger.resolve(&pay_transfer()).await.unwrap();
-        let rid = ReservationId::default();
-        save_pending(&ledger, &envelope, rid, SagaPhase::Reserving).await;
-
-        assert_eq!(ledger.recover().await.unwrap(), 1);
+        ledger.commit(pay_transfer()).await.unwrap();
         assert_eq!(
             ledger
                 .balance(&AccountId::new(2), &AssetId::new(1))
@@ -611,169 +412,18 @@ mod recovery_tests {
                 .unwrap(),
             Cent::from(60)
         );
-        assert!(
-            ledger
-                .store()
-                .list_pending_sagas()
-                .await
-                .unwrap()
-                .is_empty()
-        );
     }
 
-    /// A commit that crashed mid-finalize (phase Finalizing; the consumed posting
-    /// is already spent) is rolled forward by `recover()`.
+    /// Committing into a frozen payer is rejected atomically: nothing moves.
     #[tokio::test]
-    async fn recover_completes_partial_finalize() {
+    async fn commit_into_frozen_account_is_rejected() {
         let ledger = funded_ledger().await;
-        let envelope = ledger.resolve(&pay_transfer()).await.unwrap();
-        let rid = ReservationId::default();
-        // Run the commit halfway: reserve + deactivate the consumed posting.
-        let consumes = envelope.consumes().to_vec();
-        ledger
-            .store()
-            .reserve_postings(&consumes, rid)
-            .await
-            .unwrap();
-        assert_eq!(
-            ledger
-                .store()
-                .deactivate_postings(&consumes, Some(rid))
-                .await
-                .unwrap(),
-            1
-        );
-        save_pending(&ledger, &envelope, rid, SagaPhase::Finalizing).await;
-
-        assert_eq!(ledger.recover().await.unwrap(), 1);
-        assert_eq!(
-            ledger
-                .balance(&AccountId::new(2), &AssetId::new(1))
-                .await
-                .unwrap(),
-            Cent::from(40)
-        );
-        assert_eq!(
-            ledger
-                .balance(&AccountId::new(1), &AssetId::new(1))
-                .await
-                .unwrap(),
-            Cent::from(60)
-        );
-        assert!(
-            ledger
-                .store()
-                .list_pending_sagas()
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    /// A commit that crashed *after* `store_transfer` but *before* the committed
-    /// event was appended (phase Finalizing, transfer row present, event missing)
-    /// is repaired by `recover()`: the full end-state includes the event, so
-    /// recovery appends it (idempotently) instead of treating the transfer row as
-    /// proof of a complete commit.
-    #[tokio::test]
-    async fn recover_appends_missing_committed_event() {
-        let ledger = funded_ledger().await;
-        let envelope = ledger.resolve(&pay_transfer()).await.unwrap();
-        let tid = envelope_id(&envelope);
-        let rid = ReservationId::default();
-
-        // Replay finalize by hand up to and including store_transfer, stopping
-        // short of the event append — exactly the crash window.
-        let consumes = envelope.consumes().to_vec();
-        ledger
-            .store()
-            .reserve_postings(&consumes, rid)
-            .await
-            .unwrap();
-        ledger
-            .store()
-            .deactivate_postings(&consumes, Some(rid))
-            .await
-            .unwrap();
-        let created: Vec<Posting> = envelope
-            .creates()
-            .iter()
-            .enumerate()
-            .map(|(i, np)| {
-                Posting::new(
-                    PostingId {
-                        transfer: tid,
-                        index: i as u16,
-                    },
-                    np.owner,
-                    np.asset,
-                    np.value,
-                )
-            })
-            .collect();
-        ledger.store().insert_postings(&created).await.unwrap();
-        let consumed = ledger.store().get_postings(&consumes).await.unwrap();
-        let mut involved: Vec<AccountId> = created.iter().map(|p| p.owner).collect();
-        involved.extend(consumed.iter().map(|p| p.owner));
-        involved.sort();
-        involved.dedup();
-        ledger
-            .store()
-            .store_transfer(
-                EnvelopeRecord {
-                    envelope: envelope.clone(),
-                    receipt: Receipt { transfer_id: tid },
-                    created_at: 0,
-                },
-                &involved,
-            )
-            .await
-            .unwrap();
-        save_pending(&ledger, &envelope, rid, SagaPhase::Finalizing).await;
-
-        // Precondition: the transfer is stored, but no committed event exists yet.
-        let committed = |evs: &[LedgerEvent]| {
-            evs.iter().any(|e| {
-                matches!(
-                    e.kind,
-                    LedgerEventKind::TransferCommitted { transfer_id } if transfer_id == tid
-                )
-            })
-        };
-        assert!(ledger.store().get_transfer(&tid).await.unwrap().is_some());
-        assert!(!committed(&ledger.get_events_since(0, 1000).await.unwrap()));
-
-        assert_eq!(ledger.recover().await.unwrap(), 1);
-
-        // The missing event is repaired and the pending record cleared.
-        assert!(committed(&ledger.get_events_since(0, 1000).await.unwrap()));
-        assert!(
-            ledger
-                .store()
-                .list_pending_sagas()
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    /// Recovery of a `Reserving` saga re-validates against current state: if an
-    /// account was frozen after the write-ahead record, the commit is abandoned —
-    /// no postings move, the reservation is released, and the record is cleared.
-    #[tokio::test]
-    async fn recover_revalidates_and_aborts_when_account_frozen() {
-        let ledger = funded_ledger().await;
-        let envelope = ledger.resolve(&pay_transfer()).await.unwrap();
-        let tid = envelope_id(&envelope);
-        let rid = ReservationId::default();
-        save_pending(&ledger, &envelope, rid, SagaPhase::Reserving).await;
-
-        // A freeze lands before recovery runs.
         ledger.freeze(&AccountId::new(1)).await.unwrap();
-
-        assert_eq!(ledger.recover().await.unwrap(), 1);
-        // Nothing committed; balances unchanged; reservation released.
-        assert!(ledger.store().get_transfer(&tid).await.unwrap().is_none());
+        let err = ledger.commit(pay_transfer()).await.unwrap_err();
+        assert!(matches!(
+            err,
+            LedgerError::Validation(ValidationError::AccountFrozen(_))
+        ));
         assert_eq!(
             ledger
                 .balance(&AccountId::new(1), &AssetId::new(1))
@@ -781,298 +431,6 @@ mod recovery_tests {
                 .unwrap(),
             Cent::from(100)
         );
-        assert_eq!(
-            ledger
-                .balance(&AccountId::new(2), &AssetId::new(1))
-                .await
-                .unwrap(),
-            Cent::ZERO
-        );
-        let active = ledger
-            .store()
-            .get_postings_by_account(1, None, Some(&AssetId::new(1)), PostingFilter::Active)
-            .await
-            .unwrap();
-        assert_eq!(active.len(), 1); // back to Active
-        assert!(
-            ledger
-                .store()
-                .list_pending_sagas()
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    /// Recovery cannot double-spend: if the consumed posting was taken by another
-    /// transfer while the saga was pending, recovery aborts without creating or
-    /// storing anything.
-    #[tokio::test]
-    async fn recover_does_not_double_spend_a_taken_posting() {
-        let ledger = funded_ledger().await;
-        let envelope = ledger.resolve(&pay_transfer()).await.unwrap();
-        let tid = envelope_id(&envelope);
-        let rid = ReservationId::default();
-        save_pending(&ledger, &envelope, rid, SagaPhase::Reserving).await;
-
-        // Another transfer consumes account 1's posting and commits.
-        let steal = TransferBuilder::new()
-            .pay(
-                AccountId::new(1),
-                AccountId::new(3),
-                AssetId::new(1),
-                Cent::from(50),
-            )
-            .build();
-        ledger.commit(steal).await.unwrap();
-
-        assert_eq!(ledger.recover().await.unwrap(), 1);
-        // Our envelope never committed; only the stealing transfer applied.
-        assert!(ledger.store().get_transfer(&tid).await.unwrap().is_none());
-        assert_eq!(
-            ledger
-                .balance(&AccountId::new(1), &AssetId::new(1))
-                .await
-                .unwrap(),
-            Cent::from(50)
-        );
-        assert_eq!(
-            ledger
-                .balance(&AccountId::new(3), &AssetId::new(1))
-                .await
-                .unwrap(),
-            Cent::from(50)
-        );
-        assert_eq!(
-            ledger
-                .balance(&AccountId::new(2), &AssetId::new(1))
-                .await
-                .unwrap(),
-            Cent::ZERO
-        );
-        assert!(
-            ledger
-                .store()
-                .list_pending_sagas()
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Account-version transition recovery (freeze / unfreeze / close)
-    // -----------------------------------------------------------------------
-
-    /// Persist a transition write-ahead record by hand and return its id, so a
-    /// test can simulate a crash mid-transition.
-    async fn save_transition_record(
-        ledger: &Arc<Ledger>,
-        next: &Account,
-        event: &LedgerEventKind,
-    ) -> Result<i64, LedgerError> {
-        let saga_id = TransitionId::default().0;
-        let blob = serde_json::to_vec(&PendingTransition::new(next.clone(), event.clone()))
-            .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
-        ledger
-            .store()
-            .save_saga(SagaKind::Transition, &saga_id, blob)
-            .await?;
-        Ok(saga_id)
-    }
-
-    fn count_frozen(events: &[LedgerEvent], id: AccountId) -> usize {
-        events
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e.kind,
-                    LedgerEventKind::AccountFrozen { account_id, .. } if account_id == id
-                )
-            })
-            .count()
-    }
-
-    fn count_closed(events: &[LedgerEvent], id: AccountId) -> usize {
-        events
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e.kind,
-                    LedgerEventKind::AccountClosed { account_id, .. } if account_id == id
-                )
-            })
-            .count()
-    }
-
-    /// The happy path leaves nothing to recover: a completed freeze deletes its
-    /// write-ahead record and emits exactly one event.
-    #[tokio::test]
-    async fn freeze_leaves_no_pending_record() -> Result<(), LedgerError> {
-        let ledger = funded_ledger().await;
-        ledger.freeze(&AccountId::new(1)).await?;
-
-        assert!(
-            ledger
-                .store()
-                .get_account(&AccountId::new(1))
-                .await?
-                .is_frozen()
-        );
-        let events = ledger.get_events_since(0, 1000).await?;
-        assert_eq!(count_frozen(&events, AccountId::new(1)), 1);
-        assert!(ledger.store().list_pending_sagas().await?.is_empty());
-        Ok(())
-    }
-
-    /// The reported gap: a freeze crashed after the version append but before the
-    /// event append. Recovery appends the missing event (without bumping the
-    /// version again) and clears the record.
-    #[tokio::test]
-    async fn recover_completes_transition_missing_event() -> Result<(), LedgerError> {
-        let ledger = funded_ledger().await;
-        let current = ledger.store().get_account(&AccountId::new(1)).await?;
-        let mut next = current;
-        next.version += 1;
-        next.flags |= AccountFlags::FROZEN;
-        let event = LedgerEventKind::AccountFrozen {
-            account_id: AccountId::new(1),
-            version: next.version,
-        };
-
-        // Replay the transition up to (but not including) the event append.
-        ledger.store().append_account_version(next.clone()).await?;
-        save_transition_record(&ledger, &next, &event).await?;
-
-        // Precondition: version bumped and frozen, but no event yet.
-        assert_eq!(next.version, 2);
-        assert_eq!(
-            count_frozen(&ledger.get_events_since(0, 1000).await?, AccountId::new(1)),
-            0
-        );
-
-        assert_eq!(ledger.recover().await?, 1);
-
-        // The event is appended, the version is not bumped a second time, and the
-        // record is cleared.
-        let account = ledger.store().get_account(&AccountId::new(1)).await?;
-        assert!(account.is_frozen());
-        assert_eq!(account.version, 2);
-        assert_eq!(
-            count_frozen(&ledger.get_events_since(0, 1000).await?, AccountId::new(1)),
-            1
-        );
-        assert!(ledger.store().list_pending_sagas().await?.is_empty());
-        Ok(())
-    }
-
-    /// A freeze that crashed before either write is rolled fully forward: recovery
-    /// appends the version and the event, then clears the record.
-    #[tokio::test]
-    async fn recover_completes_transition_before_any_write() -> Result<(), LedgerError> {
-        let ledger = funded_ledger().await;
-        let current = ledger.store().get_account(&AccountId::new(1)).await?;
-        let mut next = current;
-        next.version += 1;
-        next.flags |= AccountFlags::FROZEN;
-        let event = LedgerEventKind::AccountFrozen {
-            account_id: AccountId::new(1),
-            version: next.version,
-        };
-        save_transition_record(&ledger, &next, &event).await?;
-
-        // Precondition: nothing applied yet.
-        let before = ledger.store().get_account(&AccountId::new(1)).await?;
-        assert_eq!(before.version, 1);
-        assert!(!before.is_frozen());
-
-        assert_eq!(ledger.recover().await?, 1);
-
-        let account = ledger.store().get_account(&AccountId::new(1)).await?;
-        assert!(account.is_frozen());
-        assert_eq!(account.version, 2);
-        assert_eq!(
-            count_frozen(&ledger.get_events_since(0, 1000).await?, AccountId::new(1)),
-            1
-        );
-        assert!(ledger.store().list_pending_sagas().await?.is_empty());
-        Ok(())
-    }
-
-    /// A transition that fully applied but whose record survived (crash before the
-    /// final delete) recovers idempotently: no second version, no duplicate event.
-    #[tokio::test]
-    async fn recover_transition_is_idempotent_when_already_applied() -> Result<(), LedgerError> {
-        let ledger = funded_ledger().await;
-        // A real, completed freeze: version 2, one event, no record.
-        ledger.freeze(&AccountId::new(1)).await?;
-        let next = ledger.store().get_account(&AccountId::new(1)).await?;
-        let event = LedgerEventKind::AccountFrozen {
-            account_id: AccountId::new(1),
-            version: next.version,
-        };
-        // Simulate the record surviving the crash window before delete_saga.
-        save_transition_record(&ledger, &next, &event).await?;
-
-        assert_eq!(ledger.recover().await?, 1);
-
-        let account = ledger.store().get_account(&AccountId::new(1)).await?;
-        assert_eq!(account.version, 2, "no second version bump");
-        assert_eq!(
-            count_frozen(&ledger.get_events_since(0, 1000).await?, AccountId::new(1)),
-            1,
-            "event not duplicated"
-        );
-        assert!(ledger.store().list_pending_sagas().await?.is_empty());
-        Ok(())
-    }
-
-    /// A close crashed after the version append but before the event append is
-    /// rolled forward: recovery appends the `AccountClosed` event without a second
-    /// version bump and clears the record. Account 2 is empty, so it may close.
-    #[tokio::test]
-    async fn recover_completes_close_missing_event() -> Result<(), LedgerError> {
-        let ledger = funded_ledger().await;
-        let current = ledger.store().get_account(&AccountId::new(2)).await?;
-        let mut next = current;
-        next.version += 1;
-        next.flags |= AccountFlags::CLOSED;
-        let event = LedgerEventKind::AccountClosed {
-            account_id: AccountId::new(2),
-            version: next.version,
-        };
-
-        // Replay the transition up to (but not including) the event append.
-        ledger.store().append_account_version(next.clone()).await?;
-        save_transition_record(&ledger, &next, &event).await?;
-        assert_eq!(
-            count_closed(&ledger.get_events_since(0, 1000).await?, AccountId::new(2)),
-            0
-        );
-
-        assert_eq!(ledger.recover().await?, 1);
-
-        let account = ledger.store().get_account(&AccountId::new(2)).await?;
-        assert!(account.is_closed());
-        assert_eq!(account.version, 2);
-        assert_eq!(
-            count_closed(&ledger.get_events_since(0, 1000).await?, AccountId::new(2)),
-            1
-        );
-        assert!(ledger.store().list_pending_sagas().await?.is_empty());
-        Ok(())
-    }
-
-    /// A rejected close records nothing: the emptiness guard runs before the
-    /// write-ahead, so a non-empty account leaves no pending record to recover.
-    #[tokio::test]
-    async fn rejected_close_leaves_no_pending_record() -> Result<(), LedgerError> {
-        let ledger = funded_ledger().await;
-        // Account 1 holds the funded posting, so it is not empty.
-        let result = ledger.close(&AccountId::new(1)).await;
-        assert!(matches!(result, Err(LedgerError::AccountNotEmpty(_))));
-        assert!(ledger.store().list_pending_sagas().await?.is_empty());
-        Ok(())
     }
 
     /// If the loader under-fetches a balance key validation reads, `plan` fails

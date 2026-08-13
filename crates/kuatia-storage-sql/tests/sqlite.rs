@@ -240,6 +240,7 @@ async fn migration_004_backfills_index_tables() {
         "007_balance_projection",
         "008_live_postings",
         "009_saga_kind",
+        "010_drop_sagas",
     ] {
         sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
             .bind(m)
@@ -331,6 +332,7 @@ async fn migration_005_backfills_account_head() {
         "007_balance_projection",
         "008_live_postings",
         "009_saga_kind",
+        "010_drop_sagas",
     ] {
         sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
             .bind(m)
@@ -402,6 +404,7 @@ async fn migration_008_merges_live_postings() {
         "006_drop_policy",
         "007_balance_projection",
         "009_saga_kind",
+        "010_drop_sagas",
     ] {
         sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
             .bind(m)

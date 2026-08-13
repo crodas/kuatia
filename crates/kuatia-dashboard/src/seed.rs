@@ -38,8 +38,8 @@ pub fn account_label(id: AccountId) -> Option<&'static str> {
     })
 }
 
-/// Connect to the ledger database at `db_url`, create the schema, and run
-/// recovery. The URL scheme selects the backend (e.g. `sqlite::memory:`,
+/// Connect to the ledger database at `db_url` and create the schema. The URL
+/// scheme selects the backend (e.g. `sqlite::memory:`,
 /// `sqlite://kuatia.db`, `postgres://user:pass@host/db`).
 ///
 /// The pool is capped at a single connection: `sqlite::memory:` gives each
@@ -55,7 +55,6 @@ pub async fn connect(db_url: &str) -> Result<Arc<Ledger>, Box<dyn Error>> {
     let store = SqlStore::new(pool);
     store.migrate().await?;
     let ledger = Arc::new(Ledger::new(store));
-    ledger.recover().await?;
     Ok(ledger)
 }
 

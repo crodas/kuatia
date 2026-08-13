@@ -13,7 +13,7 @@ crates/
   kuatia-core/      Pure, sync, no-IO logic: validation, hashing, posting selection
   kuatia-storage/   Store trait (7 sub-traits), InMemoryStore, conformance tests
   kuatia-storage-sql/  SQL backend: SQLite/PostgreSQL via sqlx
-  kuatia/           Async layer: Ledger resource, saga pipeline, intent API
+  kuatia/           Async layer: Ledger resource, atomic commit engine, intent API
 doc/
   architecture.md   Architecture decisions and rationale
   crates.md         Crate reference: modules, types, APIs
@@ -31,17 +31,17 @@ doc/
 - **Envelope**: concrete postings to consume and create — the resolved form of movements.
 - **Conservation**: for each asset, `sum(consumed) == sum(created)`.
 - **Balance constraint**: one per-account flag, `AccountFlags::DEBIT_MUST_NOT_EXCEED_CREDIT`. Default (no flag): overdraft allowed, unbounded, a shortfall becomes a negative offset posting and the transfer records if it conserves value. Flag set: balance may not go negative and the account may not hold a negative posting. Construct with `Account::debit_must_not_exceed_credit(id)`; query with `Account::forbids_overdraft()`. There is no bounded floor and no system/external policy label; a boundary/deposit account is just a default overdraft-permitting account.
-- **Dumb storage**: the `Store` is a thin instruction follower. Write methods apply one update and return the **number of affected rows** (or an I/O error) — they never interpret counts, decide state, enforce idempotency, or compensate. The saga owns all of that. There is no monolithic `commit_transfer`; commit is a sequence of dumb primitives (`reserve_postings`, `deactivate_postings`, `insert_postings`, `store_transfer`, `append_event`), each idempotent. See [doc/adr/0003-dumb-storage-saga-recovery.md](doc/adr/0003-dumb-storage-saga-recovery.md).
+- **Atomic storage commit**: the `Store` applies a whole transfer in one transaction via `CommitStore::commit_envelope` (and a whole account-version transition via `commit_transition`). The pure core validates first; the transaction re-checks the stateful guards inside it — double-spend, freeze/close, and the overdraft floor — so they are strict, not best-effort. `commit(transfer)` = resolve (read-only) then `commit_envelope`; `reverse()` builds a reversal envelope and runs the same path. A crash leaves no half-applied state, so there is no write-ahead log and no recovery. See [doc/adr/0023-atomic-storage-commit.md](doc/adr/0023-atomic-storage-commit.md) (supersedes 0003). Reads and the `insert_postings`/`reserve_postings`/`release_postings`/`deactivate_postings` posting primitives remain as dumb single-update instructions returning affected-row counts.
 
 ## Architecture
 
-- **Pure core / async layer separation**: kuatia-core has zero IO, fully deterministic, testable with golden vectors. kuatia adds async Store trait and saga pipeline.
-- **Saga commit pipeline**: every commit is the **two-step** envelope saga `reserve → finalize` (validation runs inside the finalize step, as the last thing before the writes), with automatic retry and LIFO compensation via the `legend` crate. `commit(transfer)` = resolve (read-only) then `commit_envelope`; `reverse()` builds a reversal envelope and runs the same path. There is one commit path, not a separate "atomic" one.
-- **Count interpretation**: the saga reads each primitive's affected-row count — full = continue; partial = error → compensate; zero = read state and continue only if this same envelope/reservation already applied it (idempotency). `finalize_envelope` additionally verifies every end-state (all consumed postings `Inactive`, created exist, transfer stored).
-- **Durable recovery**: a phase-tracked write-ahead `PendingSaga {envelope, reservation, phase}` is persisted via `SagaStore` before the saga mutates anything (`Reserving`), bumped to `Finalizing` once validation passed and the consumed postings are about to turn `Inactive`. `Ledger::recover()` (call on startup) branches on phase: a `Reserving` saga is **re-run and re-validated** (aborting cleanly if a posting was taken or an account frozen); a `Finalizing` saga is rolled forward through the verified `finalize_envelope`. Roll-forward, not rollback, so there are no orphaned `PendingInactive` postings to reconcile.
+- **Pure core / async layer separation**: kuatia-core has zero IO, fully deterministic, testable with golden vectors. kuatia adds the async Store trait and the commit engine.
+- **Atomic commit path**: `commit(transfer)` = resolve (read-only) → validate in the pure core → `store.commit_envelope(..)`, one transaction that spends the consumed postings, inserts the created ones, stores the transfer, and appends the committed event. `reverse()` builds a reversal envelope and runs the same path. There is one commit path.
+- **In-transaction guards**: the store re-checks double-spend (the delete-affected-count is the atomic single-winner claim), freeze/close (over the involved accounts), and the overdraft floor (summed in Rust from live rows, never in SQL) inside the commit transaction. A domain rejection is a typed `CommitRejection` the ledger maps back to a `LedgerError`.
+- **No recovery**: because a commit is all-or-nothing, a crash leaves no half-applied state. There is no `PendingSaga`, no `SagaStore`, and no `Ledger::recover()`. Multi-transfer composition is a plain LIFO runner (`saga::run_movements`) over `commit`/`reverse`, not a saga VM.
 - **Content-addressed transfers**: EnvelopeId = double-SHA-256 of canonical bytes. Provides idempotency and tamper evidence.
-- **Append-only accounts**: versioned, never modified in place. Snapshot pinning (validate-time) prevents TOCTOU races; under the dumb-storage model the no-overdraft (zero-floor) and freeze/close guards are validate-time and best-effort under concurrency.
-- **Store uses `Arc<dyn Store>`**: Ledger is non-generic, enabling concrete saga types.
+- **Append-only accounts**: versioned, never modified in place. Snapshot pinning (validate-time) prevents TOCTOU races; the no-overdraft (zero-floor) and freeze/close guards are re-checked strictly inside the atomic commit transaction (ADR-0023), not just at validate time.
+- **Store uses `Arc<dyn Store>`**: Ledger is non-generic.
 
 ## Resolve algorithm
 
@@ -69,7 +69,7 @@ Deposit: two movements cancel to zero net debit on the system account — no pos
 ```bash
 cargo test          # runs all tests across all crates
 cargo test -p kuatia-core   # pure core tests only
-cargo test -p kuatia        # integration + saga tests
+cargo test -p kuatia        # integration + commit/concurrency tests
 ```
 
 ## Conventions

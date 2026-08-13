@@ -232,21 +232,16 @@ validation steps are:
 10. Balance-constraint enforcement: for an account that forbids overdraft, the
     projected balance stays `>= 0`
 
-Validation runs inside the finalize step, immediately before it writes (the
-last-step floor / freeze-close re-check). The finalize step then applies the
-effects through a sequence of dumb, idempotent store primitives
-(`deactivate_postings` → `insert_postings` → `store_transfer` → `append_event`),
-verifying every end-state. There is no single transaction; crash-safety comes
-from a phase-tracked write-ahead `PendingSaga` record plus `recover()`
-roll-forward. The zero floor of an account that forbids overdraft is re-checked
-as that last step and is best-effort (not strictly atomic) under concurrency:
-two transfers that each pass the floor check against the same pre-transfer
-balance can both commit and jointly push the account below zero. Per-asset
-conservation still holds in that case (the negative postings are real
-value owed, not minted). That floor is the only guard with this
-property; double-spend prevention is exact (see
-`crates/kuatia/tests/concurrency.rs`, which asserts the exact guarantees
-and documents the floor race with an ignored test). See
+Steps 1-8 run in the pure core before the write. The effects are then applied by
+`store.commit_envelope(..)` in one transaction, which re-checks the stateful
+guards inside it: double-spend (deleting a consumed live posting is the atomic
+single-winner claim), freeze/close, and the zero floor of an account that forbids
+overdraft (steps 9-10, summed in Rust from the post-commit live rows). Because
+the checks and the writes share the transaction, the floor is **strict**, not
+best-effort: two transfers cannot both pass and jointly push an account below
+zero (ADR-0023, superseding the best-effort floor of ADR-0003). A crash leaves no
+half-applied state, so there is no write-ahead record and no recovery. See
+`crates/kuatia/tests/concurrency.rs` for the asserted guarantees and
 [architecture.md](architecture.md).
 
 See [architecture.md](architecture.md) for details on each check.

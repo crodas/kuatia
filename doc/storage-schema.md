@@ -184,8 +184,8 @@ is safe because the copied columns are immutable: `postings` rows never change a
 reserve/release only flip the `reservation` column, so a copy can never drift from
 its value row. And it is bounded and disposable: only the live set is duplicated
 (spent postings live in `postings` alone), and `live_postings` is rebuildable from
-`postings` plus the saga write-ahead records, so a corrupt hot table is a
-drop-and-rebuild, not data loss.
+`postings` and the transfer log, so a corrupt hot table is a drop-and-rebuild,
+not data loss.
 
 ### `postings`
 
@@ -207,9 +207,10 @@ The immutable record. A row here that is absent from `live_postings` is Spent.
 
 The live-set hot copy: the six data columns plus a nullable `reservation`. A
 posting is here while it is spendable or reserved; `reservation IS NULL` = Active,
-a set `reservation` = Reserved by that saga. Reserve/release flip the column
-(`UPDATE`), consume deletes the row (→ Spent). Rebuildable from `postings` + the
-saga records.
+a set `reservation` = Reserved (set only by the generic `reserve_postings`
+primitive, unused by the atomic commit path). An atomic commit deletes the
+consumed row directly (→ Spent). Rebuildable from `postings` and the transfer
+log.
 
 | Column | Type | Key | Purpose |
 |---|---|---|---|
@@ -258,17 +259,10 @@ does no computation.
 
 ## Ledger plumbing
 
-### `sagas`
-
-Write-ahead saga records for crash recovery. Owned by `saga.rs` (`SagaStore`).
-See [ADR-0002 (saga commit pipeline)](adr/0002-saga-commit-pipeline.md).
-
-| Column | Type | Key | Purpose |
-|---|---|---|---|
-| `id` | `BIGINT` | PK | Saga id (the reservation id). |
-| `data` | `TEXT` | | The encoded `PendingSaga` record (hex). |
-
-- **Primary key**: `id`.
+The `sagas` write-ahead table was dropped in migration `010_drop_sagas`: a
+commit and an account transition are now single atomic store transactions
+(ADR-0023, superseding ADR-0003), so there is no half-applied state for a
+write-ahead record to recover.
 
 ### `events`
 

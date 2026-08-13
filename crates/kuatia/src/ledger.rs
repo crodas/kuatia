@@ -4,8 +4,8 @@
 //! sibling modules by concern, so the deep commit engine is not buried among
 //! shallow query re-exports:
 //!
-//! - `commit`: the write-ahead saga/commit engine (resolve, commit, reverse,
-//!   recover, finalize). This is what a ledger fundamentally *is*.
+//! - `commit`: the commit engine (resolve, validate, atomic apply, reverse).
+//!   This is what a ledger fundamentally *is*.
 //! - `lifecycle`: account create, freeze, unfreeze, close.
 //! - `balance`: per-subaccount balance queries.
 //! - `query`: read-only queries and book CRUD (thin `Store` pass-throughs that
@@ -22,7 +22,6 @@ use crate::error::LedgerError;
 mod balance;
 mod commit;
 mod lifecycle;
-mod pending;
 mod query;
 mod transition;
 

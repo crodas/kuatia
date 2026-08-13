@@ -29,7 +29,7 @@ dependencies (`sha2`, `serde`, `bitflags`).
 | `PostingFilter` | Read filter over derived posting state: `Active`, `Reserved`, `Live` (Active ∪ Reserved), `All` |
 | `Amount` | Parser/formatter for decimal strings. Not stored; use at API boundaries only |
 | `Posting` | Immutable signed amount of one asset owned by one account. Carries no lifecycle field; its state is derived from index-table membership (see `PostingState`) |
-| `ReservationId` | Owner token recorded in the reserved index so only the reserving saga may finalize/release a posting |
+| `ReservationId` | Owner token recorded in the reserved index by the `reserve_postings`/`release_postings` primitives (unused by the atomic commit path) |
 | `NewPosting` | Posting to be created (no id yet, assigned during validation) |
 | `Transfer` | Atomic unit: consumes postings + creates postings + metadata |
 | `EnvelopeBuilder` | Fluent builder for `Transfer` construction |
@@ -84,54 +84,44 @@ Output is a `Plan` containing `transfer_id`, `postings_to_deactivate`, and
 ## kuatia
 
 Async resource layer. Depends on `kuatia-core`, `tokio`, `async-trait`,
-`serde`, `legend`.
+`serde`.
 
 ### Modules
 
 | Module | Purpose |
 |--------|---------|
-| `kuatia` | `Ledger`: primary API (non-generic, uses `Arc<dyn Store>`), saga commit pipeline, intent layer |
-| `store` | `Store` composite trait + sub-traits (`AccountStore`, `PostingStore`, `TransferStore`, `SagaStore`, `EventStore`, `BookStore`) |
+| `kuatia` | `Ledger`: primary API (non-generic, uses `Arc<dyn Store>`), atomic commit engine, intent layer |
+| `store` | `Store` composite trait + sub-traits (`AccountStore`, `PostingStore`, `TransferStore`, `CommitStore`, `EventStore`, `BookStore`) |
 | `error` | `StoreError`, `LedgerError`: unified error hierarchy |
 | `mem_store` | `InMemoryStore`: in-memory `Store` implementation for tests |
-| `saga` | Pipeline steps (reserve, validate, finalize) + high-level legend step adapters |
+| `saga` | `run_movements`: multi-transfer LIFO composition over `commit`/`reverse` |
 
 ### Ledger API
 
-#### Commit (the envelope saga)
+#### Commit (atomic)
 
-`commit(transfer)` resolves the intent into an envelope (read-only) then runs
-the `EnvelopeSaga` (defined via `legend!`): two steps with automatic retry and
-LIFO compensation. The finalize step re-validates as its last action before the
-writes, then calls the dumb primitives, interpreting/verifying each count:
+`commit(transfer)` resolves the intent into an envelope (read-only), validates it
+in the pure core, then applies the effects through `store.commit_envelope(..)` in
+one transaction. The store re-checks the stateful guards inside it:
 
 ```mermaid
 graph LR
-    A[resolve] -->|Envelope| W[save PendingSaga: Reserving]
-    W --> B[reserve_postings]
-    B -->|active index → reserved index| F[finalize]
-    F --> V[validate_and_plan re-check]
-    V --> M[mark Finalizing]
-    M --> D[deactivate → insert → store_transfer → append_event]
-    D --> E[Receipt + delete PendingSaga]
+    A[resolve] -->|Envelope| V[load + validate_and_plan]
+    V --> C["store.commit_envelope(..)"]
+    C -->|"one tx: idempotency + double-spend + freeze/close + floor, then apply"| E[Receipt]
     style E fill:#e8f5e9
 ```
 
-Note: `commit`/`commit_envelope`/`reverse`/`recover` require `Arc<Ledger>`.
-
-#### Crash recovery
-
-`recover()` re-completes any `PendingSaga` left by a crash, pushing the
-envelope through the idempotent primitives (roll-forward). Call it on startup.
+Note: `commit`/`commit_envelope`/`reverse` require `Arc<Ledger>`. A crash leaves
+no half-applied state, so there is no recovery step.
 
 #### Convenience
 
 | Method | Description |
 |--------|-------------|
 | `commit(transfer)` | Resolve intent → `commit_envelope` (requires `Arc<Ledger>`) |
-| `commit_envelope(envelope)` | The one commit path: write-ahead → reserve → finalize (finalize re-validates, then writes); for pre-built/FX envelopes |
+| `commit_envelope(envelope)` | The one commit path: validate → atomic `store.commit_envelope`; for pre-built/FX envelopes |
 | `reverse(transfer_id)` | Builds a compensating envelope and runs `commit_envelope` |
-| `recover()` | Force-completes pending sagas after a crash (call on startup) |
 
 #### Intent Layer
 
@@ -170,16 +160,17 @@ Transfers are built via `TransferBuilder` and committed with
 
 ### Store Trait
 
-The `Store` trait is a composite of focused sub-traits. Every write method is a
-dumb instruction returning the number of affected rows (`u64`); the saga
-interprets the count.
+The `Store` trait is a composite of focused sub-traits. A transfer commits
+atomically through `CommitStore`; the remaining posting/account write methods are
+dumb instructions returning the number of affected rows (`u64`), used by reads
+and setup.
 
 ```mermaid
 graph TB
     Store --> AccountStore
     Store --> PostingStore
     Store --> TransferStore
-    Store --> SagaStore
+    Store --> CommitStore
     Store --> EventStore
     Store --> BookStore
 ```
@@ -195,20 +186,22 @@ graph TB
 - **`TransferStore`**: `get_transfer`,
   `store_transfer(record, involved) -> u64`, `get_transfers_for_account`,
   `query_transfers`
+- **`CommitStore`**: `commit_envelope(request) -> CommitOutcome`,
+  `commit_transition(next, event) -> TransitionOutcome`: the atomic write
+  boundary (ADR-0023)
 - **`EventStore`**: `append_event` (idempotent on a dedup key: a transfer's id,
   or a lifecycle transition's `(account, version)`), `get_events_since`
-- **`SagaStore`**: `save_saga`, `list_pending_sagas`, `delete_saga`: the
-  write-ahead store the saga and `recover()` use
 - **`BookStore`**: `create_book`, `get_book`, `list_books`
 
-There is no `CommitStore`/`commit_transfer`: a commit is the saga calling these
-primitives in sequence, each idempotent, with crash-safety from write-ahead
-recovery rather than a single transaction.
+A commit is one `commit_envelope` transaction, not a sequence of primitives, so
+crash-safety comes from the transaction rather than write-ahead recovery. The
+`reserve_postings`/`release_postings`/`deactivate_postings` primitives remain as
+generic dumb operations, unused by the commit path.
 
 #### Batch posting operations
 
 `reserve_postings`/`release_postings`/`deactivate_postings` apply each id's
-conditional update and return how many rows changed (the saga decides what a
+conditional update and return how many rows changed (the caller decides what a
 short count means):
 
 State is derived from which index a posting is in: active index → `Active`,
@@ -238,7 +231,7 @@ applicable). The saga interprets a 0:
 There is no all-or-nothing batch rejection: a posting whose condition does not
 hold is skipped (counted as 0, not an error), so a call can apply to some ids
 and not others. Each id's update is atomic on its own row; the batch as a whole
-is not. The saga reads the count and decides what to do.
+is not. The caller reads the count and decides what to do.
 
 Balance computation lives in the Ledger (`compute_balance`), not the Store.
 
@@ -251,12 +244,13 @@ LedgerError
 ├── Selection(SelectionError)     // insufficient funds (includes Overflow)
 ├── TransferNotFound
 ├── PostingNotReversible
+├── DoubleSpend                  // a consumed posting was not live at commit time
 ├── AccountNotFound
 ├── AccountNotEmpty              // can't close with active postings
 ├── AccountAlreadyClosed
 ├── BookNotFound                 // transfer named a book that does not exist
 ├── Overflow                     // monetary arithmetic overflow
-└── CompensationFailed           // saga compensation failed (original + compensation errors)
+└── CompensationFailed           // multi-transfer reversal failed (original + compensation errors)
 ```
 
 ```
@@ -267,46 +261,28 @@ StoreError
 └── Internal(String)
 ```
 
-The store has no semantic write-outcome errors (no "posting not active",
-"reservation mismatch", "cas conflict"). Writes return affected-row counts and
-the saga derives meaning from them.
+`StoreError` is IO-only (`NotFound`, `Internal`). The atomic `commit_envelope`
+reports a domain refusal as an `Ok(CommitOutcome::Rejected(CommitRejection))`
+value (double-spend, frozen, closed, overdraft) that the ledger maps to a
+`LedgerError`; the dumb posting primitives return affected-row counts and the
+caller derives meaning from them.
 
-### Saga Steps
+### Multi-Transfer Composition
 
-#### Envelope pipeline steps (used internally by `commit_envelope`; resolution runs before the saga)
-
-| Step | Execute | Compensate | Retry |
-|------|---------|------------|-------|
-| `ReservePostingsStep` | `reserve_postings`: active index → reserved index, interpret count | Release back to `Active` | 3 |
-| `FinalizeTransferStep` | `Ledger::finalize_envelope`: re-validate (last-step floor/freeze guard) → mark `Finalizing` → `deactivate` → `insert` → `store_transfer` → `append_event`, verifying every end-state | `reverse(transfer_id)` | 3 |
-
-Validation lives inside the finalize step so it runs immediately before the
-writes. Recovery (`recover()`) re-uses `finalize_envelope` for `Finalizing`
-sagas and re-runs the whole saga for `Reserving` ones.
-
-#### High-level steps (for custom saga composition with `legend!`)
-
-| Step | Execute | Compensate |
-|------|---------|------------|
-| `PayMovementStep` | Build pay transfer, `ledger.commit(...)` | `ledger.reverse(receipt.transfer_id)` |
-| `DepositMovementStep` | Build deposit transfer, `ledger.commit(...)` | `ledger.reverse(receipt.transfer_id)` |
-
-#### Custom orchestration
-
-Compose steps into sagas using `legend!`. The saga executor drives steps in
-order with automatic retry and LIFO compensation. `LedgerCtx` is serializable
-for crash recovery:
+`saga::run_movements(ledger, movements)` commits a list of `Movement`s
+(`Pay`/`Deposit`) in order and, on the first failure, reverses the
+already-committed receipts LIFO via `ledger.reverse(..)`. Each single commit is
+already atomic in the store, so this is a plain runner, not a saga VM.
 
 ```rust
-legend! {
-    MyFlow<LedgerCtx, SagaError> {
-        deposit: DepositMovementStep,
-        pay: PayMovementStep,
-    }
-}
-let ctx = LedgerCtx::new(ledger_arc.clone());
-let result = MyFlow::new(inputs).build(ctx).start().await;
+use kuatia::saga::{DepositInput, Movement, PayInput, run_movements};
+
+let receipts = run_movements(&ledger, &[
+    Movement::Deposit(DepositInput { to: alice, asset: usd, amount, external: bank }),
+    Movement::Pay(PayInput { from: alice, to: bob, asset: usd, amount }),
+])
+.await?;
 ```
 
-`LedgerCtx` is concrete (not generic) because `Ledger` uses `Arc<dyn Store>`
-internally.
+If a movement fails, the committed ones are reversed and the original error is
+returned; a failing reversal surfaces as `LedgerError::CompensationFailed`.

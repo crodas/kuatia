@@ -23,7 +23,6 @@ i128 = ["kuatia-types/i128", "kuatia-core/i128", "kuatia-storage/i128"]
 kuatia-types.workspace = true
 kuatia-core.workspace = true
 kuatia-storage.workspace = true
-legend.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -7,7 +7,7 @@
 //! - [`AccountStore`] — account CRUD and versioning
 //! - [`PostingStore`] — posting reads and lifecycle transitions
 //! - [`TransferStore`] — transfer persistence and queries
-//! - [`SagaStore`] — saga state for crash recovery
+//! - [`CommitStore`] — the atomic commit boundary (ADR-0023)
 //! - [`EventStore`] — the ledger event log
 //! - [`BookStore`] — book persistence
 //! - [`BalanceProjectionStore`] — the cached balance projection (ADR-0019)
@@ -19,7 +19,7 @@ use kuatia_types::{
 };
 
 use crate::error::StoreError;
-use crate::events::EventStore;
+use crate::events::{EventStore, LedgerEvent};
 
 /// Pairs a committed transfer with its receipt.
 #[derive(Debug, Clone)]
@@ -236,57 +236,6 @@ pub trait TransferStore: Send + Sync {
     ) -> Result<Page<EnvelopeRecord>, StoreError>;
 }
 
-/// Which kind of write-ahead record a saga row holds. A typed discriminator on
-/// the shared saga keyspace: the store stores and returns it so recovery can
-/// dispatch by type rather than by decoding the opaque blob to read an in-band
-/// tag. Persisted as its [`as_str`](SagaKind::as_str) TEXT form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SagaKind {
-    /// A two-step envelope commit saga (reserve → finalize).
-    Envelope,
-    /// A single account-version transition (append version + lifecycle event).
-    Transition,
-}
-
-impl SagaKind {
-    /// The stored TEXT form of this kind.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Envelope => "envelope",
-            Self::Transition => "transition",
-        }
-    }
-
-    /// Parse the stored TEXT form back into a kind.
-    pub fn parse(s: &str) -> Result<Self, StoreError> {
-        match s {
-            "envelope" => Ok(Self::Envelope),
-            "transition" => Ok(Self::Transition),
-            other => Err(StoreError::Internal(format!("unknown saga kind: {other}"))),
-        }
-    }
-}
-
-/// Saga state persistence for crash recovery.
-///
-/// One flat `id → (kind, bytes)` keyspace holds both write-ahead kinds. `id` is
-/// globally unique (all ids come from one generator), so `get`/`delete` locate a
-/// row by `id` alone; `kind` is carried so `list_pending_sagas` can hand recovery
-/// a typed discriminator instead of an in-band blob tag.
-#[async_trait]
-pub trait SagaStore: Send + Sync {
-    /// Persist a saga execution state under `id`, tagged with its [`SagaKind`].
-    async fn save_saga(&self, kind: SagaKind, id: &i64, data: Vec<u8>) -> Result<(), StoreError>;
-    /// Load all pending (incomplete) saga states with their kind.
-    async fn list_pending_sagas(&self) -> Result<Vec<(SagaKind, i64, Vec<u8>)>, StoreError>;
-    /// Load one saga state by id, or `None` if no record is stored under `id`.
-    /// A keyed read so a caller checking a single in-flight saga does not scan
-    /// every pending record.
-    async fn get_saga(&self, id: &i64) -> Result<Option<Vec<u8>>, StoreError>;
-    /// Delete a completed saga state.
-    async fn delete_saga(&self, id: &i64) -> Result<(), StoreError>;
-}
-
 /// Book persistence.
 #[async_trait]
 pub trait BookStore: Send + Sync {
@@ -353,6 +302,118 @@ pub trait BalanceProjectionStore: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// Atomic commit
+// ---------------------------------------------------------------------------
+
+/// Everything one transfer commits, applied in a single store transaction.
+///
+/// The pure core validates the transfer first; this request carries the
+/// validated effects. The store applies them atomically and re-enforces the
+/// three *stateful* guards inside the transaction (double-spend, freeze/close,
+/// overdraft floor), so a concurrent commit or freeze cannot slip between the
+/// check and the write.
+pub struct CommitRequest<'a> {
+    /// Content-addressed id of the transfer being committed.
+    pub transfer_id: EnvelopeId,
+    /// Postings to spend (delete from the live set). Empty for a deposit.
+    pub consume: &'a [PostingId],
+    /// New postings to insert and activate.
+    pub create: &'a [Posting],
+    /// The transfer record to persist (envelope + receipt + created_at).
+    pub record: EnvelopeRecord,
+    /// Owners of the created and consumed postings: both the transfer's account
+    /// index and the set whose freeze/close/floor the store re-checks.
+    pub involved: &'a [AccountId],
+    /// The `TransferCommitted` event to append in the same transaction.
+    pub event: LedgerEvent,
+}
+
+/// Outcome of an atomic [`CommitStore::commit_envelope`]. A domain rejection is
+/// an `Ok(Rejected(..))` value, not a [`StoreError`]: the store reports a typed
+/// reason and the ledger maps it, keeping `StoreError` IO-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// The transfer was newly applied in this call.
+    Committed(Receipt),
+    /// The transfer id was already present; nothing changed (idempotent replay).
+    AlreadyCommitted(Receipt),
+    /// A stateful guard rejected the commit; nothing was applied.
+    Rejected(CommitRejection),
+}
+
+/// Why an atomic commit was refused. Each maps to a typed ledger error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitRejection {
+    /// A consumed posting was not live (already spent, missing, or taken by a
+    /// concurrent commit). Carries the first offending id.
+    DoubleSpend(PostingId),
+    /// An involved account is frozen.
+    AccountFrozen(AccountId),
+    /// An involved account is closed.
+    AccountClosed(AccountId),
+    /// The projected balance of an overdraft-forbidding account would go
+    /// negative.
+    OverdraftExceeded {
+        /// The account that would be overdrawn.
+        account: AccountId,
+        /// The asset involved.
+        asset: AssetId,
+        /// The negative balance that would result.
+        projected: Cent,
+    },
+}
+
+/// Outcome of an atomic [`CommitStore::commit_transition`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransitionOutcome {
+    /// The version was appended and its event recorded.
+    Applied,
+    /// The version was already present; the event was ensured (idempotent).
+    AlreadyApplied,
+    /// The transition was refused; nothing was applied.
+    Rejected(TransitionRejection),
+}
+
+/// Why an atomic transition was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransitionRejection {
+    /// The account is already closed.
+    AlreadyClosed(AccountId),
+    /// The head was not at `expected - 1` (a concurrent transition moved it).
+    VersionConflict {
+        /// The account whose version append was rejected.
+        account: AccountId,
+        /// The version this attempt targeted.
+        expected: u64,
+    },
+}
+
+/// The atomic write boundary: a whole transfer, or a whole account-version
+/// transition, applied in one store transaction.
+///
+/// This is what replaces the multi-primitive reserve → finalize saga and its
+/// write-ahead recovery: because each method is all-or-nothing, a crash leaves
+/// no half-applied state to reconcile, and the stateful guards are strict rather
+/// than best-effort (ADR-0023, superseding ADR-0003).
+#[async_trait]
+pub trait CommitStore: Send + Sync {
+    /// Commit a validated transfer atomically. Spends `consume`, inserts and
+    /// activates `create`, stores the transfer indexed under `involved`, and
+    /// appends `event` — all in one transaction, re-checking double-spend,
+    /// freeze/close, and the overdraft floor inside it.
+    async fn commit_envelope(&self, req: CommitRequest<'_>) -> Result<CommitOutcome, StoreError>;
+
+    /// Apply one account-version transition atomically: append `next` (a version
+    /// bump with flags flipped) and its lifecycle `event` in one transaction,
+    /// guarding the version chain and a closed account.
+    async fn commit_transition(
+        &self,
+        next: Account,
+        event: LedgerEvent,
+    ) -> Result<TransitionOutcome, StoreError>;
+}
+
+// ---------------------------------------------------------------------------
 // Composite trait
 // ---------------------------------------------------------------------------
 
@@ -361,7 +422,7 @@ pub trait Store:
     AccountStore
     + PostingStore
     + TransferStore
-    + SagaStore
+    + CommitStore
     + EventStore
     + BookStore
     + BalanceProjectionStore
@@ -372,7 +433,7 @@ impl<
     T: AccountStore
         + PostingStore
         + TransferStore
-        + SagaStore
+        + CommitStore
         + EventStore
         + BookStore
         + BalanceProjectionStore,

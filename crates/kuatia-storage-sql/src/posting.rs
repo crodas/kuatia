@@ -40,7 +40,7 @@ fn filter_source(filter: PostingFilter) -> (&'static str, &'static str) {
 /// parameters would hit. `500` stays comfortably under the expression-depth
 /// limit; callers that pass more ids are chunked, so the id-batch primitives
 /// have no practical ceiling on batch size.
-const MAX_IDS_PER_QUERY: usize = 500;
+pub(crate) const MAX_IDS_PER_QUERY: usize = 500;
 
 /// Build a portable predicate matching a set of posting ids:
 /// `(transfer_id = $s AND idx = $s+1) OR (transfer_id = $s+2 AND idx = $s+3) ...`
@@ -49,7 +49,7 @@ const MAX_IDS_PER_QUERY: usize = 500;
 /// caller binds each id as `(hex(transfer), idx as i16)` in order, matching the
 /// placeholder sequence. `ids` must be non-empty and no longer than
 /// [`MAX_IDS_PER_QUERY`]; larger sets are split into chunks by the caller.
-fn id_predicate(count: usize, start: u32) -> String {
+pub(crate) fn id_predicate(count: usize, start: u32) -> String {
     (0..count)
         .map(|i| {
             let p = start + (i as u32) * 2;

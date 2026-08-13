@@ -2,9 +2,9 @@
 //!
 //! The generated conformance suite drives the store through a single `&store`,
 //! so it never exercises two callers racing on the same rows. `reserve_postings`
-//! is the primitive the saga relies on to make double-spends impossible: it must
-//! move each active posting into the reserved index for exactly one caller, even
-//! when many callers target the same postings at once.
+//! is a single-winner claim primitive: it must move each active posting into the
+//! reserved index for exactly one caller, even when many callers target the same
+//! postings at once.
 
 #![allow(missing_docs)]
 

@@ -52,6 +52,10 @@ impl SqlStore {
                 "009_saga_kind",
                 include_str!("migrations/009_saga_kind.sql"),
             ),
+            (
+                "010_drop_sagas",
+                include_str!("migrations/010_drop_sagas.sql"),
+            ),
         ];
 
         for (name, sql) in migrations {

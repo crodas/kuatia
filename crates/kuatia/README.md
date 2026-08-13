@@ -2,8 +2,9 @@
 
 Async ledger resource — the main entry point for callers.
 
-Composes `kuatia-core` (validation) and `kuatia-storage` (persistence) into
-a saga-driven commit pipeline with automatic retry and compensation.
+Composes `kuatia-core` (validation) and `kuatia-storage` (persistence) into an
+atomic commit engine: resolve, validate, then apply the whole transfer in one
+store transaction.
 
 ## API layers
 
@@ -27,29 +28,21 @@ let receipt = ledger.commit(transfer).await?;
 
 ### Commit
 
-Every commit is the **envelope saga** — two steps driven by `legend` with
-automatic retry and LIFO compensation:
+Every commit is **atomic** — one store transaction:
 
 - `commit(transfer)` — resolves the intent into a concrete envelope (read-only),
   then runs `commit_envelope`.
-- `commit_envelope(envelope)` — the one commit path. Persists a write-ahead
-  `PendingSaga` record (phase `Reserving`), then:
-  1. **Reserve** — `reserve_postings`: Active → PendingInactive, stamped with this saga's `ReservationId`
-  2. **Finalize** — re-validates against current state (the last-step floor / freeze-close guard), marks the saga `Finalizing`, then runs the dumb primitives `deactivate_postings` → `insert_postings` → `store_transfer` → `append_event`, verifying every end-state
+- `commit_envelope(envelope)` — the one commit path. Validates against loaded
+  state in the pure core, then calls `store.commit_envelope(..)`, which in one
+  transaction spends the consumed postings, inserts the created ones, stores the
+  transfer, and appends the committed event — re-checking double-spend,
+  freeze/close, and the overdraft floor inside it.
 - `reverse(id)` — builds a reversal envelope and runs the same path.
 
-The store reports an **affected-row count** for each primitive; the saga
-interprets it (full = continue, partial = error → compensate, zero = read state
-and continue only if this same envelope already applied it). There is no
-monolithic `commit_transfer` and no separate "atomic" path.
-
-### Crash recovery
-
-`recover()` — call on startup. It completes any `PendingSaga` left by a crash,
-branching on the persisted phase: a `Reserving` saga is re-run (re-validating,
-aborting cleanly if a posting was taken or an account frozen); a `Finalizing`
-saga is rolled forward through the verified `finalize_envelope`. Roll-forward,
-not rollback.
+A domain refusal (double-spend, frozen, closed, overdraft) comes back as a typed
+`LedgerError`, and nothing is applied. Because the write is all-or-nothing, a
+crash leaves no half-applied state — there is no write-ahead log and no recovery
+step.
 
 ### Account lifecycle
 
@@ -70,17 +63,19 @@ not rollback.
 | `postings(account)` | All postings (any status) |
 | `get_events_since(seq, limit)` | Query ledger event log |
 
-### Saga composition
+### Multi-transfer composition
 
-Combine steps into multi-transfer workflows using the `legend!` macro:
+Combine transfers into an all-or-nothing workflow with `run_movements`, which
+commits them in order and reverses the committed ones LIFO on failure:
 
 ```rust
-legend! {
-    FundAndPay<LedgerCtx, SagaError> {
-        deposit: DepositMovementStep,
-        pay: PayMovementStep,
-    }
-}
+use kuatia::saga::{DepositInput, Movement, PayInput, run_movements};
+
+let receipts = run_movements(&ledger, &[
+    Movement::Deposit(DepositInput { to: alice, asset: usd, amount, external: bank }),
+    Movement::Pay(PayInput { from: alice, to: bob, asset: usd, amount }),
+])
+.await?;
 ```
 
 ## Examples

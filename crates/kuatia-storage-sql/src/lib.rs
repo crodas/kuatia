@@ -11,8 +11,8 @@
 //! ```
 //!
 //! The [`Store`](kuatia_storage::store::Store) sub-traits are each implemented in
-//! their own module (`account`, `posting`, `transfer`, `saga`, `event`, `book`,
-//! `projection`); shared row mappers and codecs live in `row`, the schema
+//! their own module (`account`, `posting`, `transfer`, `commit`, `event`,
+//! `book`, `projection`); shared row mappers and codecs live in `row`, the schema
 //! migrations in `migrate`, and the one SQLite/PostgreSQL divergence behind the
 //! `Dialect` seam in `dialect`.
 
@@ -24,13 +24,13 @@ use crate::dialect::Dialect;
 
 mod account;
 mod book;
+mod commit;
 mod dialect;
 mod event;
 mod migrate;
 mod posting;
 mod projection;
 mod row;
-mod saga;
 mod transfer;
 
 /// SQL-backed [`Store`](kuatia_storage::store::Store) implementation.

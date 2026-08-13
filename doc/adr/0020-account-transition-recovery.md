@@ -1,6 +1,6 @@
 # Crash-safe account-version transitions
 
-* Status: accepted
+* Status: superseded by ADR-0023
 * Authors: Cesar Rodas
 * Date: 2026-07-18
 * Targeted modules: `kuatia` (`ledger`), `kuatia-storage`, `kuatia-storage-sql`

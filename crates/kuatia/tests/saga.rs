@@ -1,14 +1,13 @@
 #![allow(missing_docs)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kuatia::error::LedgerError;
 use kuatia::ledger::Ledger;
 use kuatia::mem_store::InMemoryStore;
-use kuatia::saga::*;
+use kuatia::saga::{DepositInput, Movement, PayInput, run_movements};
 use kuatia_core::*;
-use legend::{ExecutionResult, legend};
-use std::collections::BTreeMap;
 
 fn usd() -> AssetId {
     AssetId::new(1)
@@ -52,42 +51,39 @@ async fn setup_ledger() -> Arc<Ledger> {
     ledger
 }
 
-// Define a two-step saga: deposit then pay
-legend! {
-    FundAndPay<LedgerCtx, LedgerError> {
-        deposit: DepositMovementStep,
-        pay: PayMovementStep,
-    }
+fn deposit(to: AccountId, amount: Cent) -> Movement {
+    Movement::Deposit(DepositInput {
+        to,
+        asset: usd(),
+        amount,
+        external: external(),
+    })
 }
 
+fn pay(from: AccountId, to: AccountId, amount: Cent) -> Movement {
+    Movement::Pay(PayInput {
+        from,
+        to,
+        asset: usd(),
+        amount,
+    })
+}
+
+/// A two-movement workflow (deposit then pay) commits both legs in order.
 #[tokio::test]
-async fn saga_happy_path() {
+async fn workflow_happy_path() {
     let ledger = setup_ledger().await;
 
-    let saga = FundAndPay::new(FundAndPayInputs {
-        deposit: DepositInput {
-            to: account(1),
-            asset: usd(),
-            amount: Cent::from(100),
-            external: external(),
-        },
-        pay: PayInput {
-            from: account(1),
-            to: account(2),
-            asset: usd(),
-            amount: Cent::from(60),
-        },
-    });
-
-    let ctx = LedgerCtx::new(ledger.clone());
-    let execution = saga.build(ctx);
-
-    match execution.start().await {
-        ExecutionResult::Completed(e) => {
-            assert_eq!(e.context().receipts.len(), 2);
-        }
-        other => panic!("expected Completed, got {:?}", result_debug(&other)),
-    }
+    let receipts = run_movements(
+        &ledger,
+        &[
+            deposit(account(1), Cent::from(100)),
+            pay(account(1), account(2), Cent::from(60)),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipts.len(), 2);
 
     assert_eq!(
         ledger.balance(&account(1), &usd()).await.unwrap(),
@@ -103,105 +99,56 @@ async fn saga_happy_path() {
     );
 }
 
-// Define a saga that will fail on the second step and trigger compensation
-legend! {
-    DepositAndOverspend<LedgerCtx, LedgerError> {
-        deposit: DepositMovementStep,
-        pay: PayMovementStep,
-    }
-}
-
+/// The second movement overspends and fails; the first (deposit) is reversed
+/// LIFO, so the net effect is zero. The typed `InsufficientFunds` reaches the
+/// caller.
 #[tokio::test]
-async fn saga_compensation_on_failure() {
+async fn workflow_compensation_on_failure() {
     let ledger = setup_ledger().await;
 
-    // Deposit 50 then try to pay 100 -> pay fails -> deposit should be reversed
-    let saga = DepositAndOverspend::new(DepositAndOverspendInputs {
-        deposit: DepositInput {
-            to: account(1),
-            asset: usd(),
-            amount: Cent::from(50),
-            external: external(),
-        },
-        pay: PayInput {
-            from: account(1),
-            to: account(2),
-            asset: usd(),
-            amount: Cent::from(100), // more than available
-        },
-    });
+    // Deposit 50, then try to pay 100 (more than available) -> pay fails ->
+    // deposit is reversed.
+    let err = run_movements(
+        &ledger,
+        &[
+            deposit(account(1), Cent::from(50)),
+            pay(account(1), account(2), Cent::from(100)),
+        ],
+    )
+    .await
+    .unwrap_err();
 
-    let ctx = LedgerCtx::new(ledger.clone());
-    let execution = saga.build(ctx);
-
-    match execution.start().await {
-        ExecutionResult::Failed(_, err) => {
-            // The saga carries the typed `LedgerError` across its step seam, so
-            // the overspend surfaces as `Selection(InsufficientFunds)` rather
-            // than a stringified `Store(Internal)`.
-            assert!(
-                matches!(err, LedgerError::Selection(InsufficientFunds { .. })),
-                "expected typed InsufficientFunds, got {err:?}"
-            );
-            // The deposit should have been compensated (reversed)
-            // Note: balances won't be exactly 0 because the deposit reversal
-            // creates new postings, but the net effect should be zero
-            assert_eq!(
-                ledger.balance(&account(1), &usd()).await.unwrap(),
-                Cent::ZERO
-            );
-            assert_eq!(
-                ledger.balance(&external(), &usd()).await.unwrap(),
-                Cent::ZERO
-            );
-        }
-        other => panic!("expected Failed, got {:?}", result_debug(&other)),
-    }
+    assert!(
+        matches!(err, LedgerError::Selection(InsufficientFunds { .. })),
+        "expected typed InsufficientFunds, got {err:?}"
+    );
+    // The deposit was compensated (reversed); the net effect is zero.
+    assert_eq!(
+        ledger.balance(&account(1), &usd()).await.unwrap(),
+        Cent::ZERO
+    );
+    assert_eq!(
+        ledger.balance(&external(), &usd()).await.unwrap(),
+        Cent::ZERO
+    );
 }
 
-// Three-step saga
-legend! {
-    ThreeStepFlow<LedgerCtx, LedgerError> {
-        deposit: DepositMovementStep,
-        pay_ab: PayMovementStep,
-        pay_bc: PayMovementStep,
-    }
-}
-
+/// A three-movement workflow commits all legs and settles the chain.
 #[tokio::test]
-async fn saga_three_steps_happy() {
+async fn workflow_three_steps_happy() {
     let ledger = setup_ledger().await;
 
-    let saga = ThreeStepFlow::new(ThreeStepFlowInputs {
-        deposit: DepositInput {
-            to: account(1),
-            asset: usd(),
-            amount: Cent::from(100),
-            external: external(),
-        },
-        pay_ab: PayInput {
-            from: account(1),
-            to: account(2),
-            asset: usd(),
-            amount: Cent::from(60),
-        },
-        pay_bc: PayInput {
-            from: account(2),
-            to: account(3),
-            asset: usd(),
-            amount: Cent::from(30),
-        },
-    });
-
-    let ctx = LedgerCtx::new(ledger.clone());
-    let execution = saga.build(ctx);
-
-    match execution.start().await {
-        ExecutionResult::Completed(e) => {
-            assert_eq!(e.context().receipts.len(), 3);
-        }
-        other => panic!("expected Completed, got {:?}", result_debug(&other)),
-    }
+    let receipts = run_movements(
+        &ledger,
+        &[
+            deposit(account(1), Cent::from(100)),
+            pay(account(1), account(2), Cent::from(60)),
+            pay(account(2), account(3), Cent::from(30)),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipts.len(), 3);
 
     assert_eq!(
         ledger.balance(&account(1), &usd()).await.unwrap(),
@@ -215,18 +162,4 @@ async fn saga_three_steps_happy() {
         ledger.balance(&account(3), &usd()).await.unwrap(),
         Cent::from(30)
     );
-}
-
-fn result_debug<Ctx, Err, Steps>(r: &ExecutionResult<Ctx, Err, Steps>) -> &'static str
-where
-    Ctx: Send + Sync,
-    Err: Send + Sync + Clone,
-    Steps: legend::hlist::InstructionList<Ctx, Err>,
-{
-    match r {
-        ExecutionResult::Completed(_) => "Completed",
-        ExecutionResult::Paused(_) => "Paused",
-        ExecutionResult::Failed(_, _) => "Failed",
-        ExecutionResult::CompensationFailed { .. } => "CompensationFailed",
-    }
 }
